@@ -1,0 +1,14 @@
+Fix all SyntaxError and ReferenceError issues across 8 pages
+
+- Replace all inline onclick/oninput handlers with data-attribute + event delegation
+- Fixed Purchases: renderPurItems uses data-idx/data-field with event listeners
+- Fixed Sales: renderSalesTable and renderItems use saleViewBtn/saleEditBtn classes
+- Fixed Payments: renderPayTable uses payPrintBtn/payEditBtn/payDelBtn classes
+- Fixed Payments: openChequeRegister uses chequeHonorBtn/chequeBouncBtn classes
+- Fixed Expenses: renderExpenses uses expEditBtn/expDelBtn classes
+- Fixed Expenses: renderHeadsUI uses deleteHeadBtn/deleteSubHeadBtn classes
+- Fixed Expenses: renderExpenseBanks uses expBankDelBtn class
+- Fixed Admin KV Browser: uses kvViewBtn/kvDelBtn with data-kvkey attributes
+- All 42 escaped-quote patterns eliminated
+- All pages pass Node.js --check syntax validation
+- switchPayTab, changeDay, printDayReport, goToday now work correctly
