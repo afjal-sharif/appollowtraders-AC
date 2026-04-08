@@ -1,10 +1,8 @@
 name: Build and Upload Artifacts
 
 on:
-  push:
-    branches: [developer, main]
-  pull_request:
-    branches: [developer, main]
+  push:          # runs on every push (any branch)
+  pull_request:  # runs on every PR
 
 jobs:
   build:
@@ -46,3 +44,4 @@ jobs:
             package.json
             vite.config.ts
             wrangler.jsonc
+          retention-days: 30
