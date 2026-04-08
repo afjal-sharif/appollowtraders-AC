@@ -1009,29 +1009,178 @@ loadEL();
 
 function profitLossPage(){return `
 <div class="page-header"><div><div class="page-title">Profit & Loss</div><div class="page-sub">Revenue, COGS, Expenses</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('plPrint','P&L')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('plTbl','ProfitLoss')">Export XLS</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="plFrom" onchange="renderPL()"></div><div><label>To</label><input type="date" id="plTo" onchange="renderPL()"></div></div>
-<div id="plPrint"><div class="stats" id="plStats"></div>
-<div class="card"><table class="tbl" id="plTbl"><tbody id="plBody"></tbody></table></div></div>
+
+<div class="form-row" style="margin-bottom:14px">
+<div><label>From</label><input type="date" id="plFrom" onchange="renderPL()"></div>
+<div><label>To</label><input type="date" id="plTo" onchange="renderPL()"></div>
+</div>
+
+<div id="plPrint">
+<div class="stats" id="plStats"></div>
+<div class="card">
+<table class="tbl" id="plTbl"><tbody id="plBody"></tbody></table>
+</div>
+</div>
+
 <script>
-async function loadPL(){var d=await Promise.all([loadList('sale:'),loadList('purchase:'),loadList('expense:'),loadList('product:')]);window._plSales=d[0];window._plPurchases=d[1];window._plExpenses=d[2];window._plProducts=d[3];renderPL()}
-window.renderPL=function(){var from=document.getElementById('plFrom').value;var to=document.getElementById('plTo').value;
-var sales=window._plSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
-var expenses=window._plExpenses.filter(function(e){return(!from||e.date>=from)&&(!to||e.date<=to)});
-var revenue=sales.reduce(function(s,x){return s+(x.total||0)},0);
-var cogs=0;sales.forEach(function(s){(s.items||[]).forEach(function(it){var prod=window._plProducts.find(function(p){return p._key===it.productId});var costPrice=prod?prod.purchasePrice||0:0;cogs+=costPrice*it.qty})});
+
+// ================= FIFO HELPERS =================
+
+// Build purchase batches (FIFO layers)
+function buildInventoryFIFO(purchases){
+  var stock = {};
+
+  purchases.forEach(function(p){
+    (p.items || []).forEach(function(it){
+
+      if(!stock[it.productId]) stock[it.productId] = [];
+
+      stock[it.productId].push({
+        qty: it.qty,
+        price: it.rate || it.price || 0,
+        remaining: it.qty,
+        date: p.date
+      });
+
+    });
+  });
+
+  // Sort by date (FIFO)
+  Object.keys(stock).forEach(function(pid){
+    stock[pid].sort(function(a,b){
+      return new Date(a.date) - new Date(b.date);
+    });
+  });
+
+  return stock;
+}
+
+// Calculate COGS using FIFO
+function calculateCOGSFIFO(sales, stock){
+  var totalCogs = 0;
+
+  sales.forEach(function(s){
+
+    (s.items || []).forEach(function(it){
+
+      var qtyNeeded = it.qty;
+      var layers = stock[it.productId] || [];
+
+      for(var i=0; i<layers.length && qtyNeeded > 0; i++){
+
+        var layer = layers[i];
+        if(layer.remaining <= 0) continue;
+
+        var used = Math.min(layer.remaining, qtyNeeded);
+
+        totalCogs += used * layer.price;
+
+        layer.remaining -= used;
+        qtyNeeded -= used;
+      }
+
+    });
+
+  });
+
+  return totalCogs;
+}
+
+// ================= LOAD =================
+
+async function loadPL(){
+  var d=await Promise.all([
+    loadList('sale:'),
+    loadList('purchase:'),
+    loadList('expense:'),
+    loadList('product:')
+  ]);
+  window._plSales=d[0];
+  window._plPurchases=d[1];
+  window._plExpenses=d[2];
+  window._plProducts=d[3];
+  renderPL();
+}
+
+// ================= MAIN =================
+
+window.renderPL=function(){
+
+var from=document.getElementById('plFrom').value;
+var to=document.getElementById('plTo').value;
+
+var sales=window._plSales.filter(function(s){
+  return(!from||s.date>=from)&&(!to||s.date<=to)
+});
+
+var expenses=window._plExpenses.filter(function(e){
+  return(!from||e.date>=from)&&(!to||e.date<=to)
+});
+
+// Revenue
+var revenue=sales.reduce(function(s,x){
+  return s+(x.total||0)
+},0);
+
+// ✅ FIFO COGS
+var stock = buildInventoryFIFO(window._plPurchases);
+var cogs = calculateCOGSFIFO(sales, stock);
+
+// Profit
 var grossProfit=revenue-cogs;
-var totalExp=expenses.reduce(function(s,e){return s+(e.amount||0)},0);
+
+var totalExp=expenses.reduce(function(s,e){
+  return s+(e.amount||0)
+},0);
+
 var netProfit=grossProfit-totalExp;
-var expByHead={};expenses.forEach(function(e){var h=e.headName||'Other';expByHead[h]=(expByHead[h]||0)+(e.amount||0)});
-document.getElementById('plStats').innerHTML='<div class="stat"><div class="label">Revenue</div><div class="value text-success">'+fmt(revenue)+'</div></div><div class="stat"><div class="label">COGS</div><div class="value text-warning">'+fmt(cogs)+'</div></div><div class="stat"><div class="label">Gross Profit</div><div class="value '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</div></div><div class="stat"><div class="label">Net Profit</div><div class="value '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(netProfit)+'</div></div>';
-var rows='<tr style="background:var(--accent-light)"><td class="bold" colspan="2">Revenue</td></tr><tr><td style="padding-left:24px">Sales Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr><tr style="background:var(--bg)"><td class="bold">Total Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
-rows+='<tr style="background:var(--warning-light)"><td class="bold" colspan="2">Cost of Goods Sold</td></tr><tr><td style="padding-left:24px">COGS (Purchase Price x Qty Sold)</td><td class="r bold text-danger">'+fmt(cogs)+'</td></tr><tr style="background:var(--bg)"><td class="bold">Gross Profit</td><td class="r bold '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</td></tr>';
+
+// Expense grouping
+var expByHead={};
+expenses.forEach(function(e){
+  var h=e.headName||'Other';
+  expByHead[h]=(expByHead[h]||0)+(e.amount||0)
+});
+
+// ================= UI =================
+
+document.getElementById('plStats').innerHTML=
+'<div class="stat"><div class="label">Revenue</div><div class="value text-success">'+fmt(revenue)+'</div></div>'+
+'<div class="stat"><div class="label">COGS</div><div class="value text-warning">'+fmt(cogs)+'</div></div>'+
+'<div class="stat"><div class="label">Gross Profit</div><div class="value '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</div></div>'+
+'<div class="stat"><div class="label">Net Profit</div><div class="value '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(netProfit)+'</div></div>';
+
+var rows='';
+
+// Revenue
+rows+='<tr style="background:var(--accent-light)"><td class="bold" colspan="2">Revenue</td></tr>';
+rows+='<tr><td style="padding-left:24px">Sales Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+rows+='<tr style="background:var(--bg)"><td class="bold">Total Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+
+// COGS
+rows+='<tr style="background:var(--warning-light)"><td class="bold" colspan="2">Cost of Goods Sold</td></tr>';
+rows+='<tr><td style="padding-left:24px">COGS (FIFO Based)</td><td class="r bold text-danger">'+fmt(cogs)+'</td></tr>';
+rows+='<tr style="background:var(--bg)"><td class="bold">Gross Profit</td><td class="r bold '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</td></tr>';
+
+// Expenses
 rows+='<tr style="background:var(--danger-light)"><td class="bold" colspan="2">Expenses</td></tr>';
-Object.keys(expByHead).sort().forEach(function(h){rows+='<tr><td style="padding-left:24px">'+h+'</td><td class="r">'+fmt(expByHead[h])+'</td></tr>'});
+
+Object.keys(expByHead).sort().forEach(function(h){
+  rows+='<tr><td style="padding-left:24px">'+h+'</td><td class="r">'+fmt(expByHead[h])+'</td></tr>';
+});
+
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Expenses</td><td class="r bold text-danger">'+fmt(totalExp)+'</td></tr>';
+
+// Net
 rows+='<tr style="background:var(--primary-light);font-size:15px"><td class="bold">NET PROFIT / (LOSS)</td><td class="r bold '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(netProfit)+'</td></tr>';
-document.getElementById('plBody').innerHTML=rows}
+
+document.getElementById('plBody').innerHTML=rows;
+
+}
+
+// ================= INIT =================
 loadPL();
+
 </script>`}
 
 function balanceSheetPage(){return `
