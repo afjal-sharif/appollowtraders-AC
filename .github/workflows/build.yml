@@ -46,4 +46,3 @@ jobs:
             package.json
             vite.config.ts
             wrangler.jsonc
-          retention-days: 30
