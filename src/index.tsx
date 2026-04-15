@@ -39,7 +39,7 @@ async function kvList(env: any, prefix: string) {
 }
 
 function htmlRes(content: string) {
-  return new Response(content, { headers: { "content-type": "text/html;charset=UTF-8" } });
+  return new Response(content, { headers: { "content-type": "text/html;charset=UTF-8", "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate", "Pragma": "no-cache", "Expires": "0" } });
 }
 
 // ============================================================
@@ -57,7 +57,7 @@ app.post('/login', async (c) => {
     const user = users.find((u: any) => u.username === username && u.password === enteredPin && u.active !== false);
     if (user) {
       const cookieVal = encodeURIComponent(JSON.stringify({ auth: 1, userId: user._key, username: user.username, role: user.role, name: user.name }));
-      return new Response(null, { status: 302, headers: { "Set-Cookie": `session=${cookieVal}; Path=/; HttpOnly; SameSite=Strict`, Location: "/" } });
+      return new Response(null, { status: 302, headers: { "Set-Cookie": `session=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`, "Location": "/", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache" } });
     }
     return htmlRes(loginPage("Invalid credentials", users.length > 0));
   }
@@ -65,13 +65,13 @@ app.post('/login', async (c) => {
   // Fallback PIN login (admin)
   if (enteredPin === storedPin) {
     const cookieVal = encodeURIComponent(JSON.stringify({ auth: 1, userId: 'admin', username: 'admin', role: 'admin', name: 'Administrator' }));
-    return new Response(null, { status: 302, headers: { "Set-Cookie": `session=${cookieVal}; Path=/; HttpOnly; SameSite=Strict`, Location: "/" } });
+    return new Response(null, { status: 302, headers: { "Set-Cookie": `session=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`, "Location": "/", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache" } });
   }
   return htmlRes(loginPage("Wrong PIN", users.length > 0));
 });
 
 app.get('/logout', () => {
-  return new Response(null, { status: 302, headers: { "Set-Cookie": "session=; Path=/; HttpOnly; Max-Age=0", Location: "/login" } });
+  return new Response(null, { status: 302, headers: { "Set-Cookie": "session=; Path=/; HttpOnly; Max-Age=0; SameSite=Strict", "Location": "/login", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache", "Clear-Site-Data": '"cache"' } });
 });
 
 function getSession(c: any) {
@@ -87,6 +87,10 @@ app.use('*', async (c, next) => {
   if (path === '/login' && c.req.method === 'GET') {
     const users = await kvList(c.env, 'user:');
     return htmlRes(loginPage("", users.length > 0));
+  }
+  // Allow public access to company settings (for login page theming)
+  if (path === '/api/company-settings' && c.req.method === 'GET') {
+    await next(); return;
   }
   
   const url = new URL(c.req.url);
@@ -116,8 +120,8 @@ app.use('*', async (c, next) => {
   const rolePageMap: Record<string, string[]> = {
     admin: [],  // admin has access to everything
     manager: ['/users', '/admin'],  // pages denied to manager
-    entry: ['/users', '/admin', '/reports', '/profit-loss', '/balance-sheet', '/trial-balance', '/stock', '/receivable-payable', '/salesperson', '/expense-ledger'],
-    viewer: ['/inventory', '/parties', '/purchases', '/sales', '/payments', '/expenses', '/orders', '/users', '/admin', '/salesperson'],
+    entry: ['/users', '/admin', '/reports', '/profit-loss', '/balance-sheet', '/trial-balance', '/stock', '/receivable-payable', '/salesperson', '/expense-ledger', '/approvals', '/company-settings'],
+    viewer: ['/inventory', '/parties', '/purchases', '/sales', '/payments', '/expenses', '/orders', '/users', '/admin', '/salesperson', '/approvals', '/company-settings'],
   };
   const role = session?.role || 'admin';
   const denied = rolePageMap[role] || [];
@@ -152,6 +156,9 @@ app.post('/api/list', async (c) => {
   return c.json(await kvList(c.env, body?.prefix || ""));
 });
 
+// Prefixes that require approval for entry users when editing/deleting
+const APPROVAL_PREFIXES = ['product:', 'party:', 'sale:', 'purchase:', 'payment:', 'expense:', 'bank:', 'order:', 'salesperson:'];
+
 app.post('/api/save', async (c) => {
   if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
   const body = await c.req.json();
@@ -161,15 +168,40 @@ app.post('/api/save', async (c) => {
   const data = body?.data || {};
   const logAction = body?.logAction || '';
   const logDetail = body?.logDetail || '';
+  const skipApproval = body?.skipApproval === true;
   let key = keyFromBody;
   if (!key) {
     if (id) key = id.startsWith(prefix) ? id : prefix + id;
     else key = prefix + genId();
   }
+
+  // Entry user approval check: edits (when key already exists) need approval
+  const session = getSession(c);
+  const isEntry = session?.role === 'entry';
+  const isEdit = !!(keyFromBody || id); // editing existing record
+  const matchesPrefix = APPROVAL_PREFIXES.some(p => (prefix && prefix === p) || (key && key.startsWith(p)));
+
+  if (isEntry && isEdit && matchesPrefix && !skipApproval) {
+    // Store as pending approval instead of directly saving
+    const approvalKey = 'approval:' + genId();
+    const oldVal = await c.env.DATA_STORE.get(key);
+    await c.env.DATA_STORE.put(approvalKey, JSON.stringify({
+      type: 'edit',
+      targetKey: key,
+      prefix: prefix,
+      newData: data,
+      oldData: oldVal ? JSON.parse(oldVal) : null,
+      detail: logDetail || ('Edit: ' + key),
+      requestedBy: session?.name || session?.username || 'Unknown',
+      requestedAt: new Date().toISOString(),
+      status: 'pending'
+    }));
+    return c.json({ success: true, key, pending: true, message: 'Your edit has been submitted for approval' });
+  }
+
   await c.env.DATA_STORE.put(key, JSON.stringify(data));
   // Modification log
   if (logAction) {
-    const session = getSession(c);
     const logKey = 'modlog:' + genId();
     await c.env.DATA_STORE.put(logKey, JSON.stringify({ action: logAction, detail: logDetail, key: key, prefix: prefix, user: session?.name || session?.username || 'System', timestamp: new Date().toISOString() }));
   }
@@ -188,19 +220,111 @@ app.post('/api/delete', async (c) => {
   const body = await c.req.json();
   const key = body?.key;
   const logDetail = body?.logDetail || '';
+  const skipApproval = body?.skipApproval === true;
   if (!key) return c.json({ success: false, error: "Key is required" }, 400);
+
+  // Entry user approval check: deletes need approval
+  const session = getSession(c);
+  const isEntry = session?.role === 'entry';
+  const matchesPrefix = APPROVAL_PREFIXES.some(p => key.startsWith(p));
+
+  if (isEntry && matchesPrefix && !skipApproval) {
+    const oldVal = await c.env.DATA_STORE.get(key);
+    const approvalKey = 'approval:' + genId();
+    await c.env.DATA_STORE.put(approvalKey, JSON.stringify({
+      type: 'delete',
+      targetKey: key,
+      prefix: key.split(':')[0] + ':',
+      newData: null,
+      oldData: oldVal ? JSON.parse(oldVal) : null,
+      detail: logDetail || ('Delete: ' + key),
+      requestedBy: session?.name || session?.username || 'Unknown',
+      requestedAt: new Date().toISOString(),
+      status: 'pending'
+    }));
+    return c.json({ success: true, pending: true, message: 'Your delete request has been submitted for approval' });
+  }
+
   // Save old value for log before deleting
   const oldVal = await c.env.DATA_STORE.get(key);
   await c.env.DATA_STORE.delete(key);
   // Modification log
-  const session = getSession(c);
   const logKey = 'modlog:' + genId();
   await c.env.DATA_STORE.put(logKey, JSON.stringify({ action: 'delete', detail: logDetail || ('Deleted key: ' + key), key: key, oldData: oldVal ? oldVal.substring(0, 500) : '', user: session?.name || session?.username || 'System', timestamp: new Date().toISOString() }));
   return c.json({ success: true });
 });
 
+// ============================================================
+// APPROVAL QUEUE API
+// ============================================================
+app.post('/api/approval-list', async (c) => {
+  return c.json(await kvList(c.env, 'approval:'));
+});
+
+app.post('/api/approval-action', async (c) => {
+  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
+  const session = getSession(c);
+  const role = session?.role || '';
+  if (role !== 'admin' && role !== 'manager') return c.json({ success: false, error: "Only admin/manager can approve" }, 403);
+
+  const { approvalKey, action } = await c.req.json(); // action: 'approve' or 'reject'
+  if (!approvalKey) return c.json({ success: false, error: "Approval key required" }, 400);
+
+  const raw = await c.env.DATA_STORE.get(approvalKey);
+  if (!raw) return c.json({ success: false, error: "Approval not found" }, 404);
+  const approval = JSON.parse(raw);
+  if (approval.status !== 'pending') return c.json({ success: false, error: "Already processed" }, 400);
+
+  if (action === 'approve') {
+    if (approval.type === 'edit' && approval.targetKey && approval.newData) {
+      await c.env.DATA_STORE.put(approval.targetKey, JSON.stringify(approval.newData));
+      // Log
+      const logKey = 'modlog:' + genId();
+      await c.env.DATA_STORE.put(logKey, JSON.stringify({
+        action: 'edit', detail: 'Approved edit by ' + approval.requestedBy + ': ' + approval.detail,
+        key: approval.targetKey, prefix: approval.prefix,
+        user: session?.name || session?.username || 'System', timestamp: new Date().toISOString()
+      }));
+    } else if (approval.type === 'delete' && approval.targetKey) {
+      await c.env.DATA_STORE.delete(approval.targetKey);
+      const logKey = 'modlog:' + genId();
+      await c.env.DATA_STORE.put(logKey, JSON.stringify({
+        action: 'delete', detail: 'Approved delete by ' + approval.requestedBy + ': ' + approval.detail,
+        key: approval.targetKey, prefix: approval.prefix,
+        user: session?.name || session?.username || 'System', timestamp: new Date().toISOString()
+      }));
+    }
+    approval.status = 'approved';
+  } else {
+    approval.status = 'rejected';
+  }
+  approval.processedBy = session?.name || session?.username || 'System';
+  approval.processedAt = new Date().toISOString();
+  await c.env.DATA_STORE.put(approvalKey, JSON.stringify(approval));
+  return c.json({ success: true, status: approval.status });
+});
+
+// ============================================================
+// COMPANY SETTINGS API
+// ============================================================
+app.get('/api/company-settings', async (c) => {
+  if (!c.env.DATA_STORE) return c.json({ companyName: 'My Company', companyAddress: '', companyPhone: '', companyEmail: '', companyWebsite: '', companyTagline: '', companyTIN: '', primaryColor: '#4f46e5', sidebarColor: '#1e1b4b' });
+  const val = await c.env.DATA_STORE.get('COMPANY_SETTINGS');
+  if (!val) return c.json({ companyName: 'My Company', companyAddress: '', companyPhone: '', companyEmail: '', companyWebsite: '', companyTagline: '', companyTIN: '', primaryColor: '#4f46e5', sidebarColor: '#1e1b4b' });
+  return c.json(JSON.parse(val));
+});
+
+app.post('/api/company-settings', async (c) => {
+  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
+  const session = getSession(c);
+  if (session?.role !== 'admin') return c.json({ success: false, error: "Only admin can change company settings" }, 403);
+  const data = await c.req.json();
+  await c.env.DATA_STORE.put('COMPANY_SETTINGS', JSON.stringify(data));
+  return c.json({ success: true });
+});
+
 app.post('/api/export-all', async (c) => {
-  const prefixes = ['product:','party:','sale:','purchase:','payment:','expense:','exphead:','expsubhead:','bank:','cb:','user:','order:','salesperson:','creditlimit:','prodgroup:','modlog:'];
+  const prefixes = ['product:','party:','sale:','purchase:','payment:','expense:','exphead:','expsubhead:','bank:','cb:','user:','order:','salesperson:','creditlimit:','prodgroup:','modlog:','approval:','companysettings:'];
   const all: any = {};
   for (const p of prefixes) { all[p] = await kvList(c.env, p); }
   return c.json(all);
@@ -295,6 +419,8 @@ app.get('/orders', (c) => htmlRes(layout(ordersPage(), "orders", getSession(c)))
 app.get('/users', (c) => htmlRes(layout(usersPage(), "users", getSession(c))));
 app.get('/admin', (c) => htmlRes(layout(adminPage(), "admin", getSession(c))));
 app.get('/mod-log', (c) => htmlRes(layout(modLogPage(), "modlog", getSession(c))));
+app.get('/approvals', (c) => htmlRes(layout(approvalsPage(), "approvals", getSession(c))));
+app.get('/company-settings', (c) => htmlRes(layout(companySettingsPage(), "companysettings", getSession(c))));
 app.get('/sp-portal', (c) => htmlRes(spPortalPage(c)));
 app.get('/login', async (c) => {
   const users = await kvList(c.env, 'user:');
@@ -448,8 +574,8 @@ function layout(content: string, active: string, session: any) {
   
   // Role-based access control map
   const roleAccess: Record<string, string[]> = {
-    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','modlog'],
-    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','modlog'],
+    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog'],
+    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog'],
     entry: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','daydetails'],
     viewer: ['dashboard','stockcheck','reports','profitloss','balancesheet','trialbalance','stock','recpay','ledger','expledger','daydetails'],
   };
@@ -485,7 +611,9 @@ function layout(content: string, active: string, session: any) {
     ]},
     { group: 'System', items: [
       { path:"/users", icon:"manage_accounts", label:"Users & Access", id:"users" },
+      { path:"/approvals", icon:"task_alt", label:"Approval Queue", id:"approvals" },
       { path:"/mod-log", icon:"history", label:"Modification Log", id:"modlog" },
+      { path:"/company-settings", icon:"domain", label:"Company Settings", id:"companysettings" },
       { path:"/admin", icon:"settings", label:"Admin", id:"admin" },
     ]},
   ];
@@ -503,7 +631,7 @@ function layout(content: string, active: string, session: any) {
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Apollow Traders - BizManager</title>
+<title>BizManager</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
 ${getCSS()}
@@ -512,9 +640,9 @@ ${getCSS()}
 // ============ GLOBAL UTILITIES ============
 window.api=async function(path,body){var r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});var d=await r.json();if(!r.ok||(d&&d.success===false)){throw new Error(d.error||'Request failed');}return d;};
 window.loadList=async function(prefix){return api('/api/list',{prefix:prefix});};
-window.saveItem=async function(prefix,data,id,logAction,logDetail){return api('/api/save',{prefix:prefix,data:data,id:id,logAction:logAction||'',logDetail:logDetail||''});};
-window.saveByKey=async function(key,data,logAction,logDetail){return api('/api/save',{key:key,data:data,logAction:logAction||'',logDetail:logDetail||''});};
-window.deleteItem=async function(key,ask,logDetail){if(ask!==false&&!confirm('Delete this item?'))return;await api('/api/delete',{key:key,logDetail:logDetail||''});};
+window.saveItem=async function(prefix,data,id,logAction,logDetail){var r=await api('/api/save',{prefix:prefix,data:data,id:id,logAction:logAction||'',logDetail:logDetail||''});if(r&&r.pending){showToast(r.message||'Submitted for approval','info');}return r;};
+window.saveByKey=async function(key,data,logAction,logDetail){var r=await api('/api/save',{key:key,data:data,logAction:logAction||'',logDetail:logDetail||''});if(r&&r.pending){showToast(r.message||'Submitted for approval','info');}return r;};
+window.deleteItem=async function(key,ask,logDetail){if(ask!==false&&!confirm('Delete this item?'))return;var r=await api('/api/delete',{key:key,logDetail:logDetail||''});if(r&&r.pending){showToast(r.message||'Delete request submitted for approval','info');}return r;};
 window.openModal=function(id){var el=document.getElementById(id);if(el)el.classList.add('open');};
 window.closeModal=function(id){var el=document.getElementById(id);if(el)el.classList.remove('open');};
 window.fmt=function(n){return Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:0,maximumFractionDigits:2});};
@@ -533,8 +661,16 @@ window.exportXLS=function(tableId,fileName){
 };
 window.printContent=function(elementId,title){
   var content=document.getElementById(elementId);if(!content)return alert('Content not found');
+  var cs=window._companySettings||{};
+  var companyHeader='<div style="text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:16px">'
+    +'<h1 style="margin:0;font-size:20px;font-weight:800">'+(cs.companyName||'')+'</h1>'
+    +(cs.companyAddress?'<div style="font-size:11px;color:#555;margin-top:2px">'+cs.companyAddress+'</div>':'')
+    +(cs.companyPhone||cs.companyEmail?'<div style="font-size:10px;color:#666;margin-top:2px">'+(cs.companyPhone?'Phone: '+cs.companyPhone:'')+(cs.companyPhone&&cs.companyEmail?' | ':'')+(cs.companyEmail?'Email: '+cs.companyEmail:'')+'</div>':'')
+    +(cs.companyWebsite?'<div style="font-size:10px;color:#666">'+cs.companyWebsite+'</div>':'')
+    +(cs.companyTIN?'<div style="font-size:10px;color:#666">TIN: '+cs.companyTIN+'</div>':'')
+    +'</div>';
   var win=window.open('','_blank');
-  win.document.write('<html><head><title>'+(title||'Print')+'</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:11px}.r{text-align:right}.bold{font-weight:bold}.text-danger{color:#dc2626}.text-success{color:#059669}.text-warning{color:#d97706}.text-muted{color:#666}.text-info{color:#0891b2}.text-primary{color:#4f46e5}.badge{padding:2px 6px;border-radius:3px;font-size:9px}.pl-row{display:flex;justify-content:space-between;padding:4px 12px}.pl-row.total{font-weight:bold;background:#f3f3f3;padding:8px 12px}.led-sale td{background:#eef2ff}.led-purchase td{background:#fffbeb}.led-receipt td,.led-payment td{background:#ecfdf5}.stat{display:inline-block;padding:8px 12px;margin:3px;border:1px solid #ddd;border-radius:6px}.stat .label{font-size:9px;text-transform:uppercase;color:#666;font-weight:bold}.stat .value{font-size:16px;font-weight:bold}.stats{margin-bottom:12px}.card{margin-bottom:12px;padding:10px}</style></head><body>'+content.innerHTML+'</body></html>');
+  win.document.write('<html><head><title>'+(title||'Print')+'</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:11px}.r{text-align:right}.bold{font-weight:bold}.text-danger{color:#dc2626}.text-success{color:#059669}.text-warning{color:#d97706}.text-muted{color:#666}.text-info{color:#0891b2}.text-primary{color:#4f46e5}.badge{padding:2px 6px;border-radius:3px;font-size:9px}.pl-row{display:flex;justify-content:space-between;padding:4px 12px}.pl-row.total{font-weight:bold;background:#f3f3f3;padding:8px 12px}.led-sale td{background:#eef2ff}.led-purchase td{background:#fffbeb}.led-receipt td,.led-payment td{background:#ecfdf5}.stat{display:inline-block;padding:8px 12px;margin:3px;border:1px solid #ddd;border-radius:6px}.stat .label{font-size:9px;text-transform:uppercase;color:#666;font-weight:bold}.stat .value{font-size:16px;font-weight:bold}.stats{margin-bottom:12px}.card{margin-bottom:12px;padding:10px}</style></head><body>'+companyHeader+content.innerHTML+'</body></html>');
   win.document.close();setTimeout(function(){win.print();win.close();},500);
 };
 // Document preview handler
@@ -573,20 +709,20 @@ window.buildSaleInvoice=async function(s){
     prevBal=prevSalesTotal-prevPaidTotal;
     curBal=prevBal+(s.total||0)-(s.paid||0);
   }catch(e){}
-  return '<div style="max-width:700px;margin:0 auto"><div style="display:flex;justify-content:space-between;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:12px"><div><h2 style="margin:0;font-size:18px">SALES INVOICE</h2><b>No:</b> '+s.invoiceNo+'</div><div style="text-align:right"><b>Date:</b> '+s.date+'<br><b>Customer:</b> '+s.customerName+(s.salespersonName?'<br><span style="font-size:11px;color:#666">SP: '+s.salespersonName+'</span>':'')+'</div></div><table class="tbl"><thead><tr style="background:#f3f3f3"><th>#</th><th>Product</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>'+(s.items||[]).map(function(it,i){return'<tr><td>'+(i+1)+'</td><td>'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r">'+fmt(it.amount)+'</td></tr>';}).join('')+'</tbody></table><div style="display:flex;justify-content:flex-end;margin-top:12px"><div style="width:280px;line-height:1.8;font-size:12px"><div style="display:flex;justify-content:space-between"><span>Subtotal:</span><span>'+fmt(sub)+'</span></div><div style="display:flex;justify-content:space-between;color:#dc2626"><span>Discount:</span><span>-'+fmt(discAmt)+'</span></div><div style="display:flex;justify-content:space-between"><span>Extra:</span><span>+'+fmt(s.extra||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>VAT:</span><span>+'+fmt(vatAmt)+'</span></div><div style="display:flex;justify-content:space-between"><span>AIT:</span><span>+'+fmt(aitAmt)+'</span></div><div style="display:flex;justify-content:space-between;font-weight:800;font-size:14px;border-top:2px solid #333;margin-top:4px;padding-top:4px"><span>Total:</span><span>'+fmt(s.total)+'</span></div><div style="display:flex;justify-content:space-between;color:#059669"><span>Paid:</span><span>'+fmt(s.paid)+'</span></div><div style="display:flex;justify-content:space-between;border-top:1px dashed #666"><span>Balance Due:</span><span>'+fmt((s.total||0)-(s.paid||0))+'</span></div><div style="border-top:2px solid #333;margin-top:6px;padding-top:6px"><div style="display:flex;justify-content:space-between;color:#6b7280"><span>Previous Balance:</span><span>'+fmt(Math.abs(prevBal))+' '+(prevBal>0?'Dr':'Cr')+'</span></div><div style="display:flex;justify-content:space-between;font-weight:800;font-size:13px;color:'+(curBal>0?'#dc2626':'#059669')+'"><span>Current Balance:</span><span>'+fmt(Math.abs(curBal))+' '+(curBal>0?'Dr':'Cr')+'</span></div></div></div></div></div>';
+  return '<div style="max-width:700px;margin:0 auto">'+getCompanyHeader()+'<div style="display:flex;justify-content:space-between;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:12px"><div><h2 style="margin:0;font-size:18px">SALES INVOICE</h2><b>No:</b> '+s.invoiceNo+'</div><div style="text-align:right"><b>Date:</b> '+s.date+'<br><b>Customer:</b> '+s.customerName+(s.salespersonName?'<br><span style="font-size:11px;color:#666">SP: '+s.salespersonName+'</span>':'')+'</div></div><table class="tbl"><thead><tr style="background:#f3f3f3"><th>#</th><th>Product</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>'+(s.items||[]).map(function(it,i){return'<tr><td>'+(i+1)+'</td><td>'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r">'+fmt(it.amount)+'</td></tr>';}).join('')+'</tbody></table><div style="display:flex;justify-content:flex-end;margin-top:12px"><div style="width:280px;line-height:1.8;font-size:12px"><div style="display:flex;justify-content:space-between"><span>Subtotal:</span><span>'+fmt(sub)+'</span></div><div style="display:flex;justify-content:space-between;color:#dc2626"><span>Discount:</span><span>-'+fmt(discAmt)+'</span></div><div style="display:flex;justify-content:space-between"><span>Extra:</span><span>+'+fmt(s.extra||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>VAT:</span><span>+'+fmt(vatAmt)+'</span></div><div style="display:flex;justify-content:space-between"><span>AIT:</span><span>+'+fmt(aitAmt)+'</span></div><div style="display:flex;justify-content:space-between;font-weight:800;font-size:14px;border-top:2px solid #333;margin-top:4px;padding-top:4px"><span>Total:</span><span>'+fmt(s.total)+'</span></div><div style="display:flex;justify-content:space-between;color:#059669"><span>Paid:</span><span>'+fmt(s.paid)+'</span></div><div style="display:flex;justify-content:space-between;border-top:1px dashed #666"><span>Balance Due:</span><span>'+fmt((s.total||0)-(s.paid||0))+'</span></div><div style="border-top:2px solid #333;margin-top:6px;padding-top:6px"><div style="display:flex;justify-content:space-between;color:#6b7280"><span>Previous Balance:</span><span>'+fmt(Math.abs(prevBal))+' '+(prevBal>0?'Dr':'Cr')+'</span></div><div style="display:flex;justify-content:space-between;font-weight:800;font-size:13px;color:'+(curBal>0?'#dc2626':'#059669')+'"><span>Current Balance:</span><span>'+fmt(Math.abs(curBal))+' '+(curBal>0?'Dr':'Cr')+'</span></div></div></div></div></div>';
 };
 window.buildPurchaseInvoice=function(p){
   if(!p)return'';var sub=(p.items||[]).reduce(function(a,i){return a+(i.amount||0);},0);
   var base=sub-(p.discount||0)+(p.extra||0);var vatAmt=(p.vatType==='percent')?(base*(p.vat||0)/100):(p.vat||0);
-  return '<div style="max-width:700px;margin:0 auto"><div style="display:flex;justify-content:space-between;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:12px"><div><h2 style="margin:0;font-size:18px">PURCHASE INVOICE</h2><b>No:</b> '+p.purchaseNo+'</div><div style="text-align:right"><b>Date:</b> '+p.date+'<br><b>Supplier:</b> '+p.supplierName+'</div></div><table class="tbl"><thead><tr style="background:#f3f3f3"><th>#</th><th>Item</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>'+(p.items||[]).map(function(it,i){return'<tr><td>'+(i+1)+'</td><td>'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r">'+fmt(it.amount)+'</td></tr>';}).join('')+'</tbody></table><div style="display:flex;justify-content:flex-end;margin-top:12px"><div style="width:260px;line-height:1.8;font-size:12px"><div style="display:flex;justify-content:space-between"><span>Subtotal:</span><span>'+fmt(sub)+'</span></div><div style="display:flex;justify-content:space-between;color:#dc2626"><span>Discount:</span><span>-'+fmt(p.discount||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>Extra:</span><span>+'+fmt(p.extra||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>VAT:</span><span>+'+fmt(vatAmt)+'</span></div><div style="display:flex;justify-content:space-between;font-weight:800;font-size:14px;border-top:2px solid #333;margin-top:4px;padding-top:4px"><span>Total:</span><span>'+fmt(p.total)+'</span></div><div style="display:flex;justify-content:space-between;color:#059669"><span>Paid:</span><span>'+fmt(p.paid)+'</span></div><div style="display:flex;justify-content:space-between;border-top:1px dashed #666"><span>Balance:</span><span>'+fmt((p.total||0)-(p.paid||0))+'</span></div></div></div></div>';
+  return '<div style="max-width:700px;margin:0 auto">'+getCompanyHeader()+'<div style="display:flex;justify-content:space-between;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:12px"><div><h2 style="margin:0;font-size:18px">PURCHASE INVOICE</h2><b>No:</b> '+p.purchaseNo+'</div><div style="text-align:right"><b>Date:</b> '+p.date+'<br><b>Supplier:</b> '+p.supplierName+'</div></div><table class="tbl"><thead><tr style="background:#f3f3f3"><th>#</th><th>Item</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>'+(p.items||[]).map(function(it,i){return'<tr><td>'+(i+1)+'</td><td>'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r">'+fmt(it.amount)+'</td></tr>';}).join('')+'</tbody></table><div style="display:flex;justify-content:flex-end;margin-top:12px"><div style="width:260px;line-height:1.8;font-size:12px"><div style="display:flex;justify-content:space-between"><span>Subtotal:</span><span>'+fmt(sub)+'</span></div><div style="display:flex;justify-content:space-between;color:#dc2626"><span>Discount:</span><span>-'+fmt(p.discount||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>Extra:</span><span>+'+fmt(p.extra||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>VAT:</span><span>+'+fmt(vatAmt)+'</span></div><div style="display:flex;justify-content:space-between;font-weight:800;font-size:14px;border-top:2px solid #333;margin-top:4px;padding-top:4px"><span>Total:</span><span>'+fmt(p.total)+'</span></div><div style="display:flex;justify-content:space-between;color:#059669"><span>Paid:</span><span>'+fmt(p.paid)+'</span></div><div style="display:flex;justify-content:space-between;border-top:1px dashed #666"><span>Balance:</span><span>'+fmt((p.total||0)-(p.paid||0))+'</span></div></div></div></div>';
 };
 window.buildVoucher=function(p){
   if(!p)return'';
-  return '<div style="max-width:500px;margin:0 auto;border:2px solid #333;padding:20px"><div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:8px"><h2 style="margin:0;font-size:16px">'+(p.type||'').toUpperCase()+' VOUCHER</h2><b>'+p.no+'</b></div><div style="margin:16px 0;line-height:2"><b>Date:</b> '+p.date+'<br><b>Party:</b> '+(p.party||'')+'<br><b>Method:</b> '+(p.method||'').toUpperCase()+(p.chequeNo?' (Chq: '+p.chequeNo+')':'')+'<br><b>Note:</b> '+(p.note||'N/A')+'<br><br><div style="font-size:22px;font-weight:bold">Amount: '+fmt(p.amount)+'</div></div><div style="margin-top:40px;display:flex;justify-content:space-between"><span>________________<br>Receiver</span><span>________________<br>Authorized</span></div></div>';
+  return '<div style="max-width:500px;margin:0 auto;border:2px solid #333;padding:20px">'+getCompanyHeader()+'<div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:8px"><h2 style="margin:0;font-size:16px">'+(p.type||'').toUpperCase()+' VOUCHER</h2><b>'+p.no+'</b></div><div style="margin:16px 0;line-height:2"><b>Date:</b> '+p.date+'<br><b>Party:</b> '+(p.party||'')+'<br><b>Method:</b> '+(p.method||'').toUpperCase()+(p.chequeNo?' (Chq: '+p.chequeNo+')':'')+'<br><b>Note:</b> '+(p.note||'N/A')+'<br><br><div style="font-size:22px;font-weight:bold">Amount: '+fmt(p.amount)+'</div></div><div style="margin-top:40px;display:flex;justify-content:space-between"><span>________________<br>Receiver</span><span>________________<br>Authorized</span></div></div>';
 };
 window.buildExpenseVoucher=function(e){
   if(!e)return'';
-  return '<div style="max-width:500px;margin:0 auto;border:2px solid #333;padding:20px"><div style="border-bottom:1px solid #333;padding-bottom:8px"><h2 style="margin:0;font-size:16px">EXPENSE VOUCHER</h2></div><div style="margin:16px 0;line-height:2"><b>No:</b> '+e.expenseNo+'<br><b>Date:</b> '+e.date+'<br><b>Head:</b> '+e.headName+(e.subHeadName?' / '+e.subHeadName:'')+'<br><b>Method:</b> '+(e.method||'').toUpperCase()+(e.bankName?' ('+e.bankName+')':'')+'<br><b>Description:</b> '+(e.description||'N/A')+'<br><br><div style="font-size:22px;font-weight:bold">Amount: '+fmt(e.amount)+'</div></div></div>';
+  return '<div style="max-width:500px;margin:0 auto;border:2px solid #333;padding:20px">'+getCompanyHeader()+'<div style="border-bottom:1px solid #333;padding-bottom:8px"><h2 style="margin:0;font-size:16px">EXPENSE VOUCHER</h2></div><div style="margin:16px 0;line-height:2"><b>No:</b> '+e.expenseNo+'<br><b>Date:</b> '+e.date+'<br><b>Head:</b> '+e.headName+(e.subHeadName?' / '+e.subHeadName:'')+'<br><b>Method:</b> '+(e.method||'').toUpperCase()+(e.bankName?' ('+e.bankName+')':'')+'<br><b>Description:</b> '+(e.description||'N/A')+'<br><br><div style="font-size:22px;font-weight:bold">Amount: '+fmt(e.amount)+'</div></div></div>';
 };
 window.SESSION=${JSON.stringify(session||{})};
 // ============ TOAST NOTIFICATION SYSTEM ============
@@ -628,16 +764,59 @@ window.invalidateCache=function(prefix){
   if(prefix){delete window._dataCache[prefix];delete window._dataCacheTime[prefix];}
   else{window._dataCache={};window._dataCacheTime={};}
 };
+// ============ COMPANY SETTINGS LOADER ============
+window._companySettings={};
+window.loadCompanySettings=async function(){
+  try{
+    var r=await fetch('/api/company-settings');
+    var cs=await r.json();
+    window._companySettings=cs||{};
+    // Apply color theme dynamically
+    if(cs.primaryColor){
+      document.documentElement.style.setProperty('--primary',cs.primaryColor);
+      document.documentElement.style.setProperty('--sidebar-active',cs.primaryColor);
+    }
+    if(cs.sidebarColor){
+      document.documentElement.style.setProperty('--sidebar-bg',cs.sidebarColor);
+    }
+    // Update branding text
+    var logoEl=document.querySelector('.sidebar .logo');
+    if(logoEl&&cs.companyName){
+      var iconEl=logoEl.querySelector('.logo-icon');
+      var initials=cs.companyName.split(' ').map(function(w){return w[0]}).join('').substring(0,2).toUpperCase();
+      if(iconEl)iconEl.textContent=initials;
+      logoEl.childNodes[logoEl.childNodes.length-1].textContent=cs.companyName;
+    }
+    var mobileTitle=document.querySelector('.mobile-header span:last-child');
+    if(mobileTitle&&cs.companyName)mobileTitle.textContent=cs.companyName;
+    // Update page title
+    if(cs.companyName)document.title=cs.companyName+' - BizManager';
+  }catch(e){console.log('Company settings load error:',e);}
+};
+loadCompanySettings();
+// ============ COMPANY HEADER FOR INVOICES ============
+window.getCompanyHeader=function(){
+  var cs=window._companySettings||{};
+  if(!cs.companyName)return'';
+  return '<div style="text-align:center;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:14px">'
+    +'<h1 style="margin:0;font-size:20px;font-weight:800">'+cs.companyName+'</h1>'
+    +(cs.companyTagline?'<div style="font-size:11px;color:#777;font-style:italic;margin-top:2px">'+cs.companyTagline+'</div>':'')
+    +(cs.companyAddress?'<div style="font-size:11px;color:#555;margin-top:2px">'+cs.companyAddress+'</div>':'')
+    +(cs.companyPhone||cs.companyEmail?'<div style="font-size:10px;color:#666;margin-top:2px">'+(cs.companyPhone?'Phone: '+cs.companyPhone:'')+(cs.companyPhone&&cs.companyEmail?' | ':'')+(cs.companyEmail?'Email: '+cs.companyEmail:'')+'</div>':'')
+    +(cs.companyWebsite?'<div style="font-size:10px;color:#666">'+cs.companyWebsite+'</div>':'')
+    +(cs.companyTIN?'<div style="font-size:10px;color:#666">TIN/BIN: '+cs.companyTIN+'</div>':'')
+    +'</div>';
+};
 </script>
 </head><body>
 <div class="mobile-header">
   <button class="hamburger" onclick="toggleSidebar()"><span class="material-symbols-outlined">menu</span></button>
-  <span style="font-weight:800;font-size:14px">Apollow Traders</span>
+  <span style="font-weight:800;font-size:14px">BizManager</span>
 </div>
 <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
 <div class="app">
   <aside class="sidebar" id="sidebar">
-    <div class="logo"><div class="logo-icon">AT</div>Apollow Traders</div>
+    <div class="logo"><div class="logo-icon">BM</div>BizManager</div>
     <nav>${navHTML}<div class="nav-group" style="margin-top:12px"></div><a href="/sp-portal" target="_blank"><span class="nav-icon material-symbols-outlined">storefront</span>SP Portal</a><a href="/logout" style="opacity:.6"><span class="nav-icon material-symbols-outlined">logout</span>Logout</a></nav>
     <div class="sidebar-footer">BizManager v3.0 | ${userName} (${role})</div>
   </aside>
@@ -663,14 +842,23 @@ function loginPage(msg: string, hasUsers: boolean = false) {
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
 ${getCSS()}</head><body>
 <div class="login-page"><form class="login-card" method="POST" action="/login">
-  <div style="width:52px;height:52px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto;color:#fff;font-weight:800;font-size:18px">AT</div>
-  <h2>Apollow Traders</h2><div class="sub">Enter credentials to continue</div>
+  <div id="loginLogo" style="width:52px;height:52px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto;color:#fff;font-weight:800;font-size:18px">BM</div>
+  <h2 id="loginTitle">BizManager</h2><div class="sub">Enter credentials to continue</div>
   ${msg?`<div class="err">${msg}</div>`:''}
   ${hasUsers?`<input name="username" placeholder="Username" style="text-align:center">`:''}
   <input type="password" name="pin" placeholder="${hasUsers?'Password':'PIN'}" maxlength="20" autofocus required>
-  <button type="submit" class="btn btn-primary">Login</button>
+  <button type="submit" class="btn btn-primary" id="loginBtn">Login</button>
   <div style="margin-top:12px;font-size:11px;color:var(--muted)"><a href="/sp-portal/login">Salesperson Portal</a></div>
-</form></div></body></html>`;
+</form></div>
+<script>
+(async function(){try{var r=await fetch('/api/company-settings');var cs=await r.json();
+if(cs.companyName){document.getElementById('loginTitle').textContent=cs.companyName;document.title=cs.companyName+' - Login';
+var initials=cs.companyName.split(' ').map(function(w){return w[0]}).join('').substring(0,2).toUpperCase();
+document.getElementById('loginLogo').textContent=initials;}
+if(cs.primaryColor){document.documentElement.style.setProperty('--primary',cs.primaryColor);document.querySelector('.login-page').style.background='linear-gradient(135deg,'+cs.sidebarColor+' 0%,'+cs.primaryColor+' 100%)';document.getElementById('loginLogo').style.background='linear-gradient(135deg,'+cs.primaryColor+','+cs.sidebarColor+')';}
+}catch(e){}})();
+</script>
+</body></html>`;
 }
 function expiredPage() { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>License Expired</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><div class="login-card"><h2>License Expired</h2><div class="sub">Please renew.</div></div></div></body></html>`; }
 function spLoginPage(msg: string) { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SP Portal</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><form class="login-card" method="POST" action="/sp-portal/login"><h2>Salesperson Portal</h2><div class="sub">Enter code and PIN</div>${msg?`<div class="err">${msg}</div>`:''}<input name="code" placeholder="Code" style="text-align:center" required><input type="password" name="pin" placeholder="PIN" style="text-align:center" required><button type="submit" class="btn btn-primary">Login</button><div style="margin-top:12px"><a href="/login" style="font-size:11px;color:var(--muted)">Admin Login</a></div></form></div></body></html>`; }
@@ -1862,4 +2050,140 @@ var fl=mlLogs.filter(function(l){var d=(l.timestamp||'').slice(0,10);return(!af|
 fl.sort(function(a,b){return(b.timestamp||'').localeCompare(a.timestamp||'')});
 document.getElementById('mlBody').innerHTML=!fl.length?'<tr><td colspan="5" class="empty">No modification logs</td></tr>':fl.map(function(l){var actionBadge=l.action==='delete'?'badge-danger':l.action==='edit'?'badge-warning':'badge-success';var ts=l.timestamp?new Date(l.timestamp).toLocaleString():'';return'<tr><td class="text-muted" style="font-size:11px;white-space:nowrap">'+ts+'</td><td class="bold">'+(l.user||'System')+'</td><td><span class="badge '+actionBadge+'">'+(l.action||'')+'</span></td><td>'+(l.detail||'')+'</td><td class="text-muted" style="font-size:10px;word-break:break-all">'+(l.key||'')+'</td></tr>'}).join('')}
 loadML();
+</script>`}
+
+function approvalsPage(){return `
+<div class="page-header"><div><div class="page-title">Approval Queue</div><div class="page-sub">Review and approve/reject pending changes from Entry users</div></div></div>
+<div class="tabs"><button class="tab active" onclick="switchApprTab('pending',this)">Pending</button><button class="tab" onclick="switchApprTab('approved',this)">Approved</button><button class="tab" onclick="switchApprTab('rejected',this)">Rejected</button><button class="tab" onclick="switchApprTab('all',this)">All</button></div>
+<div class="stats" id="apprStats"></div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="apprTbl"><thead><tr><th>Requested</th><th>User</th><th>Type</th><th>Target</th><th>Detail</th><th>Status</th><th class="r">Actions</th></tr></thead><tbody id="apprBody"></tbody></table></div></div>
+<div class="modal-overlay" id="apprDetailModal"><div class="modal modal-lg">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h3 style="margin:0">Change Details</h3><button class="btn btn-outline btn-sm" onclick="closeModal('apprDetailModal')">Close</button></div>
+<div id="apprDetailContent"></div>
+<div id="apprDetailActions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px"></div>
+</div></div>
+<script>
+var apprItems=[],apprTab='pending';
+async function loadAppr(){apprItems=await api('/api/approval-list');renderAppr()}
+window.switchApprTab=function(t,el){apprTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderAppr()};
+function renderAppr(){
+  var fl=apprTab==='all'?apprItems:apprItems.filter(function(a){return a.status===apprTab});
+  fl.sort(function(a,b){return(b.requestedAt||'').localeCompare(a.requestedAt||'')});
+  var pending=apprItems.filter(function(a){return a.status==='pending'}).length;
+  var approved=apprItems.filter(function(a){return a.status==='approved'}).length;
+  var rejected=apprItems.filter(function(a){return a.status==='rejected'}).length;
+  document.getElementById('apprStats').innerHTML='<div class="stat"><div class="label">Pending</div><div class="value text-warning">'+pending+'</div></div><div class="stat"><div class="label">Approved</div><div class="value text-success">'+approved+'</div></div><div class="stat"><div class="label">Rejected</div><div class="value text-danger">'+rejected+'</div></div><div class="stat"><div class="label">Total</div><div class="value">'+apprItems.length+'</div></div>';
+  document.getElementById('apprBody').innerHTML=!fl.length?'<tr><td colspan="7" class="empty">No approval requests</td></tr>':fl.map(function(a){
+    var statusBadge=a.status==='pending'?'badge-warning':a.status==='approved'?'badge-success':'badge-danger';
+    var typeBadge=a.type==='delete'?'badge-danger':'badge-info';
+    var ts=a.requestedAt?new Date(a.requestedAt).toLocaleString():'';
+    var acts='';
+    if(a.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="approveAppr(\\x27'+a._key+'\\x27)">Approve</button> <button class="btn btn-danger btn-xs" onclick="rejectAppr(\\x27'+a._key+'\\x27)">Reject</button> ';}
+    acts+='<button class="btn btn-outline btn-xs" onclick="viewApprDetail(\\x27'+a._key+'\\x27)">View</button>';
+    return'<tr><td class="text-muted" style="font-size:11px;white-space:nowrap">'+ts+'</td><td class="bold">'+(a.requestedBy||'')+'</td><td><span class="badge '+typeBadge+'">'+(a.type||'')+'</span></td><td class="text-muted" style="font-size:11px;word-break:break-all">'+(a.targetKey||'')+'</td><td>'+(a.detail||'')+'</td><td><span class="badge '+statusBadge+'">'+(a.status||'')+'</span>'+(a.processedBy?'<br><span class="text-muted" style="font-size:10px">by '+a.processedBy+'</span>':'')+'</td><td class="r">'+acts+'</td></tr>'
+  }).join('')
+}
+window.approveAppr=async function(k){if(!confirm('Approve this change?'))return;try{await api('/api/approval-action',{approvalKey:k,action:'approve'});showToast('Change approved and applied','success');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
+window.rejectAppr=async function(k){if(!confirm('Reject this change?'))return;try{await api('/api/approval-action',{approvalKey:k,action:'reject'});showToast('Change rejected','info');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
+window.viewApprDetail=function(k){
+  var a=apprItems.find(function(x){return x._key===k});if(!a)return;
+  var html='<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">';
+  html+='<div class="card"><div class="section-title">Request Info</div><div style="line-height:2;font-size:12px"><b>Type:</b> '+(a.type||'')+'<br><b>Target:</b> '+(a.targetKey||'')+'<br><b>Requested By:</b> '+(a.requestedBy||'')+'<br><b>Requested At:</b> '+(a.requestedAt?new Date(a.requestedAt).toLocaleString():'')+'<br><b>Status:</b> <span class="badge '+(a.status==='pending'?'badge-warning':a.status==='approved'?'badge-success':'badge-danger')+'">'+(a.status||'')+'</span>'+(a.processedBy?'<br><b>Processed By:</b> '+a.processedBy:'')+(a.processedAt?'<br><b>Processed At:</b> '+new Date(a.processedAt).toLocaleString():'')+'</div></div>';
+  if(a.type==='edit'){
+    html+='<div class="card"><div class="section-title">Old Data</div><pre style="font-size:10px;max-height:300px;overflow:auto;background:var(--bg);padding:8px;border-radius:6px">'+JSON.stringify(a.oldData,null,2)+'</pre></div>';
+    html+='</div><div class="card" style="margin-top:14px"><div class="section-title">New Data (Proposed)</div><pre style="font-size:10px;max-height:300px;overflow:auto;background:var(--accent-light);padding:8px;border-radius:6px">'+JSON.stringify(a.newData,null,2)+'</pre></div>';
+  }else{
+    html+='<div class="card"><div class="section-title">Data to be Deleted</div><pre style="font-size:10px;max-height:300px;overflow:auto;background:var(--danger-light);padding:8px;border-radius:6px">'+JSON.stringify(a.oldData,null,2)+'</pre></div>';
+    html+='</div>';
+  }
+  document.getElementById('apprDetailContent').innerHTML=html;
+  var actHtml='';
+  if(a.status==='pending'){actHtml='<button class="btn btn-success" onclick="approveAppr(\\x27'+a._key+'\\x27);closeModal(\\x27apprDetailModal\\x27)">Approve</button><button class="btn btn-danger" onclick="rejectAppr(\\x27'+a._key+'\\x27);closeModal(\\x27apprDetailModal\\x27)">Reject</button>';}
+  document.getElementById('apprDetailActions').innerHTML=actHtml;
+  openModal('apprDetailModal');
+};
+loadAppr();
+</script>`}
+
+function companySettingsPage(){return `
+<div class="page-header"><div><div class="page-title">Company Settings</div><div class="page-sub">Configure company name, details & theme colors globally</div></div></div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+<div class="card">
+<div class="section-title">Company Information</div>
+<div class="form-group"><label>Company Name</label><input id="csName" placeholder="Your Company Name"></div>
+<div class="form-group"><label>Tagline / Slogan</label><input id="csTagline" placeholder="e.g. Quality Trading Since 1990"></div>
+<div class="form-group"><label>Address</label><textarea id="csAddress" rows="2" placeholder="Full business address"></textarea></div>
+<div class="form-row"><div><label>Phone</label><input id="csPhone" placeholder="+880-XXX-XXXX"></div><div><label>Email</label><input id="csEmail" placeholder="info@company.com"></div></div>
+<div class="form-row"><div><label>Website</label><input id="csWebsite" placeholder="www.company.com"></div><div><label>TIN/BIN Number</label><input id="csTIN" placeholder="Tax ID"></div></div>
+</div>
+<div class="card">
+<div class="section-title">Theme & Appearance</div>
+<div class="form-row"><div><label>Primary Color</label><div style="display:flex;gap:8px;align-items:center"><input type="color" id="csPrimary" value="#4f46e5" style="width:50px;height:36px;padding:2px;cursor:pointer"><input id="csPrimaryText" value="#4f46e5" style="width:100px" oninput="document.getElementById('csPrimary').value=this.value" placeholder="#hex"></div></div><div><label>Sidebar Color</label><div style="display:flex;gap:8px;align-items:center"><input type="color" id="csSidebar" value="#1e1b4b" style="width:50px;height:36px;padding:2px;cursor:pointer"><input id="csSidebarText" value="#1e1b4b" style="width:100px" oninput="document.getElementById('csSidebar').value=this.value" placeholder="#hex"></div></div></div>
+<div style="margin-top:12px"><div class="section-title">Preview</div>
+<div id="csPreview" style="border:1px solid var(--border);border-radius:10px;overflow:hidden;height:120px;display:flex">
+<div id="csPreviewSidebar" style="width:200px;padding:12px;color:#fff;display:flex;flex-direction:column;gap:6px"><div style="font-weight:800;font-size:13px" id="csPreviewLogo">Company</div><div style="font-size:11px;opacity:.7">Dashboard</div><div style="font-size:11px;opacity:.7">Inventory</div><div style="font-size:11px;padding:4px 8px;border-radius:6px" id="csPreviewActive">Sales</div></div>
+<div style="flex:1;padding:12px;background:var(--bg)"><div style="font-weight:800;font-size:14px" id="csPreviewTitle">Dashboard</div><div style="margin-top:6px;display:flex;gap:6px"><div style="padding:6px 12px;border-radius:6px;color:#fff;font-size:11px;font-weight:600" id="csPreviewBtn">Button</div><div style="padding:6px 12px;border:1px solid var(--border);border-radius:6px;font-size:11px">Outline</div></div></div>
+</div></div>
+<div class="form-row" style="margin-top:14px"><div><button class="btn btn-outline" onclick="resetThemeDefaults()">Reset to Default</button></div></div>
+</div>
+</div>
+<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px"><button class="btn btn-primary" onclick="saveCS()" style="padding:12px 28px;font-size:14px"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">save</span> Save Settings</button></div>
+<script>
+var csData={};
+async function loadCS(){
+  try{
+    var r=await fetch('/api/company-settings');
+    csData=await r.json();
+    document.getElementById('csName').value=csData.companyName||'';
+    document.getElementById('csTagline').value=csData.companyTagline||'';
+    document.getElementById('csAddress').value=csData.companyAddress||'';
+    document.getElementById('csPhone').value=csData.companyPhone||'';
+    document.getElementById('csEmail').value=csData.companyEmail||'';
+    document.getElementById('csWebsite').value=csData.companyWebsite||'';
+    document.getElementById('csTIN').value=csData.companyTIN||'';
+    document.getElementById('csPrimary').value=csData.primaryColor||'#4f46e5';
+    document.getElementById('csPrimaryText').value=csData.primaryColor||'#4f46e5';
+    document.getElementById('csSidebar').value=csData.sidebarColor||'#1e1b4b';
+    document.getElementById('csSidebarText').value=csData.sidebarColor||'#1e1b4b';
+    updatePreview();
+  }catch(e){console.log(e)}
+}
+window.updatePreview=function(){
+  var pc=document.getElementById('csPrimary').value;
+  var sc=document.getElementById('csSidebar').value;
+  var nm=document.getElementById('csName').value||'Company';
+  document.getElementById('csPreviewSidebar').style.background=sc;
+  document.getElementById('csPreviewActive').style.background=pc;
+  document.getElementById('csPreviewBtn').style.background=pc;
+  document.getElementById('csPreviewLogo').textContent=nm;
+  document.getElementById('csPrimaryText').value=pc;
+  document.getElementById('csSidebarText').value=sc;
+};
+document.getElementById('csPrimary').addEventListener('input',updatePreview);
+document.getElementById('csSidebar').addEventListener('input',updatePreview);
+document.getElementById('csName').addEventListener('input',updatePreview);
+window.resetThemeDefaults=function(){
+  document.getElementById('csPrimary').value='#4f46e5';
+  document.getElementById('csSidebar').value='#1e1b4b';
+  updatePreview();
+};
+window.saveCS=async function(){
+  var data={
+    companyName:document.getElementById('csName').value.trim(),
+    companyTagline:document.getElementById('csTagline').value.trim(),
+    companyAddress:document.getElementById('csAddress').value.trim(),
+    companyPhone:document.getElementById('csPhone').value.trim(),
+    companyEmail:document.getElementById('csEmail').value.trim(),
+    companyWebsite:document.getElementById('csWebsite').value.trim(),
+    companyTIN:document.getElementById('csTIN').value.trim(),
+    primaryColor:document.getElementById('csPrimary').value,
+    sidebarColor:document.getElementById('csSidebar').value
+  };
+  try{
+    await api('/api/company-settings',data);
+    showToast('Company settings saved successfully! Reloading...','success');
+    setTimeout(function(){window.location.reload()},1500);
+  }catch(e){showToast('Failed to save: '+e.message,'error')}
+};
+loadCS();
 </script>`}
