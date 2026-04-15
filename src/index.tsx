@@ -590,9 +590,19 @@ window.buildExpenseVoucher=function(e){
 };
 window.SESSION=${JSON.stringify(session||{})};
 // ============ TOAST NOTIFICATION SYSTEM ============
-(function(){var container=document.createElement('div');container.className='toast-container';container.id='toastContainer';document.body.appendChild(container)})();
+window._toastReady=false;
+window._toastQueue=[];
+function _initToastContainer(){
+  if(window._toastReady)return;
+  if(!document.body)return;
+  var container=document.createElement('div');container.className='toast-container';container.id='toastContainer';document.body.appendChild(container);
+  window._toastReady=true;
+  while(window._toastQueue.length){var q=window._toastQueue.shift();showToast(q.msg,q.type);}
+}
+if(document.body){_initToastContainer();}else{document.addEventListener('DOMContentLoaded',_initToastContainer);}
 window.showToast=function(msg,type){
   type=type||'success';
+  if(!window._toastReady){window._toastQueue.push({msg:msg,type:type});if(document.body)_initToastContainer();return;}
   var icons={success:'check_circle',error:'error',warning:'warning',info:'info'};
   var toast=document.createElement('div');
   toast.className='toast toast-'+type;
