@@ -584,8 +584,12 @@ function layout(content: string, active: string, session: any) {
   const nav = [
     { group: 'Main', items: [
       { path:"/", icon:"grid_view", label:"Dashboard", id:"dashboard" },
-      { path:"/inventory", icon:"inventory_2", label:"Inventory", id:"inventory" },
+      { path:"/day-details", icon:"calendar_today", label:"Day Details", id:"daydetails" },
+      { path:"/orders", icon:"assignment", label:"Orders", id:"orders" },
       { path:"/stock-check", icon:"checklist", label:"Stock Check", id:"stockcheck" },
+    ]},
+    { group: 'Inventory & Parties', items: [
+      { path:"/inventory", icon:"inventory_2", label:"Inventory", id:"inventory" },
       { path:"/parties", icon:"groups", label:"Customers & Suppliers", id:"parties" },
     ]},
     { group: 'Transactions', items: [
@@ -593,28 +597,24 @@ function layout(content: string, active: string, session: any) {
       { path:"/sales", icon:"receipt_long", label:"Sales", id:"sales" },
       { path:"/payments", icon:"account_balance_wallet", label:"Accounts & Banking", id:"payments" },
       { path:"/expenses", icon:"payments", label:"Expenses", id:"expenses" },
-      { path:"/orders", icon:"assignment", label:"Orders", id:"orders" },
     ]},
-    { group: 'Ledgers & Reports', items: [
+    { group: 'Reports', items: [
+      { path:"/reports", icon:"assessment", label:"Reports", id:"reports" },
       { path:"/ledger", icon:"menu_book", label:"Ledger", id:"ledger" },
       { path:"/expense-ledger", icon:"receipt", label:"Expense Ledger", id:"expledger" },
+      { path:"/receivable-payable", icon:"swap_horiz", label:"Receivable / Payable", id:"recpay" },
       { path:"/profit-loss", icon:"trending_up", label:"Profit & Loss", id:"profitloss" },
       { path:"/balance-sheet", icon:"account_balance", label:"Balance Sheet", id:"balancesheet" },
       { path:"/trial-balance", icon:"balance", label:"Trial Balance", id:"trialbalance" },
-      { path:"/receivable-payable", icon:"swap_horiz", label:"Receivable / Payable", id:"recpay" },
-      { path:"/reports", icon:"assessment", label:"Reports", id:"reports" },
-    ]},
-    { group: 'Stock & Sales', items: [
       { path:"/stock", icon:"warehouse", label:"Stock & Valuation", id:"stock" },
-      { path:"/salesperson", icon:"badge", label:"Salesperson Mgmt", id:"salesperson" },
-      { path:"/day-details", icon:"calendar_today", label:"Day Details", id:"daydetails" },
     ]},
     { group: 'System', items: [
       { path:"/users", icon:"manage_accounts", label:"Users & Access", id:"users" },
+      { path:"/salesperson", icon:"badge", label:"Salesperson Mgmt", id:"salesperson" },
       { path:"/approvals", icon:"task_alt", label:"Approval Queue", id:"approvals" },
-      { path:"/mod-log", icon:"history", label:"Modification Log", id:"modlog" },
       { path:"/company-settings", icon:"domain", label:"Company Settings", id:"companysettings" },
       { path:"/admin", icon:"settings", label:"Admin", id:"admin" },
+      { path:"/mod-log", icon:"history", label:"Modification Log", id:"modlog" },
     ]},
   ];
 
@@ -669,8 +669,11 @@ window.printContent=function(elementId,title){
     +(cs.companyWebsite?'<div style="font-size:10px;color:#666">'+cs.companyWebsite+'</div>':'')
     +(cs.companyTIN?'<div style="font-size:10px;color:#666">TIN: '+cs.companyTIN+'</div>':'')
     +'</div>';
+  // Skip company header if content already contains one (e.g. invoice/voucher previews)
+  var contentHtml=content.innerHTML;
+  var alreadyHasHeader=elementId==='docPrintArea';
   var win=window.open('','_blank');
-  win.document.write('<html><head><title>'+(title||'Print')+'</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:11px}.r{text-align:right}.bold{font-weight:bold}.text-danger{color:#dc2626}.text-success{color:#059669}.text-warning{color:#d97706}.text-muted{color:#666}.text-info{color:#0891b2}.text-primary{color:#4f46e5}.badge{padding:2px 6px;border-radius:3px;font-size:9px}.pl-row{display:flex;justify-content:space-between;padding:4px 12px}.pl-row.total{font-weight:bold;background:#f3f3f3;padding:8px 12px}.led-sale td{background:#eef2ff}.led-purchase td{background:#fffbeb}.led-receipt td,.led-payment td{background:#ecfdf5}.stat{display:inline-block;padding:8px 12px;margin:3px;border:1px solid #ddd;border-radius:6px}.stat .label{font-size:9px;text-transform:uppercase;color:#666;font-weight:bold}.stat .value{font-size:16px;font-weight:bold}.stats{margin-bottom:12px}.card{margin-bottom:12px;padding:10px}</style></head><body>'+companyHeader+content.innerHTML+'</body></html>');
+  win.document.write('<html><head><title>'+(title||'Print')+'</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:11px}.r{text-align:right}.bold{font-weight:bold}.text-danger{color:#dc2626}.text-success{color:#059669}.text-warning{color:#d97706}.text-muted{color:#666}.text-info{color:#0891b2}.text-primary{color:#4f46e5}.badge{padding:2px 6px;border-radius:3px;font-size:9px}.pl-row{display:flex;justify-content:space-between;padding:4px 12px}.pl-row.total{font-weight:bold;background:#f3f3f3;padding:8px 12px}.led-sale td{background:#eef2ff}.led-purchase td{background:#fffbeb}.led-receipt td,.led-payment td{background:#ecfdf5}.stat{display:inline-block;padding:8px 12px;margin:3px;border:1px solid #ddd;border-radius:6px}.stat .label{font-size:9px;text-transform:uppercase;color:#666;font-weight:bold}.stat .value{font-size:16px;font-weight:bold}.stats{margin-bottom:12px}.card{margin-bottom:12px;padding:10px}</style></head><body>'+(alreadyHasHeader?'':companyHeader)+contentHtml+'</body></html>');
   win.document.close();setTimeout(function(){win.print();win.close();},500);
 };
 // Document preview handler
@@ -817,7 +820,7 @@ window.getCompanyHeader=function(){
 <div class="app">
   <aside class="sidebar" id="sidebar">
     <div class="logo"><div class="logo-icon">BM</div>BizManager</div>
-    <nav>${navHTML}<div class="nav-group" style="margin-top:12px"></div><a href="/sp-portal" target="_blank"><span class="nav-icon material-symbols-outlined">storefront</span>SP Portal</a><a href="/logout" style="opacity:.6"><span class="nav-icon material-symbols-outlined">logout</span>Logout</a></nav>
+    <nav>${navHTML}<div class="nav-group" style="margin-top:12px">Portal</div><a href="/sp-portal" target="_blank"><span class="nav-icon material-symbols-outlined">storefront</span>SP Portal</a><div class="nav-group"></div><a href="/logout" style="opacity:.6"><span class="nav-icon material-symbols-outlined">logout</span>Logout</a></nav>
     <div class="sidebar-footer">BizManager v3.0 | ${userName} (${role})</div>
   </aside>
   <main class="main">${content}</main>
@@ -1279,10 +1282,15 @@ if(payTab==='bankledger'){
 if(payTab==='bank'){c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openBankModal()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Bank</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Bank</th><th>Account No</th><th class="r">Balance</th><th class="r">Act</th></tr></thead><tbody>'+(!banks.length?'<tr><td colspan="4" class="empty">No banks</td></tr>':banks.map(function(b){return'<tr><td class="bold">'+b.name+'</td><td>'+(b.accountNo||'')+'</td><td class="r bold">'+fmt(b.balance||b.openingBalance||0)+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editBank(\\x27'+b._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delBank(\\x27'+b._key+'\\x27)">Del</button></td></tr>'}).join(''))+'</tbody></table></div></div>';return}
 if(payTab==='transfer'){var trs=pays.filter(function(p){return p.type==='transfer'});c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openTransfer()"><span class="material-symbols-outlined" style="font-size:16px">swap_horiz</span> New Transfer</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>No</th><th>From</th><th>To</th><th class="r">Amount</th></tr></thead><tbody>'+(trs.length?trs.sort(function(a,b){return(b.date||'').localeCompare(a.date)}).map(function(t){return'<tr><td>'+t.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27transfer\\x27,\\x27'+t._key+'\\x27)">'+t.no+'</span></td><td>'+t.fromAcc+'</td><td>'+t.toAcc+'</td><td class="r bold">'+fmt(t.amount)+'</td></tr>'}).join(''):'<tr><td colspan="5" class="empty">No transfers</td></tr>')+'</tbody></table></div></div>';return}
 var fl=pays.filter(function(p){return p.type===payTab&&p.status==='done'}).sort(function(a,b){return(b.date||'').localeCompare(a.date)});
-c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openPayModal(\\x27'+payTab+'\\x27)"><span class="material-symbols-outlined" style="font-size:16px">add</span> New '+(payTab==='receipt'?'Receipt':'Payment')+'</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="payTbl"><thead><tr><th>Date</th><th>No</th><th>Party</th><th>Method</th><th class="r">Amount</th><th>Note</th><th class="r">Act</th></tr></thead><tbody>'+(fl.length?fl.map(function(p){return'<tr><td>'+p.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27'+p.type+'\\x27,\\x27'+p._key+'\\x27)">'+p.no+'</span></td><td>'+p.party+'</td><td>'+methodBadge(p.method)+'</td><td class="r bold">'+fmt(p.amount)+'</td><td class="text-muted">'+(p.note||'')+'</td><td class="r"><button class="btn btn-danger btn-xs" onclick="delPay(\\x27'+p._key+'\\x27)">Del</button></td></tr>'}).join(''):'<tr><td colspan="7" class="empty">None</td></tr>')+'</tbody></table></div></div>'}
+c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openPayModal(\\x27'+payTab+'\\x27)"><span class="material-symbols-outlined" style="font-size:16px">add</span> New '+(payTab==='receipt'?'Receipt':'Payment')+'</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="payTbl"><thead><tr><th>Date</th><th>No</th><th>Party</th><th>Method</th><th class="r">Amount</th><th>Note</th><th class="r">Act</th></tr></thead><tbody>'+(fl.length?fl.map(function(p){return'<tr><td>'+p.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27'+p.type+'\\x27,\\x27'+p._key+'\\x27)">'+p.no+'</span></td><td>'+p.party+'</td><td>'+methodBadge(p.method)+'</td><td class="r bold">'+fmt(p.amount)+'</td><td class="text-muted">'+(p.note||'')+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editPay(\\x27'+p._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delPay(\\x27'+p._key+'\\x27)">Del</button></td></tr>'}).join(''):'<tr><td colspan="7" class="empty">None</td></tr>')+'</tbody></table></div></div>'}
 window.openPayModal=function(type){document.getElementById('payEK').value='';document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='New '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=txnNo(type==='receipt'?'RCV':'PAY');document.getElementById('payDt').value=todayISO();document.getElementById('payAmt').value='';document.getElementById('payNote').value='';document.getElementById('payMeth').value='cash';document.getElementById('payCheque').value='';document.getElementById('chequeDiv').classList.add('hidden');
 var pts=type==='receipt'?payParties.filter(function(p){return p.type==='customer'}):payParties.filter(function(p){return p.type==='supplier'});document.getElementById('payParty').innerHTML='<option value="">Select...</option>'+pts.map(function(p){return'<option value="'+p.name+'">'+p.name+'</option>'}).join('');
 document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
+document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
+document.getElementById('payParty').onchange=function(){showBills(type,this.value)}}
+window.editPay=function(k){var p=pays.find(function(x){return x._key===k});if(!p)return;var type=p.type;document.getElementById('payEK').value=k;document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='Edit '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=p.no||'';document.getElementById('payDt').value=p.date||todayISO();document.getElementById('payAmt').value=p.amount||'';document.getElementById('payNote').value=p.note||'';document.getElementById('payMeth').value=p.method||'cash';document.getElementById('payCheque').value=p.chequeNo||'';document.getElementById('chequeDiv').classList.toggle('hidden',p.method!=='cheque');var needsBank=p.method==='bank_transfer'||p.method==='cheque'||p.method==='credit_card'||p.method==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);
+var pts=type==='receipt'?payParties.filter(function(x){return x.type==='customer'}):payParties.filter(function(x){return x.type==='supplier'});document.getElementById('payParty').innerHTML='<option value="">Select...</option>'+pts.map(function(x){return'<option value="'+x.name+'">'+x.name+'</option>'}).join('');document.getElementById('payParty').value=p.party||'';
+document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');document.getElementById('payBank').value=p.bankName||'';
 document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
 document.getElementById('payParty').onchange=function(){showBills(type,this.value)}}
 window.showBills=function(type,party){var div=document.getElementById('billSelection');var list=document.getElementById('billList');if(!party){div.classList.add('hidden');return}
@@ -1290,7 +1298,16 @@ var bills=[];if(type==='receipt'){bills=paySales.filter(function(s){return s.cus
 if(bills.length){div.classList.remove('hidden');list.innerHTML='<table class="tbl" style="font-size:11px"><thead><tr><th>Bill#</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th>Select</th></tr></thead><tbody>'+bills.map(function(b){return'<tr><td>'+b.no+'</td><td class="r">'+fmt(b.total)+'</td><td class="r">'+fmt(b.paid)+'</td><td class="r text-danger">'+fmt(b.due)+'</td><td><input type="checkbox" data-key="'+b.key+'" data-due="'+b.due+'" onchange="calcBillAmt()"></td></tr>'}).join('')+'</tbody></table>'}else{div.classList.add('hidden')}}
 window.calcBillAmt=function(){var total=0;document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){total+=+(c.dataset.due||0)});document.getElementById('payAmt').value=total}
 window.toggleCheque=function(){var m=document.getElementById('payMeth').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);document.getElementById('chequeDiv').classList.toggle('hidden',m!=='cheque')}
-window.savePay=async function(){var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}var amt=+document.getElementById('payAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:amt,method:document.getElementById('payMeth').value,bankName:document.getElementById('payBank').value,chequeNo:document.getElementById('payCheque').value,note:document.getElementById('payNote').value,status:'done'};
+window.savePay=async function(){var ek=document.getElementById('payEK').value;var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}var amt=+document.getElementById('payAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:amt,method:document.getElementById('payMeth').value,bankName:document.getElementById('payBank').value,chequeNo:document.getElementById('payCheque').value,note:document.getElementById('payNote').value,status:'done'};
+if(ek){
+  // Editing: reverse old bank balance first
+  var oldPay=pays.find(function(x){return x._key===ek});
+  if(oldPay&&oldPay.method!=='cash'&&oldPay.bankName){var oldBk=banks.find(function(b){return b.name===oldPay.bankName});if(oldBk){if(oldPay.type==='receipt'){oldBk.balance=(oldBk.balance||0)-oldPay.amount}else{oldBk.balance=(oldBk.balance||0)+oldPay.amount}await saveByKey(oldBk._key,cleanForSave(oldBk))}}
+  await saveByKey(ek,data,'edit','Edit '+(type==='receipt'?'receipt':'payment')+': '+data.no);
+  // Apply new bank balance
+  if(data.method!=='cash'&&data.bankName){var newBk=banks.find(function(b){return b.name===data.bankName});if(newBk){if(type==='receipt'){newBk.balance=(newBk.balance||0)+amt}else{newBk.balance=(newBk.balance||0)-amt}await saveByKey(newBk._key,cleanForSave(newBk))}}
+  invalidateCache('payment:');invalidateCache('bank:');showToast((type==='receipt'?'Receipt':'Payment')+' updated successfully','success');closeModal('payModal');loadPay();return;
+}
 var bills=[];document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){bills.push(c.dataset.key)});data.billKeys=bills;
 await saveItem('payment:',data);
 var method=data.method;var bankName=data.bankName;
@@ -2085,15 +2102,65 @@ function renderAppr(){
 }
 window.approveAppr=async function(k){if(!confirm('Approve this change?'))return;try{await api('/api/approval-action',{approvalKey:k,action:'approve'});showToast('Change approved and applied','success');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
 window.rejectAppr=async function(k){if(!confirm('Reject this change?'))return;try{await api('/api/approval-action',{approvalKey:k,action:'reject'});showToast('Change rejected','info');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
+window._humanizeKey=function(k){
+  var map={invoiceNo:'Invoice No',purchaseNo:'Purchase No',expenseNo:'Expense No',customerName:'Customer',supplierName:'Supplier',customerId:'Customer ID',supplierId:'Supplier ID',salespersonName:'Salesperson',salespersonId:'Salesperson ID',productName:'Product',productId:'Product ID',headName:'Head',subHeadName:'Sub-Head',bankName:'Bank',chequeNo:'Cheque No',companyName:'Company',companyAddress:'Address',companyPhone:'Phone',companyEmail:'Email',companyWebsite:'Website',companyTIN:'TIN/BIN',companyTagline:'Tagline',primaryColor:'Primary Color',sidebarColor:'Sidebar Color',openingBalance:'Opening Balance',creditLimit:'Credit Limit',vatType:'VAT Type',aitType:'AIT Type',discountType:'Discount Type'};
+  if(map[k])return map[k];
+  return k.replace(/([A-Z])/g,' $1').replace(/^./,function(s){return s.toUpperCase()}).replace(/_/g,' ');
+};
+window._humanizeVal=function(v){
+  if(v===null||v===undefined)return'<span class="text-muted">N/A</span>';
+  if(typeof v==='boolean')return v?'Yes':'No';
+  if(typeof v==='number')return fmt(v);
+  if(Array.isArray(v)){
+    if(v.length===0)return'<span class="text-muted">(empty)</span>';
+    if(v[0]&&typeof v[0]==='object'){return'<table class="tbl" style="font-size:11px;margin:4px 0"><thead><tr>'+Object.keys(v[0]).filter(function(k){return k!=='_key'}).map(function(k){return'<th>'+_humanizeKey(k)+'</th>'}).join('')+'</tr></thead><tbody>'+v.map(function(row){return'<tr>'+Object.keys(v[0]).filter(function(k){return k!=='_key'}).map(function(k){return'<td>'+(typeof row[k]==='number'?fmt(row[k]):(row[k]||''))+'</td>'}).join('')+'</tr>'}).join('')+'</tbody></table>';}
+    return v.join(', ');
+  }
+  if(typeof v==='string'&&/^\d{4}-\d{2}-\d{2}/.test(v)){try{return new Date(v).toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'})}catch(e){return v}}
+  return String(v);
+};
+window._humanizeData=function(data,title,bgColor){
+  if(!data)return'<div class="empty">No data</div>';
+  var html='';
+  var skip=['_key'];
+  var keys=Object.keys(data).filter(function(k){return skip.indexOf(k)===-1});
+  html+='<table style="width:100%;font-size:12px;border-collapse:collapse">';
+  keys.forEach(function(k){
+    var val=data[k];
+    var isArray=Array.isArray(val)&&val.length>0&&typeof val[0]==='object';
+    html+='<tr style="border-bottom:1px solid var(--border)"><td style="padding:6px 10px;font-weight:700;color:var(--muted);white-space:nowrap;vertical-align:top;width:140px;font-size:11px;text-transform:uppercase;letter-spacing:.3px">'+_humanizeKey(k)+'</td><td style="padding:6px 10px">'+(isArray?_humanizeVal(val):_humanizeVal(val))+'</td></tr>';
+  });
+  html+='</table>';
+  return html;
+};
+window._humanizeDiff=function(oldData,newData){
+  if(!oldData||!newData)return'';
+  var allKeys=Object.keys(Object.assign({},oldData,newData)).filter(function(k){return k!=='_key'});
+  var html='<table style="width:100%;font-size:12px;border-collapse:collapse"><thead><tr style="background:var(--bg)"><th style="padding:6px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted)">Field</th><th style="padding:6px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted)">Old Value</th><th style="padding:6px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted)">New Value</th></tr></thead><tbody>';
+  allKeys.forEach(function(k){
+    var ov=oldData[k],nv=newData[k];
+    var ovStr=JSON.stringify(ov),nvStr=JSON.stringify(nv);
+    var changed=ovStr!==nvStr;
+    var rowStyle=changed?'background:rgba(217,119,6,.06)':'';
+    html+='<tr style="border-bottom:1px solid var(--border);'+rowStyle+'"><td style="padding:6px 10px;font-weight:700;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap;vertical-align:top">'+_humanizeKey(k)+(changed?' <span style="color:var(--warning);font-size:9px">CHANGED</span>':'')+'</td><td style="padding:6px 10px;vertical-align:top">'+(Array.isArray(ov)&&ov.length>0&&typeof ov[0]==='object'?_humanizeVal(ov):_humanizeVal(ov))+'</td><td style="padding:6px 10px;vertical-align:top'+(changed?';font-weight:700':'')+'">'+(Array.isArray(nv)&&nv.length>0&&typeof nv[0]==='object'?_humanizeVal(nv):_humanizeVal(nv))+'</td></tr>';
+  });
+  html+='</tbody></table>';
+  return html;
+};
 window.viewApprDetail=function(k){
   var a=apprItems.find(function(x){return x._key===k});if(!a)return;
   var html='<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">';
   html+='<div class="card"><div class="section-title">Request Info</div><div style="line-height:2;font-size:12px"><b>Type:</b> '+(a.type||'')+'<br><b>Target:</b> '+(a.targetKey||'')+'<br><b>Requested By:</b> '+(a.requestedBy||'')+'<br><b>Requested At:</b> '+(a.requestedAt?new Date(a.requestedAt).toLocaleString():'')+'<br><b>Status:</b> <span class="badge '+(a.status==='pending'?'badge-warning':a.status==='approved'?'badge-success':'badge-danger')+'">'+(a.status||'')+'</span>'+(a.processedBy?'<br><b>Processed By:</b> '+a.processedBy:'')+(a.processedAt?'<br><b>Processed At:</b> '+new Date(a.processedAt).toLocaleString():'')+'</div></div>';
   if(a.type==='edit'){
-    html+='<div class="card"><div class="section-title">Old Data</div><pre style="font-size:10px;max-height:300px;overflow:auto;background:var(--bg);padding:8px;border-radius:6px">'+JSON.stringify(a.oldData,null,2)+'</pre></div>';
-    html+='</div><div class="card" style="margin-top:14px"><div class="section-title">New Data (Proposed)</div><pre style="font-size:10px;max-height:300px;overflow:auto;background:var(--accent-light);padding:8px;border-radius:6px">'+JSON.stringify(a.newData,null,2)+'</pre></div>';
+    if(a.oldData&&a.newData){
+      html+='<div class="card"><div class="section-title">Summary of Changes</div><div style="font-size:11px;color:var(--muted);margin-bottom:6px">Fields marked <span style="color:var(--warning);font-weight:700">CHANGED</span> have been modified</div></div>';
+      html+='</div><div class="card" style="margin-top:14px;padding:0;overflow:auto;max-height:400px"><div style="padding:12px 16px 4px"><div class="section-title">Comparison: Old vs New</div></div>'+_humanizeDiff(a.oldData,a.newData)+'</div>';
+    }else{
+      html+='<div class="card"><div class="section-title">Proposed Data</div>'+_humanizeData(a.newData||a.oldData)+'</div>';
+      html+='</div>';
+    }
   }else{
-    html+='<div class="card"><div class="section-title">Data to be Deleted</div><pre style="font-size:10px;max-height:300px;overflow:auto;background:var(--danger-light);padding:8px;border-radius:6px">'+JSON.stringify(a.oldData,null,2)+'</pre></div>';
+    html+='<div class="card"><div class="section-title">Data to be Deleted</div>'+_humanizeData(a.oldData)+'</div>';
     html+='</div>';
   }
   document.getElementById('apprDetailContent').innerHTML=html;
