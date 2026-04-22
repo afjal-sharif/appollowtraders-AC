@@ -466,7 +466,103 @@ a{color:var(--primary);text-decoration:none}
 .hamburger{background:none;border:none;font-size:20px;cursor:pointer;color:var(--text);width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:8px}
 .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:45;backdrop-filter:blur(2px)}
 .overlay.open{display:block}
-@media(max-width:900px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.mobile-header{display:flex}.main{margin-left:0;padding:64px 12px 20px}}
+@media(max-width:900px){
+.sidebar{transform:translateX(-100%);width:280px}
+.sidebar.open{transform:translateX(0)}
+.mobile-header{display:flex}
+.main{margin-left:0;padding:64px 12px 20px}
+/* Bottom Navigation Bar */
+.bottom-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--border);z-index:40;padding:4px 0 env(safe-area-inset-bottom,4px);box-shadow:0 -2px 10px rgba(0,0,0,.06)}
+.bottom-nav .bnav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:6px 2px;cursor:pointer;color:var(--muted);text-decoration:none;transition:color .2s;-webkit-tap-highlight-color:transparent;position:relative;border:none;background:none;font-family:inherit}
+.bottom-nav .bnav-item .bnav-icon{font-size:22px;line-height:1;transition:all .2s}
+.bottom-nav .bnav-item .bnav-label{font-size:9px;font-weight:600;margin-top:2px;letter-spacing:.2px;transition:all .2s}
+.bottom-nav .bnav-item.active{color:var(--primary)}
+.bottom-nav .bnav-item.active .bnav-icon{transform:translateY(-2px);font-variation-settings:'FILL' 1}
+.bottom-nav .bnav-item.active::before{content:'';position:absolute;top:-1px;left:50%;transform:translateX(-50%);width:36px;height:3px;background:var(--primary);border-radius:0 0 3px 3px}
+.bottom-nav .bnav-more{position:relative}
+.bottom-nav .bnav-more-menu{display:none;position:absolute;bottom:100%;right:0;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:6px;min-width:180px;box-shadow:0 -8px 30px rgba(0,0,0,.12);margin-bottom:8px;max-height:60vh;overflow-y:auto}
+.bottom-nav .bnav-more-menu.open{display:block}
+.bottom-nav .bnav-more-menu a{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:8px;color:var(--text);font-size:13px;font-weight:500;text-decoration:none;transition:background .15s}
+.bottom-nav .bnav-more-menu a:active{background:var(--primary-light)}
+.bottom-nav .bnav-more-menu a .material-symbols-outlined{font-size:18px;color:var(--muted)}
+.bottom-nav .bnav-more-menu .bnav-menu-group{font-size:9px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);padding:8px 14px 2px;font-weight:700}
+.main{padding-bottom:76px}
+/* Mobile-specific enhancements */
+.mobile-header{height:56px;padding:0 12px;gap:8px;background:var(--card);box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.mobile-header .hamburger{width:40px;height:40px}
+.mobile-header .mh-title{font-weight:700;font-size:15px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mobile-header .mh-actions{display:flex;gap:4px;align-items:center}
+.main{padding-top:68px}
+.page-header{gap:8px;margin-bottom:14px}
+.page-title{font-size:18px}
+.page-sub{font-size:11px}
+/* Mobile cards */
+.card{padding:14px;border-radius:10px}
+.stat .value,.summary-card .value{font-size:16px}
+.stat .label,.summary-card .label{font-size:9px}
+.stat,.summary-card{padding:10px 12px;border-radius:10px}
+.stats,.summary-grid{gap:8px;grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
+/* Mobile forms */
+input,select,textarea{padding:11px 14px;font-size:14px;border-radius:10px}
+label{font-size:9px;margin-bottom:3px}
+.form-row{gap:8px;margin-bottom:8px}
+.form-group{margin-bottom:8px}
+/* Mobile buttons */
+.btn{padding:10px 16px;font-size:13px;border-radius:10px;min-height:42px}
+.btn-sm{padding:7px 12px;font-size:12px;border-radius:8px;min-height:36px}
+.btn-xs{padding:5px 10px;font-size:11px;border-radius:6px;min-height:32px}
+/* Mobile tabs */
+.tabs{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:4px;gap:2px;flex-wrap:nowrap}
+.tabs::-webkit-scrollbar{display:none}
+.tab{padding:8px 14px;font-size:12px;white-space:nowrap;flex-shrink:0}
+/* Mobile modals - fullscreen drawer */
+.modal-overlay{padding:0;align-items:flex-end}
+.modal{border-radius:20px 20px 0 0;padding:20px 16px;max-height:92vh;max-width:100%;width:100%;animation:slideUp .3s ease}
+.modal h3{font-size:15px;margin-bottom:12px}
+.modal-lg,.modal-xl{max-width:100%}
+@keyframes slideUp{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}
+/* Modal drag handle */
+.modal::before{content:'';display:block;width:36px;height:4px;background:var(--border-dark);border-radius:2px;margin:0 auto 14px}
+/* Mobile table enhancements */
+.table-wrap{max-height:60vh;border-radius:8px}
+.tbl td{padding:6px 10px;font-size:12px}
+/* Mobile search */
+.search-wrap{max-width:100%}
+.search-wrap input{padding:12px 12px 12px 38px;font-size:14px;border-radius:10px}
+/* Mobile date nav */
+.date-nav{flex-wrap:wrap;gap:4px}
+/* Mobile sidebar adjustments */
+.sidebar{width:280px;padding-top:env(safe-area-inset-top,0)}
+.sidebar .logo{padding:16px}
+.sidebar nav a{padding:12px 16px;font-size:13px;margin-bottom:2px}
+.sidebar nav a .nav-icon{font-size:18px}
+.sidebar nav .nav-group{padding:14px 16px 6px;font-size:9px}
+/* Touch feedback */
+.btn:active,.tab:active,.bnav-item:active{opacity:.7}
+.tbl tr:active td{background:var(--primary-light)}
+/* Safe area insets */
+.mobile-header{padding-top:env(safe-area-inset-top,0);height:calc(56px + env(safe-area-inset-top,0))}
+.main{padding-top:calc(68px + env(safe-area-inset-top,0))}
+/* Grid improvements for mobile */
+#daySections{grid-template-columns:1fr !important}
+.pl-row{padding:5px 12px;font-size:12px}
+/* Method toggle mobile */
+.method-toggle{gap:4px}
+.method-btn{padding:10px;font-size:13px}
+/* Swipe indicator */
+.sidebar::after{content:'';position:absolute;right:-20px;top:50%;transform:translateY(-50%);width:4px;height:40px;background:rgba(255,255,255,.3);border-radius:2px;opacity:0;transition:opacity .3s}
+.sidebar.open::after{opacity:1}
+/* FAB */
+.fab{display:none;position:fixed;bottom:calc(68px + env(safe-area-inset-bottom,4px));right:16px;width:52px;height:52px;border-radius:50%;background:var(--primary);color:#fff;border:none;box-shadow:0 4px 14px rgba(79,70,229,.35);z-index:35;cursor:pointer;align-items:center;justify-content:center;transition:all .2s;-webkit-tap-highlight-color:transparent}
+.fab .material-symbols-outlined{font-size:24px}
+.fab:active{transform:scale(.92)}
+.page-has-fab .fab{display:flex}
+/* Mobile toast */
+.toast-container{top:auto;bottom:calc(80px + env(safe-area-inset-bottom,4px));right:12px;left:12px}
+.toast{min-width:auto;max-width:100%;border-radius:12px;font-size:12px;padding:10px 14px}
+/* Landscape improvements */
+@media(max-height:500px){.bottom-nav .bnav-item{padding:3px 2px}.bottom-nav .bnav-icon{font-size:20px}.bottom-nav .bnav-label{font-size:8px;margin-top:1px}.main{padding-bottom:60px}}
+}
 .page-header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:20px}
 .page-title{font-size:22px;font-weight:800;letter-spacing:-.4px}
 .page-sub{font-size:12px;color:var(--muted);margin-top:2px}
@@ -546,8 +642,8 @@ label{display:block;font-size:10px;font-weight:700;color:var(--muted);margin-bot
 .date-nav button{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:14px;transition:var(--transition)}
 .date-nav button:hover{background:var(--bg)}
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border-dark);border-radius:3px}
-@media print{.sidebar,.mobile-header,.overlay,.no-print,.btn:not(.print-btn){display:none !important}.main{margin-left:0 !important;padding:0 !important}.card{border:none !important;box-shadow:none !important;page-break-inside:avoid}.led-sale td{background:#eef2ff !important}.led-purchase td{background:#fffbeb !important}.led-receipt td,.led-payment td{background:#ecfdf5 !important}}
-@media(max-width:600px){.tbl thead{display:none}.tbl tr{display:block;border-bottom:2px solid var(--border);margin-bottom:8px;padding:6px 0}.tbl td{display:flex;justify-content:space-between;padding:4px 10px;border:none}.stats,.summary-grid{grid-template-columns:1fr 1fr}}
+@media print{.sidebar,.mobile-header,.overlay,.no-print,.btn:not(.print-btn),.bottom-nav,.fab{display:none !important}.main{margin-left:0 !important;padding:0 !important}.card{border:none !important;box-shadow:none !important;page-break-inside:avoid}.led-sale td{background:#eef2ff !important}.led-purchase td{background:#fffbeb !important}.led-receipt td,.led-payment td{background:#ecfdf5 !important}}
+@media(max-width:600px){.tbl thead{display:none}.tbl tr{display:block;border-bottom:2px solid var(--border);margin-bottom:8px;padding:6px 0;border-radius:8px;background:var(--card)}.tbl td{display:flex;justify-content:space-between;padding:6px 12px;border:none;font-size:12px}.tbl td::before{content:attr(data-label);font-weight:700;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.3px;flex-shrink:0;margin-right:8px}.tbl td:first-child{padding-top:10px}.tbl td:last-child{padding-bottom:10px}.stats,.summary-grid{grid-template-columns:1fr 1fr}}
 .toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
 .toast{pointer-events:auto;display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:10px;font-size:13px;font-weight:600;color:#fff;box-shadow:0 8px 24px rgba(0,0,0,.15);animation:toastIn .35s ease,toastOut .35s ease 3.5s forwards;min-width:260px;max-width:420px}
 .toast-success{background:linear-gradient(135deg,#059669,#10b981)}
@@ -561,6 +657,24 @@ label{display:block;font-size:10px;font-weight:700;color:var(--muted);margin-bot
 .rpt-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 20px;color:var(--muted)}
 .rpt-placeholder .material-symbols-outlined{font-size:48px;margin-bottom:12px;opacity:.4}
 .rpt-placeholder p{font-size:14px;font-weight:600}
+/* Tablet breakpoint */
+@media(min-width:601px) and (max-width:900px){
+.stats,.summary-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+.form-row{grid-template-columns:1fr 1fr}
+.modal{max-width:90%;border-radius:16px;max-height:85vh}
+.modal::before{display:none}
+.modal-overlay{align-items:center;padding:20px}
+.tbl thead{display:table-header-group}
+.tbl tr{display:table-row}
+.tbl td{display:table-cell}
+.bottom-nav .bnav-label{font-size:10px}
+.bottom-nav .bnav-icon{font-size:24px}
+}
+/* Desktop: hide bottom nav and mobile-only elements */
+@media(min-width:901px){
+.bottom-nav{display:none !important}
+.fab{display:none !important}
+}
 </style>`;
 }
 
@@ -630,7 +744,11 @@ function layout(content: string, active: string, session: any) {
 
   return `<!doctype html>
 <html lang="en"><head>
-<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
+<meta name="theme-color" content="#1e1b4b"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="mobile-web-app-capable" content="yes"/>
 <title>BizManager</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
@@ -790,8 +908,12 @@ window.loadCompanySettings=async function(){
       if(iconEl)iconEl.textContent=initials;
       logoEl.childNodes[logoEl.childNodes.length-1].textContent=cs.companyName;
     }
-    var mobileTitle=document.querySelector('.mobile-header span:last-child');
+    var mobileTitle=document.querySelector('.mh-title');
     if(mobileTitle&&cs.companyName)mobileTitle.textContent=cs.companyName;
+    // Update mobile theme color meta tag
+    if(cs.sidebarColor){var metaTheme=document.querySelector('meta[name="theme-color"]');if(metaTheme)metaTheme.setAttribute('content',cs.sidebarColor);}
+    // Update mobile header background on scroll for iOS-like feel
+    if(cs.primaryColor){document.documentElement.style.setProperty('--bnav-active',cs.primaryColor);}
     // Update page title
     if(cs.companyName)document.title=cs.companyName+' - BizManager';
   }catch(e){console.log('Company settings load error:',e);}
@@ -812,9 +934,10 @@ window.getCompanyHeader=function(){
 };
 </script>
 </head><body>
-<div class="mobile-header">
+<div class="mobile-header" id="mobileHeader">
   <button class="hamburger" onclick="toggleSidebar()"><span class="material-symbols-outlined">menu</span></button>
-  <span style="font-weight:800;font-size:14px">BizManager</span>
+  <span class="mh-title">BizManager</span>
+  <div class="mh-actions"><button class="hamburger" onclick="window.location.reload()" title="Refresh"><span class="material-symbols-outlined" style="font-size:20px">refresh</span></button></div>
 </div>
 <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
 <div class="app">
@@ -825,12 +948,111 @@ window.getCompanyHeader=function(){
   </aside>
   <main class="main">${content}</main>
 </div>
+<!-- Bottom Navigation Bar (Mobile Only) -->
+<nav class="bottom-nav" id="bottomNav">
+  <a href="/" class="bnav-item${active==='dashboard'?' active':''}"><span class="material-symbols-outlined bnav-icon">grid_view</span><span class="bnav-label">Home</span></a>
+  <a href="/sales" class="bnav-item${active==='sales'?' active':''}"><span class="material-symbols-outlined bnav-icon">receipt_long</span><span class="bnav-label">Sales</span></a>
+  <a href="/purchases" class="bnav-item${active==='purchases'?' active':''}"><span class="material-symbols-outlined bnav-icon">shopping_cart</span><span class="bnav-label">Purchase</span></a>
+  <a href="/payments" class="bnav-item${active==='payments'?' active':''}"><span class="material-symbols-outlined bnav-icon">account_balance_wallet</span><span class="bnav-label">Accounts</span></a>
+  <button class="bnav-item bnav-more" id="bnavMoreBtn" onclick="toggleBnavMore()"><span class="material-symbols-outlined bnav-icon">more_horiz</span><span class="bnav-label">More</span>
+    <div class="bnav-more-menu" id="bnavMoreMenu">
+      ${(function(){
+        const moreItems = [
+          {group:'Main',items:[
+            {p:'/day-details',i:'calendar_today',l:'Day Details',id:'daydetails'},
+            {p:'/orders',i:'assignment',l:'Orders',id:'orders'},
+            {p:'/stock-check',i:'checklist',l:'Stock Check',id:'stockcheck'},
+          ]},
+          {group:'Inventory',items:[
+            {p:'/inventory',i:'inventory_2',l:'Inventory',id:'inventory'},
+            {p:'/parties',i:'groups',l:'Customers & Suppliers',id:'parties'},
+          ]},
+          {group:'Finance',items:[
+            {p:'/expenses',i:'payments',l:'Expenses',id:'expenses'},
+          ]},
+          {group:'Reports',items:[
+            {p:'/reports',i:'assessment',l:'Reports',id:'reports'},
+            {p:'/ledger',i:'menu_book',l:'Ledger',id:'ledger'},
+            {p:'/expense-ledger',i:'receipt',l:'Expense Ledger',id:'expledger'},
+            {p:'/receivable-payable',i:'swap_horiz',l:'Receivable/Payable',id:'recpay'},
+            {p:'/profit-loss',i:'trending_up',l:'Profit & Loss',id:'profitloss'},
+            {p:'/balance-sheet',i:'account_balance',l:'Balance Sheet',id:'balancesheet'},
+            {p:'/trial-balance',i:'balance',l:'Trial Balance',id:'trialbalance'},
+            {p:'/stock',i:'warehouse',l:'Stock & Valuation',id:'stock'},
+          ]},
+          {group:'System',items:[
+            {p:'/users',i:'manage_accounts',l:'Users & Access',id:'users'},
+            {p:'/salesperson',i:'badge',l:'Salesperson',id:'salesperson'},
+            {p:'/approvals',i:'task_alt',l:'Approvals',id:'approvals'},
+            {p:'/company-settings',i:'domain',l:'Company Settings',id:'companysettings'},
+            {p:'/admin',i:'settings',l:'Admin',id:'admin'},
+            {p:'/mod-log',i:'history',l:'Mod Log',id:'modlog'},
+          ]},
+        ];
+        let html='';
+        for(const g of moreItems){
+          const vis=g.items.filter(n=>allowed.includes(n.id));
+          if(!vis.length)continue;
+          html+='<div class="bnav-menu-group">'+g.group+'</div>';
+          for(const n of vis){
+            html+='<a href="'+n.p+'"'+(active===n.id?' style="color:var(--primary);font-weight:700"':'')+'><span class="material-symbols-outlined">'+n.i+'</span>'+n.l+'</a>';
+          }
+        }
+        html+='<div class="bnav-menu-group">Other</div><a href="/sp-portal" target="_blank"><span class="material-symbols-outlined">storefront</span>SP Portal</a><a href="/logout" style="color:var(--danger)"><span class="material-symbols-outlined">logout</span>Logout</a>';
+        return html;
+      })()}
+    </div>
+  </button>
+</nav>
 <!-- Global Document Preview Modal -->
 <div class="modal-overlay" id="docPreview"><div class="modal modal-lg">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h3 style="margin:0">Document Preview</h3><div><button class="btn btn-primary btn-sm" onclick="printContent('docPrintArea','Document')">Print</button> <button class="btn btn-outline btn-sm" onclick="closeModal('docPreview')">Close</button></div></div>
   <div id="docPreviewContent"></div>
 </div></div>
-<script>document.querySelectorAll('.sidebar nav a').forEach(function(a){a.addEventListener('click',function(){document.getElementById('sidebar').classList.remove('open');document.getElementById('overlay').classList.remove('open');});});</script>
+<script>
+// Sidebar nav click closes sidebar
+document.querySelectorAll('.sidebar nav a').forEach(function(a){a.addEventListener('click',function(){document.getElementById('sidebar').classList.remove('open');document.getElementById('overlay').classList.remove('open');});});
+// Bottom nav more menu toggle
+window.toggleBnavMore=function(){
+  var menu=document.getElementById('bnavMoreMenu');
+  menu.classList.toggle('open');
+  // Close when clicking outside
+  if(menu.classList.contains('open')){
+    setTimeout(function(){
+      document.addEventListener('click',function closeBnav(e){
+        if(!document.getElementById('bnavMoreBtn').contains(e.target)){
+          menu.classList.remove('open');
+          document.removeEventListener('click',closeBnav);
+        }
+      });
+    },10);
+  }
+};
+// Touch swipe to open/close sidebar
+(function(){
+  var startX=0,startY=0,tracking=false,sidebarOpen=false;
+  document.addEventListener('touchstart',function(e){
+    startX=e.touches[0].clientX;startY=e.touches[0].clientY;
+    sidebarOpen=document.getElementById('sidebar').classList.contains('open');
+    tracking=(startX<30&&!sidebarOpen)||(sidebarOpen);
+  },{passive:true});
+  document.addEventListener('touchmove',function(e){
+    if(!tracking)return;
+    var dx=e.touches[0].clientX-startX;var dy=Math.abs(e.touches[0].clientY-startY);
+    if(dy>Math.abs(dx)){tracking=false;return;}
+    if(!sidebarOpen&&dx>60){toggleSidebar();tracking=false;}
+    if(sidebarOpen&&dx<-60){toggleSidebar();tracking=false;}
+  },{passive:true});
+})();
+// Mobile: Update page title in header
+(function(){
+  var titleMap={dashboard:'Dashboard',inventory:'Inventory',stockcheck:'Stock Check',parties:'Customers & Suppliers',purchases:'Purchases',sales:'Sales',payments:'Accounts & Banking',expenses:'Expenses',ledger:'Ledger',expledger:'Expense Ledger',profitloss:'Profit & Loss',balancesheet:'Balance Sheet',trialbalance:'Trial Balance',stock:'Stock & Valuation',recpay:'Receivable/Payable',daydetails:'Day Details',reports:'Reports',salesperson:'Salesperson',orders:'Orders',users:'Users & Access',admin:'Admin',modlog:'Mod Log',approvals:'Approvals',companysettings:'Company Settings'};
+  var mhTitle=document.querySelector('.mh-title');
+  if(mhTitle&&titleMap['${active}'])mhTitle.textContent=titleMap['${active}'];
+})();
+// Close more menu when navigating
+document.querySelectorAll('.bnav-more-menu a').forEach(function(a){a.addEventListener('click',function(){document.getElementById('bnavMoreMenu').classList.remove('open');});});
+</script>
 </body></html>`;
 }
 
@@ -840,7 +1062,8 @@ window.getCompanyHeader=function(){
 // LOGIN / EXPIRED PAGES
 // ============================================================
 function loginPage(msg: string, hasUsers: boolean = false) {
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1e1b4b"><meta name="apple-mobile-web-app-capable" content="yes">
 <title>BizManager Login</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
 ${getCSS()}</head><body>
@@ -1058,8 +1281,9 @@ function dashboardPage(){var t=new Date().toISOString().slice(0,10);var ym=t.sli
 <div class="form-row" style="align-items:end"><div><label>From</label><input type="date" id="dashFrom" value="${ym}-01"></div><div><label>To</label><input type="date" id="dashTo" value="${t}"></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="renderDash()">Apply</button><button class="btn btn-outline btn-xs" onclick="setDashRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setDashRange('today')">Today</button><button class="btn btn-outline btn-xs" onclick="setDashRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setDashRange('all')">All Time</button></div></div>
 </div>
 <div class="stats" id="stats"></div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px"><div class="card"><div class="section-title">Recent Sales</div><div id="recentSales" class="table-wrap"></div></div><div class="card"><div class="section-title">Recent Purchases</div><div id="recentPurchases" class="table-wrap"></div></div></div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><div class="card"><div class="section-title">Low Stock Alerts</div><div id="lowStockAlerts" class="table-wrap"></div></div><div class="card"><div class="section-title">Pending Orders</div><div id="pendingOrders" class="table-wrap"></div></div></div>
+<div class="dash-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px"><div class="card"><div class="section-title">Recent Sales</div><div id="recentSales" class="table-wrap"></div></div><div class="card"><div class="section-title">Recent Purchases</div><div id="recentPurchases" class="table-wrap"></div></div></div>
+<div class="dash-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><div class="card"><div class="section-title">Low Stock Alerts</div><div id="lowStockAlerts" class="table-wrap"></div></div><div class="card"><div class="section-title">Pending Orders</div><div id="pendingOrders" class="table-wrap"></div></div></div>
+<style>@media(max-width:768px){.dash-grid{grid-template-columns:1fr !important;gap:10px !important}}</style>
 <script>
 var _dashData=null;
 window.setDashRange=function(r){var today=new Date();var from='',to=todayISO();
@@ -1842,7 +2066,7 @@ function receivablePayablePage(){return `
 <div class="page-header"><div><div class="page-title">Receivable / Payable</div><div class="page-sub">Outstanding balances with DSO & filters</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('rpPrint','Receivable-Payable')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rpTbl','RecPayable')">Export XLS</button></div></div>
 <div class="tabs"><button class="tab active" onclick="switchRP('receivable',this)">Receivables</button><button class="tab" onclick="switchRP('payable',this)">Payables</button></div>
 <div class="card" style="margin-bottom:14px;padding:14px 16px">
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;align-items:end">
+<div class="rp-filter-grid" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;align-items:end"><style>@media(max-width:768px){.rp-filter-grid{grid-template-columns:1fr 1fr !important}}</style>
 <div><label>Search Party</label><input id="rpSearch" placeholder="Search name/phone..." oninput="renderRP()"></div>
 <div><label>Salesperson</label><select id="rpSP" onchange="renderRP()"><option value="">All Salespersons</option></select></div>
 <div><label>Date From</label><input type="date" id="rpFrom" onchange="renderRP()"></div>
@@ -2218,7 +2442,7 @@ loadUsers();
 
 function adminPage(){return `
 <div class="page-header"><div><div class="page-title">Admin</div><div class="page-sub">Settings, data & tools</div></div></div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+<div class="admin-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:14px"><style>@media(max-width:768px){.admin-grid{grid-template-columns:1fr !important}}</style>
 <div class="card"><div class="section-title">Change PIN</div>
 <div class="form-group"><label>Current PIN</label><input id="oldPin" type="password"></div>
 <div class="form-group"><label>New PIN</label><input id="newPin" type="password"></div>
@@ -2365,7 +2589,7 @@ loadAppr();
 
 function companySettingsPage(){return `
 <div class="page-header"><div><div class="page-title">Company Settings</div><div class="page-sub">Configure company name, details & theme colors globally</div></div></div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+<div class="cs-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><style>@media(max-width:768px){.cs-grid{grid-template-columns:1fr !important}}</style>
 <div class="card">
 <div class="section-title">Company Information</div>
 <div class="form-group"><label>Company Name</label><input id="csName" placeholder="Your Company Name"></div>
