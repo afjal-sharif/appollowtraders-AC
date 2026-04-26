@@ -1729,14 +1729,14 @@ if(ek){
   // Delete old auto-created payment voucher if exists
   if(oldPur&&oldPur._autoPayKey){try{await api('/api/delete',{key:oldPur._autoPayKey,skipApproval:true})}catch(e){}}
   // Create new auto payment voucher if paid > 0
-  if(paid>0&&method!=='credit'){var payVch={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr=await api('/api/save',{prefix:'payment:',data:payVch,skipApproval:true});data._autoPayKey=pvr.key||''}
+  if(paid>0&&method!=='credit'){var payVch={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr=await api('/api/save',{prefix:'payment:',data:payVch,skipApproval:true});data._autoPayKey=pvr.key||''}
   await saveByKey(ek,data,'edit','Edited purchase: '+data.purchaseNo)
 }else{
   var saveRes=await saveItem('purchase:',data,null,'create','Created purchase: '+data.purchaseNo);
   for(var ii=0;ii<items.length;ii++){var pr=prods.find(function(x){return x._key===items[ii].pk});if(pr){pr.stock=(pr.stock||0)+items[ii].qty;pr.purchasePrice=items[ii].rate;await saveByKey(pr._key,cleanForSave(pr))}}
   if(paid>0&&method!=='cash'&&method!=='credit'&&bankName){var bk2=purBanks.find(function(b){return b.name===bankName});if(bk2){bk2.balance=(bk2.balance||0)-paid;await saveByKey(bk2._key,cleanForSave(bk2))}}
   // Auto-create payment voucher if paid > 0
-  if(paid>0&&method!=='credit'){var payVch2={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr2=await api('/api/save',{prefix:'payment:',data:payVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoPayKey=pvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
+  if(paid>0&&method!=='credit'){var payVch2={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr2=await api('/api/save',{prefix:'payment:',data:payVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoPayKey=pvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
 }
 invalidateCache('purchase:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');
 showToast(ek?'Purchase updated successfully':'Purchase saved successfully','success');
@@ -1824,7 +1824,7 @@ if(ek){
   // Delete old auto-created receipt voucher if exists
   if(oldSal&&oldSal._autoRcvKey){try{await api('/api/delete',{key:oldSal._autoRcvKey,skipApproval:true})}catch(e){}}
   // Create new auto receipt voucher if paid > 0
-  if(paid>0&&method!=='credit'){var rcvVch={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr=await api('/api/save',{prefix:'payment:',data:rcvVch,skipApproval:true});data._autoRcvKey=rvr.key||''}
+  if(paid>0&&method!=='credit'){var rcvVch={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr=await api('/api/save',{prefix:'payment:',data:rcvVch,skipApproval:true});data._autoRcvKey=rvr.key||''}
   // Reverse old truck fare vouchers
   if(oldSal&&oldSal._autoTfRcvKey){try{await api('/api/delete',{key:oldSal._autoTfRcvKey,skipApproval:true})}catch(e){}}
   if(oldSal&&oldSal._autoTfExpKey){try{await api('/api/delete',{key:oldSal._autoTfExpKey,skipApproval:true})}catch(e){}}
@@ -1842,7 +1842,7 @@ if(ek){
   for(var ii=0;ii<items.length;ii++){var pr=salProds.find(function(x){return x._key===items[ii].pk});if(pr){pr.stock=Math.max(0,(pr.stock||0)-items[ii].qty);await saveByKey(pr._key,cleanForSave(pr))}}
   if(paid>0&&method!=='cash'&&method!=='credit'&&bankName){var bk2=salBanks.find(function(b){return b.name===bankName});if(bk2){bk2.balance=(bk2.balance||0)+paid;await saveByKey(bk2._key,cleanForSave(bk2))}}
   // Auto-create receipt voucher if paid > 0
-  if(paid>0&&method!=='credit'){var rcvVch2={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr2=await api('/api/save',{prefix:'payment:',data:rcvVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoRcvKey=rvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
+  if(paid>0&&method!=='credit'){var rcvVch2={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr2=await api('/api/save',{prefix:'payment:',data:rcvVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoRcvKey=rvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
   // Truck Fare: create receipt (customer receive) + expense (Transportation > Cement Truck Fare)
   if(data.truckFare>0&&saveRes&&saveRes.key){
     var tfRcv={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:data.truckFare,method:'cash',bankName:'',chequeNo:'',note:'Truck Fare: '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo,_isTruckFare:true};
