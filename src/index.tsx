@@ -1186,7 +1186,7 @@ if(cs.primaryColor){document.documentElement.style.setProperty('--primary',cs.pr
 </body></html>`;
 }
 function expiredPage() { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>License Expired</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><div class="login-card"><h2>License Expired</h2><div class="sub">Please renew.</div></div></div></body></html>`; }
-function spLoginPage(msg: string) { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SP Portal</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><form class="login-card" method="POST" action="/sp-portal/login"><h2>Salesperson Portal</h2><div class="sub">Enter code and PIN</div>${msg?`<div class="err">${msg}</div>`:''}<input name="code" placeholder="Code" style="text-align:center" required><input type="password" name="pin" placeholder="PIN" style="text-align:center" required><button type="submit" class="btn btn-primary">Login</button><div style="margin-top:12px"><a href="/login" style="font-size:11px;color:var(--muted)">Admin Login</a></div></form></div></body></html>`; }
+function spLoginPage(msg: string) { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><meta name="theme-color" content="#1e1b4b"><meta name="apple-mobile-web-app-capable" content="yes"><title>SP Portal</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><form class="login-card" method="POST" action="/sp-portal/login"><h2>Salesperson Portal</h2><div class="sub">Enter code and PIN</div>${msg?`<div class="err">${msg}</div>`:''}<input name="code" placeholder="Code" style="text-align:center" required><input type="password" name="pin" placeholder="PIN" style="text-align:center" required><button type="submit" class="btn btn-primary">Login</button><div style="margin-top:12px"><a href="/login" style="font-size:11px;color:var(--muted)">Admin Login</a></div></form></div></body></html>`; }
 function spPortalPage(c: any) {
   const cookie = c.req.header("Cookie") || "";
   const spMatch = cookie.match(/sp_session=([^;]+)/);
@@ -1195,42 +1195,162 @@ function spPortalPage(c: any) {
   const spId = spSession.spId || '';
   const spName = spSession.spName || 'Salesperson';
   const spCode = spSession.spCode || '';
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SP Portal - ${escapeHtml(spName)}</title>
+  return `<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#1e1b4b"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>SP Portal - ${escapeHtml(spName)}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
 ${getCSS()}
-</head><body style="background:var(--bg);padding:20px">
-<div style="max-width:900px;margin:0 auto">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-<div><h2 style="margin:0">Salesperson Portal</h2><p class="text-muted" style="margin:4px 0 0">Welcome, <b>${escapeHtml(spName)}</b> (${escapeHtml(spCode)})</p></div>
-<a href="/sp-portal/logout" class="btn btn-outline btn-sm">Logout</a>
+<style>
+/* SP Portal Mobile-First Styles */
+.sp-app{min-height:100vh;background:var(--bg)}
+.sp-header{position:fixed;top:0;left:0;right:0;z-index:40;background:linear-gradient(135deg,#1e1b4b,#312e81);color:#fff;padding:env(safe-area-inset-top,0) 0 0}
+.sp-header-inner{display:flex;align-items:center;justify-content:space-between;padding:12px 16px}
+.sp-header h2{font-size:16px;font-weight:700;margin:0;letter-spacing:-.2px}
+.sp-header .sp-user{font-size:11px;opacity:.7;margin-top:1px}
+.sp-header .sp-logout{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);color:#fff;padding:6px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:4px;transition:all .2s;-webkit-tap-highlight-color:transparent}
+.sp-header .sp-logout:hover{background:rgba(255,255,255,.2)}
+.sp-header .sp-logout .material-symbols-outlined{font-size:16px}
+.sp-body{padding:calc(72px + env(safe-area-inset-top,0)) 16px calc(68px + env(safe-area-inset-bottom,4px)) 16px;max-width:960px;margin:0 auto}
+/* SP Bottom Tab Navigation */
+.sp-bnav{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--border);z-index:40;padding:4px 0 env(safe-area-inset-bottom,4px);box-shadow:0 -2px 10px rgba(0,0,0,.06)}
+.sp-bnav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:6px 2px;cursor:pointer;color:var(--muted);border:none;background:none;font-family:inherit;-webkit-tap-highlight-color:transparent;transition:color .2s;position:relative}
+.sp-bnav-item .sp-bnav-icon{font-size:22px;line-height:1;transition:all .2s}
+.sp-bnav-item .sp-bnav-label{font-size:9px;font-weight:600;margin-top:2px;letter-spacing:.2px}
+.sp-bnav-item.active{color:var(--primary)}
+.sp-bnav-item.active .sp-bnav-icon{transform:translateY(-2px);font-variation-settings:'FILL' 1}
+.sp-bnav-item.active::before{content:'';position:absolute;top:-1px;left:50%;transform:translateX(-50%);width:36px;height:3px;background:var(--primary);border-radius:0 0 3px 3px}
+.sp-bnav-item:active{opacity:.7}
+/* Desktop top tabs (visible on desktop, hidden on mobile) */
+.sp-tabs-desktop{display:flex;gap:3px;background:var(--bg);border-radius:8px;padding:3px;margin-bottom:14px;width:fit-content;border:1px solid var(--border)}
+.sp-tabs-desktop .tab{padding:6px 14px;border:none;border-radius:6px;background:transparent;color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;transition:var(--transition)}
+.sp-tabs-desktop .tab.active{background:var(--card);color:var(--primary);box-shadow:var(--shadow)}
+/* Order item cards for mobile */
+.sp-item-card{background:var(--bg);border-radius:10px;padding:12px;margin-bottom:8px;border:1px solid var(--border)}
+.sp-item-card .sp-item-row{display:grid;grid-template-columns:1fr;gap:8px}
+.sp-item-card .sp-item-footer{display:flex;justify-content:space-between;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid var(--border)}
+.sp-item-card .sp-item-amt{font-weight:700;font-size:15px;color:var(--primary)}
+.sp-item-card .sp-item-rm{background:var(--danger-light);color:var(--danger);border:none;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}
+/* Order total bar */
+.sp-total-bar{position:sticky;bottom:0;background:var(--card);border-top:2px solid var(--primary);padding:14px 16px;border-radius:12px 12px 0 0;margin:12px -16px 0;display:flex;justify-content:space-between;align-items:center;box-shadow:0 -4px 12px rgba(0,0,0,.06)}
+.sp-total-bar .sp-total-label{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.3px}
+.sp-total-bar .sp-total-value{font-size:20px;font-weight:800;color:var(--primary)}
+/* Mobile order card list */
+.sp-order-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:8px}
+.sp-order-card .sp-oc-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
+.sp-order-card .sp-oc-no{font-weight:700;font-size:13px}
+.sp-order-card .sp-oc-date{font-size:11px;color:var(--muted)}
+.sp-order-card .sp-oc-cust{font-size:12px;color:var(--text);margin-bottom:4px}
+.sp-order-card .sp-oc-bottom{display:flex;justify-content:space-between;align-items:center}
+.sp-order-card .sp-oc-total{font-weight:700;font-size:15px}
+/* Mobile customer card */
+.sp-cust-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:8px}
+.sp-cust-card .sp-cc-name{font-weight:700;font-size:14px;margin-bottom:2px}
+.sp-cust-card .sp-cc-info{font-size:12px;color:var(--muted);margin-bottom:6px}
+.sp-cust-card .sp-cc-stats{display:flex;gap:16px}
+.sp-cust-card .sp-cc-stat{text-align:center}
+.sp-cust-card .sp-cc-stat .label{font-size:9px;text-transform:uppercase;letter-spacing:.3px;color:var(--muted);font-weight:600}
+.sp-cust-card .sp-cc-stat .value{font-size:14px;font-weight:700}
+/* Mobile report controls */
+.sp-rpt-controls{display:flex;flex-direction:column;gap:8px}
+.sp-rpt-actions{display:flex;gap:6px;margin-top:4px}
+/* Responsive breakpoints */
+@media(min-width:769px){
+  .sp-bnav{display:none !important}
+  .sp-tabs-desktop{display:flex}
+  .sp-body{padding:calc(72px + env(safe-area-inset-top,0)) 28px 28px;max-width:960px}
+  .sp-header-inner{padding:14px 28px}
+  .sp-header h2{font-size:18px}
+  .sp-item-card .sp-item-row{grid-template-columns:2fr 70px 90px 90px 34px;align-items:end;gap:8px}
+  .sp-order-cards{display:none}
+  .sp-order-table{display:block}
+  .sp-cust-cards{display:none}
+  .sp-cust-table{display:block}
+  .sp-rpt-controls{flex-direction:row;align-items:end}
+  .sp-total-bar{margin:12px 0 0;border-radius:12px;position:static}
+}
+@media(max-width:768px){
+  .sp-bnav{display:flex}
+  .sp-tabs-desktop{display:none !important}
+  .sp-item-card .sp-item-row{grid-template-columns:1fr 1fr}
+  .sp-item-card .sp-item-row .sp-item-product{grid-column:1/-1}
+  .sp-order-table{display:none}
+  .sp-order-cards{display:block}
+  .sp-cust-table{display:none}
+  .sp-cust-cards{display:block}
+  .sp-body .card{border-radius:10px;padding:14px}
+  .sp-rpt-controls{flex-direction:column}
+  .sp-rpt-actions{flex-wrap:wrap}
+}
+@media(max-width:400px){
+  .sp-header h2{font-size:14px}
+  .sp-header .sp-user{font-size:10px}
+  .sp-item-card{padding:10px}
+}
+@media(max-height:500px) and (max-width:768px){
+  .sp-bnav .sp-bnav-item{padding:3px 2px}
+  .sp-bnav .sp-bnav-icon{font-size:20px}
+  .sp-bnav .sp-bnav-label{font-size:8px;margin-top:1px}
+  .sp-body{padding-bottom:56px}
+}
+</style>
+</head><body>
+<div class="sp-app">
+<!-- Fixed Header -->
+<div class="sp-header">
+<div class="sp-header-inner">
+<div><h2><span class="material-symbols-outlined" style="font-size:20px;vertical-align:middle;margin-right:4px">storefront</span>SP Portal</h2><div class="sp-user">Welcome, <b>${escapeHtml(spName)}</b> (${escapeHtml(spCode)})</div></div>
+<a href="/sp-portal/logout" class="sp-logout"><span class="material-symbols-outlined">logout</span>Logout</a>
 </div>
-<div class="tabs" style="margin-bottom:14px"><button class="tab active" id="tabPlace" onclick="switchSPTab('place')">Place Order</button><button class="tab" id="tabOrders" onclick="switchSPTab('orders')">My Orders</button><button class="tab" id="tabReports" onclick="switchSPTab('reports')">My Reports</button><button class="tab" id="tabCustomers" onclick="switchSPTab('customers')">My Customers</button></div>
+</div>
+<!-- Main Content -->
+<div class="sp-body">
+<!-- Desktop-only top tabs -->
+<div class="sp-tabs-desktop"><button class="tab active" id="tabPlace" onclick="switchSPTab('place')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">add_shopping_cart</span> Place Order</button><button class="tab" id="tabOrders" onclick="switchSPTab('orders')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">list_alt</span> My Orders</button><button class="tab" id="tabReports" onclick="switchSPTab('reports')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">bar_chart</span> My Reports</button><button class="tab" id="tabCustomers" onclick="switchSPTab('customers')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">group</span> My Customers</button></div>
+
 <div id="placeSection">
 <div class="card">
-<h3 style="font-size:15px;margin-bottom:14px">New Order</h3>
-<div class="form-row"><div><label style="font-size:12px">Customer</label><select id="spCust" style="padding:12px 14px;font-size:14px"></select></div><div><label style="font-size:12px">Date</label><input type="date" id="spDate" style="padding:12px 14px;font-size:14px"></div></div>
+<h3 style="font-size:15px;margin-bottom:14px"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle;color:var(--primary)">shopping_cart</span> New Order</h3>
+<div class="form-row"><div><label>Customer</label><select id="spCust"></select></div><div><label>Date</label><input type="date" id="spDate"></div></div>
 <div id="spItems"></div>
-<div style="margin:12px 0;display:flex;gap:8px"><button class="btn btn-outline" onclick="addSPItem()" style="padding:10px 16px;font-size:13px">+ Add Item</button><button class="btn btn-primary" onclick="submitOrd()" style="padding:10px 20px;font-size:13px">Submit Order</button></div>
-<div id="spTotal" style="font-weight:700;font-size:17px;margin-top:10px;color:var(--primary)"></div>
+<div style="margin:12px 0;display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-outline" onclick="addSPItem()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">add</span> Add Item</button><button class="btn btn-primary" onclick="submitOrd()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">send</span> Submit Order</button></div>
+<div id="spTotal" class="sp-total-bar" style="display:none"><div><div class="sp-total-label">Order Total</div><div class="sp-total-value" id="spTotalVal">0</div></div><button class="btn btn-primary" onclick="submitOrd()" style="padding:10px 20px"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">send</span> Submit</button></div>
 </div>
 </div>
+
 <div id="ordersSection" class="hidden">
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th class="r">Total</th><th>Status</th></tr></thead><tbody id="spOrdBody"></tbody></table></div></div>
+<!-- Desktop table -->
+<div class="sp-order-table card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th class="r">Total</th><th>Status</th></tr></thead><tbody id="spOrdBody"></tbody></table></div></div>
+<!-- Mobile card list -->
+<div class="sp-order-cards" id="spOrdCards"></div>
 </div>
+
 <div id="reportsSection" class="hidden">
 <div class="card" style="margin-bottom:14px">
-<h3 style="font-size:15px;margin-bottom:10px">My Sales Reports</h3>
-<div class="form-row"><div><label>Report</label><select id="spRptType" style="padding:10px 12px;font-size:13px"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer Breakdown</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option></select></div><div><label>From</label><input type="date" id="spRptFrom" style="padding:10px 12px;font-size:13px"></div><div><label>To</label><input type="date" id="spRptTo" style="padding:10px 12px;font-size:13px"></div></div>
-<div style="margin-top:8px"><button class="btn btn-primary" onclick="renderSPReport()" style="padding:10px 20px;font-size:13px"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button> <button class="btn btn-outline" onclick="exportXLS('spRptTbl','SP_Report')" style="padding:10px 14px;font-size:13px">Export XLS</button></div>
+<h3 style="font-size:15px;margin-bottom:10px"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle;color:var(--primary)">bar_chart</span> My Sales Reports</h3>
+<div class="sp-rpt-controls"><div style="flex:1;min-width:150px"><label>Report</label><select id="spRptType"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option></select></div><div style="min-width:120px"><label>From</label><input type="date" id="spRptFrom"></div><div style="min-width:120px"><label>To</label><input type="date" id="spRptTo"></div></div>
+<div class="sp-rpt-actions" style="margin-top:8px"><button class="btn btn-primary" onclick="renderSPReport()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button><button class="btn btn-outline" onclick="exportXLS('spRptTbl','SP_Report')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">download</span> Export</button></div>
 </div>
 <div id="spRptPlaceholder" class="rpt-placeholder"><span class="material-symbols-outlined">assessment</span><p>Select report type and date range, then click <b>View Report</b></p></div>
 <div id="spRptContent" class="hidden"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="spRptTbl"><thead id="spRptHead"></thead><tbody id="spRptBody"></tbody><tfoot id="spRptFoot"></tfoot></table></div></div></div>
 </div>
+
 <div id="customersSection" class="hidden">
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Customer Name</th><th>Phone</th><th>Address</th><th class="r">Total Sales</th><th class="r">Outstanding</th></tr></thead><tbody id="spCustListBody"></tbody></table></div></div>
+<!-- Desktop table -->
+<div class="sp-cust-table card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Customer Name</th><th>Phone</th><th>Address</th><th class="r">Total Sales</th><th class="r">Outstanding</th></tr></thead><tbody id="spCustListBody"></tbody></table></div></div>
+<!-- Mobile card list -->
+<div class="sp-cust-cards" id="spCustCards"></div>
 </div>
 </div>
+<!-- Bottom Navigation (mobile only) -->
+<nav class="sp-bnav" id="spBnav">
+<button class="sp-bnav-item active" data-tab="place" onclick="switchSPTab('place')"><span class="material-symbols-outlined sp-bnav-icon">add_shopping_cart</span><span class="sp-bnav-label">Order</span></button>
+<button class="sp-bnav-item" data-tab="orders" onclick="switchSPTab('orders')"><span class="material-symbols-outlined sp-bnav-icon">list_alt</span><span class="sp-bnav-label">Orders</span></button>
+<button class="sp-bnav-item" data-tab="reports" onclick="switchSPTab('reports')"><span class="material-symbols-outlined sp-bnav-icon">bar_chart</span><span class="sp-bnav-label">Reports</span></button>
+<button class="sp-bnav-item" data-tab="customers" onclick="switchSPTab('customers')"><span class="material-symbols-outlined sp-bnav-icon">group</span><span class="sp-bnav-label">Customers</span></button>
+</nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"><\/script>
 <script>
 window.api=async function(p,b){var r=await fetch(p,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(b||{})});return r.json();};
 window.loadList=async function(p){return api(\'/api/list\',{prefix:p});};
@@ -1238,6 +1358,7 @@ window.saveItem=async function(p,d){return api(\'/api/save\',{prefix:p,data:d});
 window.fmt=function(n){return Number(n||0).toLocaleString(\'en-IN\');};
 window.todayISO=function(){return new Date().toISOString().slice(0,10);};
 window.txnNo=function(p){return p+\'-\'+todayISO().replace(/-/g,\'\')+\'-\'+Math.random().toString(36).slice(2,7).toUpperCase();};
+window.exportXLS=function(tableId,fileName){try{var tbl=document.getElementById(tableId);if(!tbl)return;var wb=XLSX.utils.table_to_book(tbl,{sheet:\'Sheet1\'});XLSX.writeFile(wb,(fileName||\'export\')+\'.xlsx\');}catch(e){alert(\'Export failed: \'+e.message);}};
 var spP=[],spC=[],spI=[{pk:\'\',pn:\'\',q:1,r:0,a:0}],spOrders=[],spSales=[];
 var SP_ID=\'${escapeHtml(spId)}\';
 var SP_NAME=\'${escapeHtml(spName)}\';
@@ -1247,12 +1368,16 @@ window.switchSPTab=function(t){
   document.getElementById(\'ordersSection\').classList.toggle(\'hidden\',t!==\'orders\');
   document.getElementById(\'reportsSection\').classList.toggle(\'hidden\',t!==\'reports\');
   document.getElementById(\'customersSection\').classList.toggle(\'hidden\',t!==\'customers\');
-  document.getElementById(\'tabPlace\').classList.toggle(\'active\',t===\'place\');
-  document.getElementById(\'tabOrders\').classList.toggle(\'active\',t===\'orders\');
-  document.getElementById(\'tabReports\').classList.toggle(\'active\',t===\'reports\');
-  document.getElementById(\'tabCustomers\').classList.toggle(\'active\',t===\'customers\');
+  /* Desktop top tabs */
+  var tabPlace=document.getElementById(\'tabPlace\');if(tabPlace){tabPlace.classList.toggle(\'active\',t===\'place\');}
+  var tabOrders=document.getElementById(\'tabOrders\');if(tabOrders){tabOrders.classList.toggle(\'active\',t===\'orders\');}
+  var tabReports=document.getElementById(\'tabReports\');if(tabReports){tabReports.classList.toggle(\'active\',t===\'reports\');}
+  var tabCustomers=document.getElementById(\'tabCustomers\');if(tabCustomers){tabCustomers.classList.toggle(\'active\',t===\'customers\');}
+  /* Mobile bottom nav */
+  document.querySelectorAll(\'.sp-bnav-item\').forEach(function(el){el.classList.toggle(\'active\',el.getAttribute(\'data-tab\')===t);});
   if(t===\'orders\')renderSPOrders();
   if(t===\'customers\')renderSPCustList();
+  window.scrollTo(0,0);
 };
 (async function(){
   var d=await Promise.all([loadList(\'product:\'),loadList(\'party:\'),loadList(\'order:\'),loadList(\'sale:\')]);
@@ -1276,22 +1401,23 @@ window.spSelProd=function(idx,val){
 window.spChgQty=function(idx,val){spI[idx].q=+val||0;spI[idx].a=spI[idx].q*spI[idx].r;var aEl=document.getElementById(\'sp_amt_\'+idx);if(aEl)aEl.textContent=fmt(spI[idx].a);updateSPTotals();};
 window.spChgRate=function(idx,val){spI[idx].r=+val||0;spI[idx].a=spI[idx].q*spI[idx].r;var aEl=document.getElementById(\'sp_amt_\'+idx);if(aEl)aEl.textContent=fmt(spI[idx].a);updateSPTotals();};
 window.spRmItem=function(idx){spI.splice(idx,1);if(!spI.length)spI.push({pk:\'\',pn:\'\',q:1,r:0,a:0});renderSI();};
-window.updateSPTotals=function(){var total=spI.reduce(function(s,x){return s+x.a;},0);document.getElementById(\'spTotal\').textContent=\'Order Total: \'+fmt(total);};
+window.updateSPTotals=function(){var total=spI.reduce(function(s,x){return s+x.a;},0);var bar=document.getElementById(\'spTotal\');var valEl=document.getElementById(\'spTotalVal\');if(total>0){bar.style.display=\'flex\';if(valEl)valEl.textContent=fmt(total);}else{bar.style.display=\'none\';}};
 window.renderSI=function(){
   var html=\'\';
   for(var i=0;i<spI.length;i++){
     var it=spI[i];
-    html+=\'<div class="form-row" style="grid-template-columns:2fr 70px 90px 90px 34px;align-items:end;margin-bottom:6px;gap:8px">\';
-    html+=\'<select id="sp_sel_\'+i+\'" onchange="spSelProd(\'+i+\',this.value)" style="padding:11px 12px;font-size:14px"><option value="">Select Product</option>\';
+    html+=\'<div class="sp-item-card">\';
+    html+=\'<div class="sp-item-row">\';
+    html+=\'<div class="sp-item-product" style="grid-column:1/-1"><label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:3px;display:block">Product</label><select id="sp_sel_\'+i+\'" onchange="spSelProd(\'+i+\',this.value)"><option value="">Select Product</option>\';
     for(var j=0;j<spP.length;j++){
       var p=spP[j];
       html+=\'<option value="\'+p._key+\'"\'+(it.pk===p._key?\' selected\':\'\')+\'>\'+p.name+\' [\'+(p.stock||0)+\']</option>\';
     }
-    html+=\'</select>\';
-    html+=\'<input id="sp_qty_\'+i+\'" type="number" value="\'+it.q+\'" min="1" oninput="spChgQty(\'+i+\',this.value)" style="padding:11px 8px;font-size:14px;text-align:center">\';
-    html+=\'<input id="sp_rate_\'+i+\'" type="number" value="\'+it.r+\'" oninput="spChgRate(\'+i+\',this.value)" style="padding:11px 8px;font-size:14px;text-align:right" placeholder="Price">\';
-    html+=\'<div id="sp_amt_\'+i+\'" style="font-weight:700;font-size:14px;padding:11px 4px;text-align:right">\'+fmt(it.a)+\'</div>\';
-    html+=\'<button class="btn btn-danger btn-sm" onclick="spRmItem(\'+i+\')" style="padding:8px 10px">x</button>\';
+    html+=\'</select></div>\';
+    html+=\'<div><label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:3px;display:block">Qty</label><input id="sp_qty_\'+i+\'" type="number" value="\'+it.q+\'" min="1" oninput="spChgQty(\'+i+\',this.value)" style="text-align:center"></div>\';
+    html+=\'<div><label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:3px;display:block">Rate</label><input id="sp_rate_\'+i+\'" type="number" value="\'+it.r+\'" oninput="spChgRate(\'+i+\',this.value)" style="text-align:right" placeholder="Price"></div>\';
+    html+=\'</div>\';
+    html+=\'<div class="sp-item-footer"><div class="sp-item-amt" id="sp_amt_\'+i+\'">\'+fmt(it.a)+\'</div><button class="sp-item-rm" onclick="spRmItem(\'+i+\')"><span class="material-symbols-outlined" style="font-size:14px;vertical-align:middle">delete</span> Remove</button></div>\';
     html+=\'</div>\';
   }
   document.getElementById(\'spItems\').innerHTML=html;
@@ -1299,10 +1425,17 @@ window.renderSI=function(){
 };
 window.renderSPOrders=function(){
   var sorted=spOrders.slice().sort(function(a,b){return(b.date||\'\').localeCompare(a.date||\'\');});
+  /* Desktop table */
   document.getElementById(\'spOrdBody\').innerHTML=!sorted.length?\'<tr><td colspan="5" class="empty">No orders yet</td></tr>\':sorted.map(function(o){
     var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
     return\'<tr><td>\'+o.date+\'</td><td class="bold">\'+o.orderNo+\'</td><td>\'+o.customerName+\'</td><td class="r bold">\'+fmt(o.total)+\'</td><td><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></td></tr>\';
   }).join(\'\');
+  /* Mobile cards */
+  var cardsEl=document.getElementById(\'spOrdCards\');
+  if(cardsEl){cardsEl.innerHTML=!sorted.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No orders yet</div>\':sorted.map(function(o){
+    var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
+    return\'<div class="sp-order-card"><div class="sp-oc-top"><div><div class="sp-oc-no">\'+o.orderNo+\'</div><div class="sp-oc-date">\'+o.date+\'</div></div><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></div><div class="sp-oc-cust">\'+o.customerName+\'</div><div class="sp-oc-bottom"><div class="sp-oc-total">\'+fmt(o.total)+\'</div></div></div>\';
+  }).join(\'\');}
 };
 window.renderSPReport=function(){
   var type=document.getElementById(\'spRptType\').value;
@@ -1345,14 +1478,19 @@ window.renderSPReport=function(){
   document.getElementById(\'spRptFoot\').innerHTML=foot;
 };
 window.renderSPCustList=function(){
-  var rows=spC.map(function(c){
+  var custData=spC.map(function(c){
     var cs=spSales.filter(function(s){return s.customerId===c._key;});
     var totalS=cs.reduce(function(a,s){return a+(s.total||0);},0);
     var totalP=cs.reduce(function(a,s){return a+(s.paid||0);},0);
     var out=Math.max(0,totalS-totalP);
-    return\'<tr><td class="bold">\'+c.name+\'</td><td class="text-muted">\'+( c.phone||\'\')+\'</td><td class="text-muted">\'+(c.address||\'\')+\'</td><td class="r">\'+fmt(totalS)+\'</td><td class="r \'+(out>0?\'text-danger bold\':\'\')+\'">\'+fmt(out)+\'</td></tr>\';
-  }).join(\'\');
+    return{c:c,totalS:totalS,out:out};
+  });
+  /* Desktop table */
+  var rows=custData.map(function(d){return\'<tr><td class="bold">\'+d.c.name+\'</td><td class="text-muted">\'+(d.c.phone||\'\')+\'</td><td class="text-muted">\'+(d.c.address||\'\')+\'</td><td class="r">\'+fmt(d.totalS)+\'</td><td class="r \'+(d.out>0?\'text-danger bold\':\'\')+\'">\'+fmt(d.out)+\'</td></tr>\';}).join(\'\');
   document.getElementById(\'spCustListBody\').innerHTML=rows||\'<tr><td colspan="5" class="empty">No tagged customers</td></tr>\';
+  /* Mobile cards */
+  var cardsEl=document.getElementById(\'spCustCards\');
+  if(cardsEl){cardsEl.innerHTML=!custData.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No tagged customers</div>\':custData.map(function(d){return\'<div class="sp-cust-card"><div class="sp-cc-name">\'+d.c.name+\'</div><div class="sp-cc-info">\'+(d.c.phone?\'<span class="material-symbols-outlined" style="font-size:12px;vertical-align:middle">phone</span> \'+d.c.phone:\'\')+(d.c.address?\' &bull; \'+d.c.address:\'\')+\'</div><div class="sp-cc-stats"><div class="sp-cc-stat"><div class="label">Total Sales</div><div class="value">\'+fmt(d.totalS)+\'</div></div><div class="sp-cc-stat"><div class="label">Outstanding</div><div class="value \'+(d.out>0?\'text-danger\':\'text-success\')+\'">\'+fmt(d.out)+\'</div></div></div></div>\';}).join(\'\');}
 };
 window.submitOrd=async function(){
   var ck=document.getElementById(\'spCust\').value;
@@ -1508,7 +1646,7 @@ var _BD_GEO=[["Dhaka","Dhaka","Demra","Demra","1360"],["Dhaka","Dhaka","Demra","
 function geoUnique(field){var idx={division:0,district:1,thana:2,postoffice:3,postcode:4}[field];var seen={};return _BD_GEO.filter(function(r){var v=r[idx];if(seen[v])return false;seen[v]=true;return true}).map(function(r){return r[idx]})}
 function geoFilteredUnique(field,filters){var idx={division:0,district:1,thana:2,postoffice:3,postcode:4}[field];var filtered=_BD_GEO;if(filters.division)filtered=filtered.filter(function(r){return r[0]===filters.division});if(filters.district)filtered=filtered.filter(function(r){return r[1]===filters.district});if(filters.thana)filtered=filtered.filter(function(r){return r[2]===filters.thana});var seen={};return filtered.filter(function(r){var v=r[idx];if(seen[v])return false;seen[v]=true;return true}).map(function(r){return r[idx]})}
 function getGeoContext(){return{division:document.getElementById('paDv').value.trim(),district:document.getElementById('paDs').value.trim(),thana:document.getElementById('paTh').value.trim()}}
-window.geoFilter=function(inputId,listId,field){var q=document.getElementById(inputId).value.trim().toLowerCase();var ctx=getGeoContext();var items=geoFilteredUnique(field,ctx);if(q)items=items.filter(function(v){return v.toLowerCase().includes(q)});var el=document.getElementById(listId);el.innerHTML=items.slice(0,60).map(function(v){return'<div onclick="geoSelect(\''+inputId+'\',\''+listId+'\',\''+field+'\',this.textContent)">'+v+'</div>'}).join('');el.classList.add('active')}
+window.geoFilter=function(inputId,listId,field){var q=document.getElementById(inputId).value.trim().toLowerCase();var ctx=getGeoContext();var items=geoFilteredUnique(field,ctx);if(q)items=items.filter(function(v){return v.toLowerCase().includes(q)});var el=document.getElementById(listId);el.innerHTML=items.slice(0,60).map(function(v){return'<div onclick="geoSelect(\\x27'+inputId+'\\x27,\\x27'+listId+'\\x27,\\x27'+field+'\\x27,this.textContent)">'+v+'</div>'}).join('');el.classList.add('active')}
 window.geoShowList=function(listId){document.querySelectorAll('.sr-list').forEach(function(x){if(x.id!==listId)x.classList.remove('active')});var el=document.getElementById(listId);if(!el.innerHTML)return;el.classList.add('active')}
 window.geoSelect=function(inputId,listId,field,val){document.getElementById(inputId).value=val;document.getElementById(listId).classList.remove('active');geoAutoFill(field,val)}
 window.geoAutoFill=function(field,val){var matches=_BD_GEO.filter(function(r){var idx={division:0,district:1,thana:2,postoffice:3,postcode:4}[field];return r[idx]===val});if(!matches.length)return;var first=matches[0];
