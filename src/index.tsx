@@ -780,10 +780,10 @@ function layout(content: string, active: string, session: any) {
   
   // Role-based access control map
   const roleAccess: Record<string, string[]> = {
-    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog'],
-    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog'],
-    entry: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','daydetails'],
-    viewer: ['dashboard','stockcheck','reports','profitloss','balancesheet','trialbalance','stock','recpay','ledger','expledger','daydetails'],
+    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog','truckfarereport','truckfaresettings'],
+    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog','truckfarereport','truckfaresettings'],
+    entry: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','daydetails','truckfarereport'],
+    viewer: ['dashboard','stockcheck','reports','profitloss','balancesheet','trialbalance','stock','recpay','ledger','expledger','daydetails','truckfarereport'],
   };
   const allowed = roleAccess[role] || roleAccess['viewer'];
   
@@ -1324,6 +1324,14 @@ ${getCSS()}
 <!-- Mobile card list -->
 <div class="sp-order-cards" id="spOrdCards"></div>
 </div>
+<!-- Order Detail Modal -->
+<div style="display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.5);backdrop-filter:blur(2px)" id="spOrdDetailOverlay" onclick="if(event.target===this)closeSPOrdDetail()">
+<div style="position:absolute;bottom:0;left:0;right:0;max-height:90vh;background:var(--card);border-radius:20px 20px 0 0;padding:20px 16px;overflow-y:auto;animation:slideUp .3s ease" id="spOrdDetailInner">
+<div style="width:36px;height:4px;background:var(--border-dark);border-radius:2px;margin:0 auto 14px"></div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0;font-size:16px">Order Details</h3><button style="background:none;border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer" onclick="closeSPOrdDetail()">Close</button></div>
+<div id="spOrdDetailContent"></div>
+</div>
+</div>
 
 <div id="reportsSection" class="hidden">
 <div class="card" style="margin-bottom:14px">
@@ -1426,17 +1434,32 @@ window.renderSI=function(){
 window.renderSPOrders=function(){
   var sorted=spOrders.slice().sort(function(a,b){return(b.date||\'\').localeCompare(a.date||\'\');});
   /* Desktop table */
-  document.getElementById(\'spOrdBody\').innerHTML=!sorted.length?\'<tr><td colspan="5" class="empty">No orders yet</td></tr>\':sorted.map(function(o){
+  document.getElementById(\'spOrdBody\').innerHTML=!sorted.length?\'<tr><td colspan="5" class="empty">No orders yet</td></tr>\':sorted.map(function(o,idx){
     var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
-    return\'<tr><td>\'+o.date+\'</td><td class="bold">\'+o.orderNo+\'</td><td>\'+o.customerName+\'</td><td class="r bold">\'+fmt(o.total)+\'</td><td><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></td></tr>\';
+    return\'<tr style="cursor:pointer" onclick="viewSPOrd(\'+idx+\')"><td>\'+o.date+\'</td><td class="bold" style="color:var(--primary)">\'+o.orderNo+\'</td><td>\'+o.customerName+\'</td><td class="r bold">\'+fmt(o.total)+\'</td><td><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></td></tr>\';
   }).join(\'\');
   /* Mobile cards */
   var cardsEl=document.getElementById(\'spOrdCards\');
-  if(cardsEl){cardsEl.innerHTML=!sorted.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No orders yet</div>\':sorted.map(function(o){
+  if(cardsEl){cardsEl.innerHTML=!sorted.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No orders yet</div>\':sorted.map(function(o,idx){
     var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
-    return\'<div class="sp-order-card"><div class="sp-oc-top"><div><div class="sp-oc-no">\'+o.orderNo+\'</div><div class="sp-oc-date">\'+o.date+\'</div></div><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></div><div class="sp-oc-cust">\'+o.customerName+\'</div><div class="sp-oc-bottom"><div class="sp-oc-total">\'+fmt(o.total)+\'</div></div></div>\';
+    return\'<div class="sp-order-card" style="cursor:pointer" onclick="viewSPOrd(\'+idx+\')"><div class="sp-oc-top"><div><div class="sp-oc-no" style="color:var(--primary)">\'+o.orderNo+\'</div><div class="sp-oc-date">\'+o.date+\'</div></div><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></div><div class="sp-oc-cust">\'+o.customerName+\'</div><div class="sp-oc-bottom"><div class="sp-oc-total">\'+fmt(o.total)+\'</div><span style="font-size:11px;color:var(--primary);font-weight:600">View Details &rarr;</span></div></div>\';
   }).join(\'\');}
 };
+window.viewSPOrd=function(idx){
+  var sorted=spOrders.slice().sort(function(a,b){return(b.date||\'\').localeCompare(a.date||\'\');});
+  var o=sorted[idx];if(!o)return;
+  var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
+  var html=\'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Order Number</div><div style="font-size:18px;font-weight:800">\'+o.orderNo+\'</div></div><span class="badge \'+badge+\'" style="font-size:12px;padding:5px 12px">\'+(o.status||\'pending\')+\'</span></div>\';
+  html+=\'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px"><div style="background:var(--bg);padding:10px 12px;border-radius:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Date</div><div style="font-weight:600;font-size:14px">\'+o.date+\'</div></div><div style="background:var(--bg);padding:10px 12px;border-radius:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Customer</div><div style="font-weight:600;font-size:14px">\'+o.customerName+\'</div></div></div>\';
+  if(o.convertedInvoice){html+=\'<div style="background:var(--accent-light);padding:8px 12px;border-radius:8px;margin-bottom:12px;font-size:12px"><b>Converted to Invoice:</b> <span style="color:var(--accent);font-weight:700">\'+o.convertedInvoice+\'</span></div>\';}
+  html+=\'<div style="font-size:11px;font-weight:700;margin-bottom:8px;text-transform:uppercase;color:var(--muted);letter-spacing:.5px">Items (\'+((o.items||[]).length)+\')</div>\';
+  html+=\'<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="background:var(--bg)"><th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">#</th><th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Product</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Qty</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Rate</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Amount</th></tr></thead><tbody>\';
+  (o.items||[]).forEach(function(it,i){html+=\'<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 10px">\'+(i+1)+\'</td><td style="padding:8px 10px;font-weight:600">\'+it.productName+\'</td><td style="padding:8px 10px;text-align:right">\'+it.qty+\'</td><td style="padding:8px 10px;text-align:right">\'+fmt(it.rate)+\'</td><td style="padding:8px 10px;text-align:right;font-weight:700">\'+fmt(it.amount||it.qty*it.rate)+\'</td></tr>\';});
+  html+=\'<tr style="background:var(--bg)"><td colspan="4" style="padding:10px;text-align:right;font-weight:800;font-size:13px">Total</td><td style="padding:10px;text-align:right;font-weight:800;font-size:16px;color:var(--primary)">\'+fmt(o.total)+\'</td></tr></tbody></table>\';
+  document.getElementById(\'spOrdDetailContent\').innerHTML=html;
+  document.getElementById(\'spOrdDetailOverlay\').style.display=\'block\';
+};
+window.closeSPOrdDetail=function(){document.getElementById(\'spOrdDetailOverlay\').style.display=\'none\';};
 window.renderSPReport=function(){
   var type=document.getElementById(\'spRptType\').value;
   var from=document.getElementById(\'spRptFrom\').value;
@@ -2718,12 +2741,33 @@ function ordersPage(){return `
 <div class="page-header"><div><div class="page-title">Orders</div><div class="page-sub">SP portal orders - approve, deny, convert</div></div></div>
 <div class="tabs"><button class="tab active" onclick="switchOrdTab('pending',this)">Pending</button><button class="tab" onclick="switchOrdTab('approved',this)">Approved</button><button class="tab" onclick="switchOrdTab('denied',this)">Denied</button><button class="tab" onclick="switchOrdTab('converted',this)">Converted</button><button class="tab" onclick="switchOrdTab('all',this)">All</button></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th>SP</th><th class="r">Total</th><th>Status</th><th class="r">Act</th></tr></thead><tbody id="ordBody"></tbody></table></div></div>
+<div class="modal-overlay" id="ordDetailModal"><div class="modal" style="max-width:650px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0" id="ordDetailTitle">Order Details</h3><div style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('ordDetailPrint','Order Details')">Print</button><button class="btn btn-outline btn-sm" onclick="closeModal('ordDetailModal')">Close</button></div></div>
+<div id="ordDetailPrint">
+<div id="ordDetailContent"></div>
+</div>
+<div id="ordDetailActions" style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"></div>
+</div></div>
 <script>
 var ords=[],ordTab='pending';
 async function loadOrd(){ords=await loadList('order:');renderOrd()}
 window.switchOrdTab=function(t,el){ordTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderOrd()}
+window.viewOrd=function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;
+var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';
+var html='<div style="display:flex;justify-content:space-between;margin-bottom:14px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Order Number</div><div style="font-size:16px;font-weight:800">'+o.orderNo+'</div></div><div style="text-align:right"><span class="badge '+statusBadge+'" style="font-size:11px;padding:4px 10px">'+o.status+'</span></div></div>';
+html+='<div class="form-row" style="margin-bottom:12px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Date</div><div style="font-weight:600">'+o.date+'</div></div><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Customer</div><div style="font-weight:600">'+o.customerName+'</div></div></div>';
+html+='<div class="form-row" style="margin-bottom:14px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Salesperson</div><div style="font-weight:600">'+(o.spName||'-')+'</div></div>'+(o.convertedInvoice?'<div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Converted Invoice</div><div style="font-weight:600;color:var(--primary)">'+o.convertedInvoice+'</div></div>':'')+'</div>';
+html+='<div style="font-size:12px;font-weight:700;margin-bottom:6px;text-transform:uppercase;color:var(--muted)">Items</div>';
+html+='<table class="tbl" style="font-size:12px"><thead><tr style="background:var(--bg)"><th>#</th><th>Product</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>';
+(o.items||[]).forEach(function(it,i){html+='<tr><td>'+(i+1)+'</td><td class="bold">'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r bold">'+fmt(it.amount||it.qty*it.rate)+'</td></tr>'});
+html+='<tr style="background:var(--bg);font-weight:800"><td colspan="4" class="r">Total</td><td class="r" style="font-size:14px">'+fmt(o.total)+'</td></tr></tbody></table>';
+document.getElementById('ordDetailContent').innerHTML=html;
+var acts='';if(o.status==='pending'){acts='<button class="btn btn-success" onclick="approveOrd(\\x27'+o._key+'\\x27);closeModal(\\x27ordDetailModal\\x27)">Approve</button> <button class="btn btn-danger" onclick="denyOrd(\\x27'+o._key+'\\x27);closeModal(\\x27ordDetailModal\\x27)">Deny</button>'}
+if(o.status==='approved'){acts='<button class="btn btn-primary" onclick="convertOrd(\\x27'+o._key+'\\x27);closeModal(\\x27ordDetailModal\\x27)">Convert to Invoice</button>'}
+document.getElementById('ordDetailActions').innerHTML=acts;
+openModal('ordDetailModal')}
 function renderOrd(){var fl=ordTab==='all'?ords:ords.filter(function(o){return o.status===ordTab});fl.sort(function(a,b){return(b.date||'').localeCompare(a.date)});
-document.getElementById('ordBody').innerHTML=!fl.length?'<tr><td colspan="7" class="empty">No orders</td></tr>':fl.map(function(o){var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';var acts='';if(o.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="approveOrd(\\x27'+o._key+'\\x27)">Approve</button> <button class="btn btn-danger btn-xs" onclick="denyOrd(\\x27'+o._key+'\\x27)">Deny</button>'}if(o.status==='approved'){acts='<button class="btn btn-primary btn-xs" onclick="convertOrd(\\x27'+o._key+'\\x27)">Convert to Invoice</button>'}return'<tr><td>'+o.date+'</td><td class="bold">'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="text-muted">'+(o.spName||'')+'</td><td class="r bold">'+fmt(o.total)+'</td><td><span class="badge '+statusBadge+'">'+o.status+'</span></td><td class="r">'+acts+'</td></tr>'}).join('')}
+document.getElementById('ordBody').innerHTML=!fl.length?'<tr><td colspan="7" class="empty">No orders</td></tr>':fl.map(function(o){var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';var acts='';if(o.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="event.stopPropagation();approveOrd(\\x27'+o._key+'\\x27)">Approve</button> <button class="btn btn-danger btn-xs" onclick="event.stopPropagation();denyOrd(\\x27'+o._key+'\\x27)">Deny</button>'}if(o.status==='approved'){acts='<button class="btn btn-primary btn-xs" onclick="event.stopPropagation();convertOrd(\\x27'+o._key+'\\x27)">Convert to Invoice</button>'}return'<tr style="cursor:pointer" onclick="viewOrd(\\x27'+o._key+'\\x27)"><td>'+o.date+'</td><td class="bold" style="color:var(--primary)">'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="text-muted">'+(o.spName||'')+'</td><td class="r bold">'+fmt(o.total)+'</td><td><span class="badge '+statusBadge+'">'+o.status+'</span></td><td class="r">'+acts+'</td></tr>'}).join('')}
 window.approveOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='approved';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order approved','success');loadOrd()}
 window.denyOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='denied';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order denied','info');loadOrd()}
 window.convertOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;if(!confirm('Convert to sales invoice? Stock will be deducted.'))return;
