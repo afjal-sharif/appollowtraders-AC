@@ -467,6 +467,9 @@ var dup=_tfList.find(function(x){return x.thana===th&&(!ek||x._key!==ek)});if(du
 var data={thana:th,district:ds,division:dv,maxFare:mx};
 try{if(ek){await saveByKey(ek,data,'edit','Updated thana fare: '+th)}else{await saveItem('thanafare:',data,null,'create','Added thana fare: '+th)}invalidateCache('thanafare:');closeModal('tfModal');loadTF();showToast(ek?'Thana fare updated':'Thana fare added','success')}catch(e){showToast('Failed: '+e.message,'error')}}
 window.delTF=async function(k){if(!confirm('Delete this thana fare setting?'))return;var t=_tfList.find(function(x){return x._key===k});await deleteItem(k,false,'Deleted thana fare: '+(t?t.thana:''));invalidateCache('thanafare:');loadTF();showToast('Deleted','success')}
+window.downloadTFTemplate=function(){var ws=XLSX.utils.aoa_to_sheet([['Thana','Max Fare'],['Dhanmondi','50'],['Gulshan','60'],['Uttara','70']]);var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Template');XLSX.writeFile(wb,'thana_fare_template.xlsx')}
+document.getElementById('tfImportFile').addEventListener('change',function(e){var file=e.target.files[0];if(!file)return;var reader=new FileReader();reader.onload=function(ev){try{var wb=XLSX.read(ev.target.result,{type:'array'});var ws=wb.Sheets[wb.SheetNames[0]];var rows=XLSX.utils.sheet_to_json(ws,{defval:''});if(!rows.length){document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--danger)">No data found</span>';return}window._tfImportRows=rows.map(function(r){var thana=String(r['Thana']||r['thana']||r['THANA']||'').trim();var maxFare=parseFloat(r['Max Fare']||r['max fare']||r['MaxFare']||r['Fare']||r['fare']||0)||0;var geo=_tfGeo.find(function(g){return g[2].toLowerCase()===thana.toLowerCase()});return{thana:geo?geo[2]:thana,district:geo?geo[1]:'',division:geo?geo[0]:'',maxFare:maxFare}}).filter(function(r){return r.thana&&r.maxFare>0});var prev=document.getElementById('tfImportPreview');prev.style.display='block';prev.innerHTML='<div style="font-weight:600;margin-bottom:6px">Preview ('+window._tfImportRows.length+' thanas):</div><table class="tbl" style="font-size:11px"><thead><tr><th>Thana</th><th>District</th><th>Division</th><th class="r">Max Fare</th></tr></thead><tbody>'+window._tfImportRows.slice(0,20).map(function(r){return'<tr><td>'+r.thana+'</td><td>'+r.district+'</td><td>'+r.division+'</td><td class="r">'+r.maxFare+'</td></tr>'}).join('')+'</tbody></table>';document.getElementById('tfImportBtn').disabled=false;document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--accent)">'+window._tfImportRows.length+' thanas ready to import</span>'}catch(err){document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--danger)">Error: '+err.message+'</span>'}};reader.readAsArrayBuffer(file)})
+window.doImportTF=async function(){if(!window._tfImportRows||!window._tfImportRows.length)return;document.getElementById('tfImportBtn').disabled=true;document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--primary)">Importing...</span>';var ok=0,fail=0;for(var i=0;i<window._tfImportRows.length;i++){try{var r=window._tfImportRows[i];var dup=_tfList.find(function(x){return x.thana===r.thana});if(dup){await saveByKey(dup._key,{thana:r.thana,district:r.district,division:r.division,maxFare:r.maxFare})}else{await saveItem('thanafare:',{thana:r.thana,district:r.district,division:r.division,maxFare:r.maxFare})}ok++}catch(e){fail++}}invalidateCache('thanafare:');loadTF();closeModal('tfImportModal');showToast('Imported '+ok+' thana fares'+(fail?' ('+fail+' failed)':''),'success');window._tfImportRows=[]}
 loadTF();
 </script>`}
 
@@ -2148,7 +2151,7 @@ document.getElementById('ledPAddr').textContent=p.address||'N/A';
 var entries=[];
 var ob=p.openingBalance||0;
 if(ob!==0){entries.push({date:'--',doc:'Opening Balance',docType:'',docKey:'',type:'Opening',debit:ob>0?ob:0,credit:ob<0?Math.abs(ob):0,_isOB:true})}
-if(p.type==='customer'){ledSales.filter(function(s){return s.customerId===pk}).forEach(function(s){entries.push({date:s.date,doc:s.invoiceNo,docType:'sale',docKey:s._key,type:'Sale',debit:s.total||0,credit:s.paid||0})});ledPayments.filter(function(r){return r.party===p.name&&r.type==='receipt'&&r.status==='done'&&!r._autoInvoice&&!(r.billKeys&&r.billKeys.length)}).forEach(function(r){entries.push({date:r.date,doc:r.no,docType:'receipt',docKey:r._key,type:'Receipt',debit:0,credit:r.amount||0})})}
+if(p.type==='customer'){ledSales.filter(function(s){return s.customerId===pk}).forEach(function(s){entries.push({date:s.date,doc:s.invoiceNo,docType:'sale',docKey:s._key,type:'Sale',debit:s.total||0,credit:s.paid||0});if(s.truckFare>0){entries.push({date:s.date,doc:s.invoiceNo+' (Truck Fare IN)',docType:'sale',docKey:s._key,type:'Truck Fare IN',debit:0,credit:s.truckFare})}});ledPayments.filter(function(r){return r.party===p.name&&r.type==='receipt'&&r.status==='done'&&!r._autoInvoice&&!(r.billKeys&&r.billKeys.length)&&!r._isTruckFare}).forEach(function(r){entries.push({date:r.date,doc:r.no,docType:'receipt',docKey:r._key,type:'Receipt',debit:0,credit:r.amount||0})})}
 else{ledPurchases.filter(function(pr){return pr.supplierId===pk}).forEach(function(pr){entries.push({date:pr.date,doc:pr.purchaseNo,docType:'purchase',docKey:pr._key,type:'Purchase',debit:pr.total||0,credit:pr.paid||0})});ledPayments.filter(function(py){return py.party===p.name&&py.type==='payment'&&py.status==='done'&&!py._autoInvoice&&!(py.billKeys&&py.billKeys.length)}).forEach(function(py){entries.push({date:py.date,doc:py.no,docType:'payment',docKey:py._key,type:'Payment',debit:py.amount||0,credit:0})})}
 if(from)entries=entries.filter(function(e){return e._isOB||e.date>=from});if(to)entries=entries.filter(function(e){return e._isOB||e.date<=to});
 entries.sort(function(a,b){if(a._isOB)return -1;if(b._isOB)return 1;return(a.date||'').localeCompare(b.date)});
@@ -2157,7 +2160,7 @@ var totalDr=entries.reduce(function(s,e){return s+e.debit},0);var totalCr=entrie
 document.getElementById('ledPBalSummary').innerHTML='<div style="font-size:18px;font-weight:800;'+(bal>0?'color:var(--danger)':'color:var(--accent)')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</div><div class="text-muted" style="font-size:11px">'+(p.type==='customer'?(bal>0?'Receivable':'Advance'):(bal>0?'Overpaid':'Payable'))+'</div>';
 document.getElementById('ledStats').innerHTML='<div class="stat"><div class="label">Total Debit</div><div class="value text-danger">'+fmt(totalDr)+'</div></div><div class="stat"><div class="label">Total Credit</div><div class="value text-success">'+fmt(totalCr)+'</div></div><div class="stat"><div class="label">Balance</div><div class="value '+(bal>0?'text-danger':'text-success')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</div></div>';
 // Row color class based on type: led-sale, led-purchase, led-receipt, led-payment
-document.getElementById('ledBody').innerHTML=!entries.length?'<tr><td colspan="6" class="empty">No entries</td></tr>':entries.map(function(e){var rowClass='led-'+e.type.toLowerCase();var badgeClass=e.type==='Sale'?'badge-info':e.type==='Purchase'?'badge-warning':e.type==='Receipt'?'badge-success':e.type==='Opening'?'badge-cash':'badge-cash';return'<tr class="'+rowClass+'"><td>'+e.date+'</td><td>'+(e.docKey?'<span class="doc-link" onclick="previewDoc(\\x27'+e.docType+'\\x27,\\x27'+e.docKey+'\\x27)">'+e.doc+'</span>':e.doc)+'</td><td><span class="badge '+badgeClass+'">'+e.type+'</span></td><td class="r '+(e.debit?'text-danger':'')+'">'+fmt(e.debit)+'</td><td class="r '+(e.credit?'text-success':'')+'">'+fmt(e.credit)+'</td><td class="r bold '+(e.balance>0?'text-danger':'text-success')+'">'+fmt(Math.abs(e.balance))+' '+(e.balance>0?'Dr':'Cr')+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800;border-top:2px solid var(--border-dark)"><td colspan="3">TOTAL ('+entries.length+' entries)</td><td class="r text-danger">'+fmt(totalDr)+'</td><td class="r text-success">'+fmt(totalCr)+'</td><td class="r bold '+(bal>0?'text-danger':'text-success')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</td></tr>'}
+document.getElementById('ledBody').innerHTML=!entries.length?'<tr><td colspan="6" class="empty">No entries</td></tr>':entries.map(function(e){var rowClass='led-'+e.type.toLowerCase();var badgeClass=e.type==='Sale'?'badge-info':e.type==='Purchase'?'badge-warning':e.type==='Receipt'?'badge-success':e.type==='Truck Fare IN'?'badge-success':e.type==='Truck Fare OUT'?'badge-danger':e.type==='Opening'?'badge-cash':'badge-cash';return'<tr class="'+rowClass+'"><td>'+e.date+'</td><td>'+(e.docKey?'<span class="doc-link" onclick="previewDoc(\\x27'+e.docType+'\\x27,\\x27'+e.docKey+'\\x27)">'+e.doc+'</span>':e.doc)+'</td><td><span class="badge '+badgeClass+'">'+e.type+'</span></td><td class="r '+(e.debit?'text-danger':'')+'">'+fmt(e.debit)+'</td><td class="r '+(e.credit?'text-success':'')+'">'+fmt(e.credit)+'</td><td class="r bold '+(e.balance>0?'text-danger':'text-success')+'">'+fmt(Math.abs(e.balance))+' '+(e.balance>0?'Dr':'Cr')+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800;border-top:2px solid var(--border-dark)"><td colspan="3">TOTAL ('+entries.length+' entries)</td><td class="r text-danger">'+fmt(totalDr)+'</td><td class="r text-success">'+fmt(totalCr)+'</td><td class="r bold '+(bal>0?'text-danger':'text-success')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</td></tr>'}
 loadLedger();
 </script>`}
 
@@ -2187,11 +2190,12 @@ function profitLossPage(){return `
 <div class="form-row" style="margin-bottom:14px">
 <div><label>From</label><input type="date" id="plFrom"></div>
 <div><label>To</label><input type="date" id="plTo"></div>
-<div style="display:flex;align-items:end"><button class="btn btn-primary" onclick="renderPL()" style="white-space:nowrap"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View</button></div>
+<div style="display:flex;align-items:end;gap:8px"><button class="btn btn-primary" onclick="renderPL()" style="white-space:nowrap"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View</button><label style="font-size:11px;white-space:nowrap;display:flex;align-items:center;gap:4px;margin:0"><input type="checkbox" id="plExcludeTF" onchange="renderPL()"> Exclude Truck Fare</label></div>
 </div>
 
 <div id="plPrint">
 <div class="stats" id="plStats"></div>
+<div id="plNetBadge" style="margin-bottom:14px"></div>
 <div class="card">
 <table class="tbl" id="plTbl"><tbody id="plBody"></tbody></table>
 </div>
@@ -2283,6 +2287,7 @@ window.renderPL=function(){
 
 var from=document.getElementById('plFrom').value;
 var to=document.getElementById('plTo').value;
+var excludeTF=document.getElementById('plExcludeTF').checked;
 
 var sales=window._plSales.filter(function(s){
   return(!from||s.date>=from)&&(!to||s.date<=to)
@@ -2292,10 +2297,18 @@ var expenses=window._plExpenses.filter(function(e){
   return(!from||e.date>=from)&&(!to||e.date<=to)
 });
 
+// If excluding truck fare, filter out truck fare expenses
+if(excludeTF){
+  expenses=expenses.filter(function(e){return !e._isTruckFare});
+}
+
 // Revenue
 var revenue=sales.reduce(function(s,x){
   return s+(x.total||0)
 },0);
+
+// Truck fare totals
+var truckFareReceived=sales.reduce(function(s,x){return s+(x.truckFare||0)},0);
 
 // ✅ FIFO COGS
 var stock = buildInventoryFIFO(window._plPurchases);
@@ -2321,15 +2334,27 @@ expenses.forEach(function(e){
 
 document.getElementById('plStats').innerHTML=
 '<div class="stat"><div class="label">Revenue</div><div class="value text-success">'+fmt(revenue)+'</div></div>'+
-'<div class="stat"><div class="label">COGS</div><div class="value text-warning">'+fmt(cogs)+'</div></div>'+
+'<div class="stat"><div class="label">COGS (FIFO)</div><div class="value text-warning">'+fmt(cogs)+'</div></div>'+
 '<div class="stat"><div class="label">Gross Profit</div><div class="value '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</div></div>'+
-'<div class="stat"><div class="label">Net Profit</div><div class="value '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(netProfit)+'</div></div>';
+'<div class="stat"><div class="label">Expenses</div><div class="value text-danger">'+fmt(totalExp)+'</div></div>'+
+'<div class="stat" style="border:2px solid '+(netProfit>=0?'var(--accent)':'var(--danger)')+'"><div class="label">Net '+(netProfit>=0?'Profit':'Loss')+'</div><div class="value '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(Math.abs(netProfit))+'</div></div>';
+
+// Net Profit/Loss Badge
+var badgeHtml='';
+if(netProfit>=0){
+  badgeHtml='<div style="display:inline-flex;align-items:center;gap:8px;padding:10px 20px;background:var(--accent-light);border:2px solid var(--accent);border-radius:10px;font-size:16px;font-weight:800;color:var(--accent)"><span class="material-symbols-outlined" style="font-size:22px">trending_up</span> NET PROFIT: '+fmt(netProfit)+' <span class="badge badge-success" style="font-size:12px;padding:4px 10px">PROFIT</span></div>';
+}else{
+  badgeHtml='<div style="display:inline-flex;align-items:center;gap:8px;padding:10px 20px;background:var(--danger-light);border:2px solid var(--danger);border-radius:10px;font-size:16px;font-weight:800;color:var(--danger)"><span class="material-symbols-outlined" style="font-size:22px">trending_down</span> NET LOSS: '+fmt(Math.abs(netProfit))+' <span class="badge badge-danger" style="font-size:12px;padding:4px 10px">LOSS</span></div>';
+}
+if(excludeTF){badgeHtml+=' <span class="badge badge-warning" style="margin-left:8px;font-size:11px">Truck Fare Excluded</span>';}
+document.getElementById('plNetBadge').innerHTML=badgeHtml;
 
 var rows='';
 
 // Revenue
 rows+='<tr style="background:var(--accent-light)"><td class="bold" colspan="2">Revenue</td></tr>';
 rows+='<tr><td style="padding-left:24px">Sales Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+if(!excludeTF&&truckFareReceived>0){rows+='<tr><td style="padding-left:24px;color:var(--muted)">Truck Fare Received (pass-through)</td><td class="r text-muted">'+fmt(truckFareReceived)+'</td></tr>';}
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
 
 // COGS
@@ -2338,16 +2363,19 @@ rows+='<tr><td style="padding-left:24px">COGS (FIFO Based)</td><td class="r bold
 rows+='<tr style="background:var(--bg)"><td class="bold">Gross Profit</td><td class="r bold '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</td></tr>';
 
 // Expenses
-rows+='<tr style="background:var(--danger-light)"><td class="bold" colspan="2">Expenses</td></tr>';
+rows+='<tr style="background:var(--danger-light)"><td class="bold" colspan="2">Expenses'+(excludeTF?' <span class="badge badge-warning" style="font-size:9px">Truck Fare Excluded</span>':'')+'</td></tr>';
 
 Object.keys(expByHead).sort().forEach(function(h){
-  rows+='<tr><td style="padding-left:24px">'+h+'</td><td class="r">'+fmt(expByHead[h])+'</td></tr>';
+  var isTF=(h==='Transportation');
+  rows+='<tr><td style="padding-left:24px'+(isTF&&!excludeTF?';color:var(--info)':'')+'">'+(isTF&&!excludeTF?h+' <span style="font-size:10px;color:var(--muted)">(incl. Truck Fare)</span>':h)+'</td><td class="r">'+fmt(expByHead[h])+'</td></tr>';
 });
 
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Expenses</td><td class="r bold text-danger">'+fmt(totalExp)+'</td></tr>';
 
 // Net
-rows+='<tr style="background:var(--primary-light);font-size:15px"><td class="bold">NET PROFIT / (LOSS)</td><td class="r bold '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(netProfit)+'</td></tr>';
+var netLabel=netProfit>=0?'NET PROFIT':'NET LOSS';
+var netBadge=netProfit>=0?' <span class="badge badge-success" style="font-size:10px;padding:2px 8px">Profit</span>':' <span class="badge badge-danger" style="font-size:10px;padding:2px 8px">Loss</span>';
+rows+='<tr style="background:var(--primary-light);font-size:15px"><td class="bold">'+netLabel+netBadge+'</td><td class="r bold '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(Math.abs(netProfit))+'</td></tr>';
 
 document.getElementById('plBody').innerHTML=rows;
 
@@ -2760,7 +2788,7 @@ loadSP();
 function ordersPage(){return `
 <div class="page-header"><div><div class="page-title">Orders</div><div class="page-sub">SP portal orders - approve, deny, convert</div></div></div>
 <div class="tabs"><button class="tab active" onclick="switchOrdTab('pending',this)">Pending</button><button class="tab" onclick="switchOrdTab('approved',this)">Approved</button><button class="tab" onclick="switchOrdTab('denied',this)">Denied</button><button class="tab" onclick="switchOrdTab('converted',this)">Converted</button><button class="tab" onclick="switchOrdTab('all',this)">All</button></div>
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th>SP</th><th>Products</th><th class="r">Total</th><th>Status</th><th class="r">Act</th></tr></thead><tbody id="ordBody"></tbody></table></div></div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th>SP</th><th>Product Name</th><th class="r">Quantity</th><th class="r">Total</th><th>Status</th><th class="r">Act</th></tr></thead><tbody id="ordBody"></tbody></table></div></div>
 <div class="modal-overlay" id="ordDetailModal"><div class="modal" style="max-width:650px">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0" id="ordDetailTitle">Order Details</h3><div style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('ordDetailPrint','Order Details')">Print</button><button class="btn btn-outline btn-sm" onclick="closeModal('ordDetailModal')">Close</button></div></div>
 <div id="ordDetailPrint">
@@ -2787,7 +2815,7 @@ if(o.status==='approved'){acts='<button class="btn btn-primary" onclick="convert
 document.getElementById('ordDetailActions').innerHTML=acts;
 openModal('ordDetailModal')}
 function renderOrd(){var fl=ordTab==='all'?ords:ords.filter(function(o){return o.status===ordTab});fl.sort(function(a,b){return(b.date||'').localeCompare(a.date)});
-document.getElementById('ordBody').innerHTML=!fl.length?'<tr><td colspan="8" class="empty">No orders</td></tr>':fl.map(function(o){var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';var acts='';if(o.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="event.stopPropagation();approveOrd(\\x27'+o._key+'\\x27)">Approve</button> <button class="btn btn-danger btn-xs" onclick="event.stopPropagation();denyOrd(\\x27'+o._key+'\\x27)">Deny</button>'}if(o.status==='approved'){acts='<button class="btn btn-primary btn-xs" onclick="event.stopPropagation();convertOrd(\\x27'+o._key+'\\x27)">Convert to Invoice</button>'}var prodSummary=(o.items||[]).map(function(it){return it.productName+' x'+it.qty}).join(', ');return'<tr style="cursor:pointer" onclick="viewOrd(\\x27'+o._key+'\\x27)"><td>'+o.date+'</td><td class="bold" style="color:var(--primary)">'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="text-muted">'+(o.spName||'')+'</td><td class="text-muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+prodSummary+'">'+prodSummary+'</td><td class="r bold">'+fmt(o.total)+'</td><td><span class="badge '+statusBadge+'">'+o.status+'</span></td><td class="r">'+acts+'</td></tr>'}).join('')}
+document.getElementById('ordBody').innerHTML=!fl.length?'<tr><td colspan="9" class="empty">No orders</td></tr>':fl.map(function(o){var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';var acts='';if(o.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="event.stopPropagation();approveOrd(\\x27'+o._key+'\\x27)">Approve</button> <button class="btn btn-danger btn-xs" onclick="event.stopPropagation();denyOrd(\\x27'+o._key+'\\x27)">Deny</button>'}if(o.status==='approved'){acts='<button class="btn btn-primary btn-xs" onclick="event.stopPropagation();convertOrd(\\x27'+o._key+'\\x27)">Convert to Invoice</button>'}var prodNames=(o.items||[]).map(function(it){return it.productName}).join(', ');var totalQty=(o.items||[]).reduce(function(s,it){return s+(it.qty||0)},0);return'<tr style="cursor:pointer" onclick="viewOrd(\\x27'+o._key+'\\x27)"><td>'+o.date+'</td><td class="bold" style="color:var(--primary)">'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="text-muted">'+(o.spName||'')+'</td><td class="text-muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+prodNames+'">'+prodNames+'</td><td class="r bold">'+totalQty+'</td><td class="r bold">'+fmt(o.total)+'</td><td><span class="badge '+statusBadge+'">'+o.status+'</span></td><td class="r">'+acts+'</td></tr>'}).join('')}
 window.approveOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='approved';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order approved','success');loadOrd()}
 window.denyOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='denied';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order denied','info');loadOrd()}
 window.convertOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;if(!confirm('Convert to sales invoice? Stock will be deducted.'))return;
