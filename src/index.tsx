@@ -421,6 +421,8 @@ app.get('/admin', (c) => htmlRes(layout(adminPage(), "admin", getSession(c))));
 app.get('/mod-log', (c) => htmlRes(layout(modLogPage(), "modlog", getSession(c))));
 app.get('/approvals', (c) => htmlRes(layout(approvalsPage(), "approvals", getSession(c))));
 app.get('/company-settings', (c) => htmlRes(layout(companySettingsPage(), "companysettings", getSession(c))));
+app.get('/vat-ledger', (c) => htmlRes(layout(vatLedgerPage(), "vatledger", getSession(c))));
+app.get('/ait-ledger', (c) => htmlRes(layout(aitLedgerPage(), "aitledger", getSession(c))));
 app.get('/truck-fare-report', (c) => htmlRes(layout(truckFareReportPage(), "truckfarereport", getSession(c))));
 app.get('/truck-fare-settings', (c) => htmlRes(layout(truckFareSettingsPage(), "truckfaresettings", getSession(c))));
 app.get('/sp-portal', (c) => htmlRes(spPortalPage(c)));
@@ -428,6 +430,50 @@ app.get('/login', async (c) => {
   const users = await kvList(c.env, 'user:');
   return htmlRes(loginPage("", users.length > 0));
 });
+
+function vatLedgerPage(){return `
+<div class="page-header"><div><div class="page-title">VAT/Tax Ledger</div><div class="page-sub">VAT collected from customers (Liability - Payable to Gov't)</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('vatPrint','VAT Ledger')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('vatTbl','VATLedger')">Export XLS</button></div></div>
+<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="vatFrom" onchange="renderVatLedger()"></div><div><label>To</label><input type="date" id="vatTo" onchange="renderVatLedger()"></div></div>
+<div class="stats" id="vatStats"></div>
+<div id="vatPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="vatTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">VAT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="vatBody"></tbody></table></div></div></div>
+<script>
+async function loadVatLedger(){var s=await loadList('sale:');window._vatSales=s;renderVatLedger()}
+window.renderVatLedger=function(){var from=document.getElementById('vatFrom').value;var to=document.getElementById('vatTo').value;
+var sales=window._vatSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
+sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
+var rows=[];var total=0;var bal=0;
+sales.forEach(function(s){
+  var vatAmt=0;
+  if(s.vatAmount){vatAmt=s.vatAmount}
+  else{var vv=+(s.vat||0);if(vv){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));vatAmt=s.vatType==='percent'?base*vv/100:vv}}
+  if(vatAmt>0){total+=vatAmt;bal+=vatAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,vatAmt:vatAmt,bal:bal,key:s._key})}
+});
+document.getElementById('vatStats').innerHTML='<div class="stat"><div class="label">Total VAT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">VAT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with VAT</div><div class="value">'+rows.length+'</div></div>';
+document.getElementById('vatBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No VAT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+r.key+'\\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.vatAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'}
+loadVatLedger();
+</script>`}
+
+function aitLedgerPage(){return `
+<div class="page-header"><div><div class="page-title">AIT Ledger</div><div class="page-sub">AIT collected from customers (Liability - Payable to Gov't)</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('aitPrint','AIT Ledger')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('aitTbl','AITLedger')">Export XLS</button></div></div>
+<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="aitFrom" onchange="renderAitLedger()"></div><div><label>To</label><input type="date" id="aitTo" onchange="renderAitLedger()"></div></div>
+<div class="stats" id="aitStats"></div>
+<div id="aitPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="aitTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">AIT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="aitBody"></tbody></table></div></div></div>
+<script>
+async function loadAitLedger(){var s=await loadList('sale:');window._aitSales=s;renderAitLedger()}
+window.renderAitLedger=function(){var from=document.getElementById('aitFrom').value;var to=document.getElementById('aitTo').value;
+var sales=window._aitSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
+sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
+var rows=[];var total=0;var bal=0;
+sales.forEach(function(s){
+  var aitAmt=0;
+  if(s.aitAmount){aitAmt=s.aitAmount}
+  else{var av=+(s.ait||0);if(av){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));aitAmt=s.aitType==='percent'?base*av/100:av}}
+  if(aitAmt>0){total+=aitAmt;bal+=aitAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,aitAmt:aitAmt,bal:bal,key:s._key})}
+});
+document.getElementById('aitStats').innerHTML='<div class="stat"><div class="label">Total AIT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">AIT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with AIT</div><div class="value">'+rows.length+'</div></div>';
+document.getElementById('aitBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No AIT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+r.key+'\\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.aitAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'}
+loadAitLedger();
+</script>`}
 
 function truckFareSettingsPage(){return `
 <div class="page-header"><div><div class="page-title">Truck Fare Settings</div><div class="page-sub">Configure max truck fare per quantity per Thana</div></div><button class="btn btn-outline" onclick="openModal('tfImportModal')"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-primary" onclick="openAddTF()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Thana Fare</button></div>
@@ -476,7 +522,7 @@ loadTF();
 function truckFareReportPage(){return `
 <div class="page-header"><div><div class="page-title">Truck Fare Report</div><div class="page-sub">Thana-wise fare analysis with exceed tracking</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('tfrPrint','Truck Fare Report')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('tfrTbl','TruckFareReport')">Export XLS</button></div></div>
 <div class="card" style="margin-bottom:14px;padding:14px 16px">
-<div class="form-row" style="align-items:end"><div><label>From</label><input type="date" id="tfrFrom" onchange="renderTFR()"></div><div><label>To</label><input type="date" id="tfrTo" onchange="renderTFR()"></div><div><label>Thana</label><select id="tfrThana" onchange="renderTFR()"><option value="">All Thanas</option></select></div><div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:16px"><button class="btn btn-outline btn-xs" onclick="setTFRRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setTFRRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setTFRRange('all')">All Time</button><label style="margin:0;display:inline;font-size:12px"><input type="checkbox" id="tfrOnlyExceed" onchange="renderTFR()"> Only Exceeded</label></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="align-items:end"><div><label>From</label><input type="date" id="tfrFrom" onchange="renderTFR()"></div><div><label>To</label><input type="date" id="tfrTo" onchange="renderTFR()"></div><div><label>Thana</label><select id="tfrThana" onchange="renderTFR()"><option value="">All Thanas</option></select></div><div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:16px"><button class="btn btn-outline btn-xs" onclick="setTFRRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setTFRRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setTFRRange('all')">All Time</button><label style="margin:0;display:inline;font-size:12px"><input type="checkbox" id="tfrOnlyExceed" onchange="renderTFR()"> Only Exceeded</label></div></div></div>
 </div>
 <div class="stats" id="tfrStats"></div>
 <div id="tfrPrint">
@@ -784,8 +830,8 @@ function layout(content: string, active: string, session: any) {
   
   // Role-based access control map
   const roleAccess: Record<string, string[]> = {
-    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog','truckfarereport','truckfaresettings'],
-    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog','truckfarereport','truckfaresettings'],
+    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog','truckfarereport','truckfaresettings','vatledger','aitledger'],
+    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog','truckfarereport','truckfaresettings','vatledger','aitledger'],
     entry: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','daydetails','truckfarereport','reports'],
     viewer: ['dashboard','stockcheck','reports','profitloss','balancesheet','trialbalance','stock','recpay','ledger','expledger','daydetails','truckfarereport'],
   };
@@ -818,6 +864,8 @@ function layout(content: string, active: string, session: any) {
       { path:"/trial-balance", icon:"balance", label:"Trial Balance", id:"trialbalance" },
       { path:"/stock", icon:"warehouse", label:"Stock & Valuation", id:"stock" },
       { path:"/truck-fare-report", icon:"local_shipping", label:"Truck Fare Report", id:"truckfarereport" },
+      { path:"/vat-ledger", icon:"gavel", label:"VAT Ledger", id:"vatledger" },
+      { path:"/ait-ledger", icon:"policy", label:"AIT Ledger", id:"aitledger" },
     ]},
     { group: 'System', items: [
       { path:"/users", icon:"manage_accounts", label:"Users & Access", id:"users" },
@@ -1604,9 +1652,9 @@ window.submitOrd=async function(){
 
 function dashboardPage(){var t=new Date().toISOString().slice(0,10);var ym=t.slice(0,7);return `
 <div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">Business overview</div></div></div>
-<div class="card no-print" style="margin-bottom:14px;padding:14px 16px">
-<div class="form-row" style="align-items:end"><div><label>From</label><input type="date" id="dashFrom" value="${ym}-01"></div><div><label>To</label><input type="date" id="dashTo" value="${t}"></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="renderDash()">Apply</button><button class="btn btn-outline btn-xs" onclick="setDashRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setDashRange('today')">Today</button><button class="btn btn-outline btn-xs" onclick="setDashRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setDashRange('all')">All Time</button></div></div>
-</div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="margin-bottom:14px;padding:14px 16px">
+<div class="form-row" style="align-items:end;gap:8px;flex-wrap:wrap"><div><label>From</label><input type="date" id="dashFrom" value="${ym}-01"></div><div><label>To</label><input type="date" id="dashTo" value="${t}"></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="renderDash()">Apply</button><button class="btn btn-outline btn-xs" onclick="setDashRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setDashRange('today')">Today</button><button class="btn btn-outline btn-xs" onclick="setDashRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setDashRange('all')">All Time</button></div></div>
+</div></div>
 <div class="stats" id="stats"></div>
 <div class="dash-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px"><div class="card"><div class="section-title">Recent Sales</div><div id="recentSales" class="table-wrap"></div></div><div class="card"><div class="section-title">Recent Purchases</div><div id="recentPurchases" class="table-wrap"></div></div></div>
 <div class="dash-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><div class="card"><div class="section-title">Low Stock Alerts</div><div id="lowStockAlerts" class="table-wrap"></div></div><div class="card"><div class="section-title">Pending Orders</div><div id="pendingOrders" class="table-wrap"></div></div></div>
@@ -1649,7 +1697,7 @@ var po=allOrders.filter(function(o){return o.status==='pending'}).slice(0,5);doc
 
 function inventoryPage(){return `
 <div class="page-header"><div><div class="page-title">Inventory</div><div class="page-sub">Products & stock (Group & Brand wise)</div></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline" onclick="openImportProd()"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-outline" onclick="openGroupMgr()"><span class="material-symbols-outlined" style="font-size:16px">folder</span> Manage Groups</button><button class="btn btn-outline" onclick="openBrandMgr()"><span class="material-symbols-outlined" style="font-size:16px">label</span> Manage Brands</button><button class="btn btn-primary" onclick="openAddP()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Product</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search..." oninput="filterP(this.value)" id="pSearch"></div><div><label>Group</label><select id="pGroupFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="pBrandFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Brands</option></select></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search..." oninput="filterP(this.value)" id="pSearch"></div><div><label>Group</label><select id="pGroupFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="pBrandFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Brands</option></select></div></div></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Group</th><th>Brand</th><th>SKU</th><th class="r">Buy</th><th class="r">Sell</th><th class="r">Stock</th><th class="r">Act</th></tr></thead><tbody id="pBody"></tbody></table></div></div>
 <div class="modal-overlay" id="addProduct"><div class="modal"><h3 id="pTitle">Add Product</h3><input type="hidden" id="editPK"><div class="form-group"><label>Name</label><input id="pN" placeholder="Name"></div><div class="form-row"><div><label>Group</label><select id="pG"><option value="">No Group</option></select></div><div><label>Brand</label><select id="pBr"><option value="">No Brand</option></select></div></div><div class="form-row"><div><label>SKU</label><input id="pS" placeholder="Auto"></div><div><label>Unit</label><input id="pU" value="pcs"></div></div><div class="form-row"><div><label>Stock</label><input type="number" id="pSt" placeholder="0"></div><div><label>Purchase Price</label><input type="number" id="pB" placeholder="0"></div></div><div class="form-row"><div><label>Sale Price</label><input type="number" id="pSl" placeholder="0"></div><div></div></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('addProduct')">Cancel</button><button class="btn btn-primary" onclick="saveP()">Save</button></div></div></div>
 <div class="modal-overlay" id="groupMgr"><div class="modal"><h3>Product Groups</h3>
@@ -1702,7 +1750,7 @@ loadP();
 
 function stockCheckPage(){return `
 <div class="page-header"><div><div class="page-title">Stock Check</div><div class="page-sub">Quick stock availability lookup</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('sckPrint','Stock Check')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('sckTbl','StockCheck')">Export XLS</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="sckSearch" placeholder="Search product name..." oninput="filterSck()" style="padding:12px 12px 12px 36px;font-size:15px"></div><div><label>Group</label><select id="sckGroup" onchange="filterSck()"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="sckBrand" onchange="filterSck()"><option value="">All Brands</option></select></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="sckSearch" placeholder="Search product name..." oninput="filterSck()" style="padding:12px 12px 12px 36px;font-size:15px"></div><div><label>Group</label><select id="sckGroup" onchange="filterSck()"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="sckBrand" onchange="filterSck()"><option value="">All Brands</option></select></div></div></div>
 <div id="sckPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="sckTbl"><thead><tr><th>Product Name</th><th>Group</th><th class="r">Available Qty</th></tr></thead><tbody id="sckBody"></tbody></table></div></div></div>
 <script>
 var sckProds=[],sckGroups=[],sckBrands=[];
@@ -1946,7 +1994,7 @@ if(!ek){var stockErrors=[];items.forEach(function(it){var pr=salProds.find(funct
 var cust=customers.find(function(x){return x._key===cid});var spId=document.getElementById('salSP').value;var sp=spList.find(function(x){return x._key===spId});
 var bankName=document.getElementById('salBank').value||'';var chequeNo=document.getElementById('salCheque')?document.getElementById('salCheque').value:'';
 var truckFare=+document.getElementById('salTruckFare').value||0;var custThana=(cust&&cust.thana)||'';var fareExceeded=false;var fareMaxForThana=0;var totalSaleQty=items.reduce(function(s,x){return s+x.qty},0);if(truckFare>0&&custThana){var tfMatch=_thanaFares.find(function(f){return f.thana===custThana});if(tfMatch&&tfMatch.maxFare>0){fareMaxForThana=tfMatch.maxFare;fareExceeded=truckFare>(tfMatch.maxFare*totalSaleQty)}}
-var data={invoiceNo:document.getElementById('salNo').value,date:document.getElementById('salDate').value,customerId:cid,customerName:cust?cust.name:'',salespersonId:spId,salespersonName:sp?sp.name:'',createdBy:window.SESSION?.name||window.SESSION?.username||'Admin',items:items.map(function(x){return{productId:x.pk,productName:x.pn,qty:x.qty,rate:x.rate,amount:x.amt}}),discount:dv,discountType:dt,extra:extra,vat:vv,vatType:vt,ait:av,aitType:at,total:total,paid:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:document.getElementById('salNote').value,truckFare:truckFare,customerThana:custThana,fareExceeded:fareExceeded,fareMaxForThana:fareMaxForThana};
+var data={invoiceNo:document.getElementById('salNo').value,date:document.getElementById('salDate').value,customerId:cid,customerName:cust?cust.name:'',salespersonId:spId,salespersonName:sp?sp.name:'',createdBy:window.SESSION?.name||window.SESSION?.username||'Admin',items:items.map(function(x){return{productId:x.pk,productName:x.pn,qty:x.qty,rate:x.rate,amount:x.amt}}),discount:dv,discountType:dt,extra:extra,vat:vv,vatType:vt,ait:av,aitType:at,vatAmount:vatAmt,aitAmount:aitAmt,total:total,paid:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:document.getElementById('salNote').value,truckFare:truckFare,customerThana:custThana,fareExceeded:fareExceeded,fareMaxForThana:fareMaxForThana};
 if(ek){
   var oldSal=sals.find(function(x){return x._key===ek});
   // Reverse old stock (add back old items)
@@ -2171,7 +2219,7 @@ loadPay();
 function expensesPage(){return `
 <div class="page-header"><div><div class="page-title">Expenses</div><div class="page-sub">Track expenses by head & sub-head</div></div><button class="btn btn-primary" onclick="openExpense()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Expense</button></div>
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px"><button class="btn btn-outline btn-sm" onclick="openHeadModal()">Manage Heads</button><button class="btn btn-outline btn-sm" onclick="openSubHeadModal()">Manage Sub-Heads</button></div>
-<div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px"><div><label>Head</label><select id="expFilterHead" onchange="renderExp()"><option value="">All Heads</option></select></div><div><label>Sub-Head</label><select id="expFilterSub" onchange="renderExp()"><option value="">All Sub-Heads</option></select></div><div><label>Method</label><select id="expFilterMethod" onchange="renderExp()"><option value="">All Methods</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div><label>From</label><input type="date" id="expFrom" onchange="renderExp()"></div><div><label>To</label><input type="date" id="expTo" onchange="renderExp()"></div><div><label>Search</label><input id="expSearch" placeholder="Search..." oninput="renderExp()" style="font-size:12px"></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div><label>Head</label><select id="expFilterHead" onchange="renderExp()"><option value="">All Heads</option></select></div><div><label>Sub-Head</label><select id="expFilterSub" onchange="renderExp()"><option value="">All Sub-Heads</option></select></div><div><label>Method</label><select id="expFilterMethod" onchange="renderExp()"><option value="">All Methods</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div><label>From</label><input type="date" id="expFrom" onchange="renderExp()"></div><div><label>To</label><input type="date" id="expTo" onchange="renderExp()"></div><div><label>Search</label><input id="expSearch" placeholder="Search..." oninput="renderExp()" style="font-size:12px"></div></div></div>
 <div class="stats" id="expStats"></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="expTable"><thead><tr><th>Date</th><th>No</th><th>Head</th><th>Sub-Head</th><th>Method</th><th class="r">Amount</th><th>Description</th><th class="r">Act</th></tr></thead><tbody id="expBody"></tbody></table></div></div>
 <div class="modal-overlay" id="expModal"><div class="modal"><h3>New Expense</h3>
@@ -2402,10 +2450,25 @@ if(excludeTF){
   expenses=expenses.filter(function(e){return !e._isTruckFare});
 }
 
-// Revenue
-var revenue=sales.reduce(function(s,x){
-  return s+(x.total||0)
+// Revenue = Total - VAT - AIT (VAT/AIT are liabilities, not revenue)
+var totalInvoiced=sales.reduce(function(s,x){ return s+(x.total||0) },0);
+var totalVatCollected=sales.reduce(function(s,x){
+  if(x.vatAmount) return s+x.vatAmount;
+  var vv2=+(x.vat||0);if(!vv2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.vatType==='percent'?base2*vv2/100:vv2);
 },0);
+var totalAitCollected=sales.reduce(function(s,x){
+  if(x.aitAmount) return s+x.aitAmount;
+  var av2=+(x.ait||0);if(!av2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.aitType==='percent'?base2*av2/100:av2);
+},0);
+var revenue=totalInvoiced-totalVatCollected-totalAitCollected;
 
 // Truck fare totals
 var truckFareReceived=sales.reduce(function(s,x){return s+(x.truckFare||0)},0);
@@ -2433,10 +2496,12 @@ expenses.forEach(function(e){
 // ================= UI =================
 
 document.getElementById('plStats').innerHTML=
-'<div class="stat"><div class="label">Revenue</div><div class="value text-success">'+fmt(revenue)+'</div></div>'+
+'<div class="stat"><div class="label">Revenue (excl. VAT/AIT)</div><div class="value text-success">'+fmt(revenue)+'</div></div>'+
 '<div class="stat"><div class="label">COGS (FIFO)</div><div class="value text-warning">'+fmt(cogs)+'</div></div>'+
 '<div class="stat"><div class="label">Gross Profit</div><div class="value '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</div></div>'+
 '<div class="stat"><div class="label">Expenses</div><div class="value text-danger">'+fmt(totalExp)+'</div></div>'+
+(totalVatCollected>0?'<div class="stat"><div class="label">VAT Payable</div><div class="value text-info">'+fmt(totalVatCollected)+'</div></div>':'')+
+(totalAitCollected>0?'<div class="stat"><div class="label">AIT Payable</div><div class="value text-info">'+fmt(totalAitCollected)+'</div></div>':'')+
 '<div class="stat" style="border:2px solid '+(netProfit>=0?'var(--accent)':'var(--danger)')+'"><div class="label">Net '+(netProfit>=0?'Profit':'Loss')+'</div><div class="value '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(Math.abs(netProfit))+'</div></div>';
 
 // Net Profit/Loss Badge
@@ -2453,9 +2518,12 @@ var rows='';
 
 // Revenue
 rows+='<tr style="background:var(--accent-light)"><td class="bold" colspan="2">Revenue</td></tr>';
-rows+='<tr><td style="padding-left:24px">Sales Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+rows+='<tr><td style="padding-left:24px">Product Sales + Extra Charges</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+if(totalVatCollected>0){rows+='<tr><td style="padding-left:24px;color:var(--info)">VAT/Tax Collected (Liability)</td><td class="r text-info">'+fmt(totalVatCollected)+'</td></tr>';}
+if(totalAitCollected>0){rows+='<tr><td style="padding-left:24px;color:var(--info)">AIT Collected (Liability)</td><td class="r text-info">'+fmt(totalAitCollected)+'</td></tr>';}
+rows+='<tr><td style="padding-left:24px;color:var(--muted);font-size:11px">Total Invoiced (incl. VAT/AIT)</td><td class="r text-muted" style="font-size:11px">'+fmt(totalInvoiced)+'</td></tr>';
 if(!excludeTF&&truckFareReceived>0){rows+='<tr><td style="padding-left:24px;color:var(--muted)">Truck Fare Received (pass-through)</td><td class="r text-muted">'+fmt(truckFareReceived)+'</td></tr>';}
-rows+='<tr style="background:var(--bg)"><td class="bold">Total Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+rows+='<tr style="background:var(--bg)"><td class="bold">Total Revenue (excl. VAT/AIT)</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
 
 // COGS
 rows+='<tr style="background:var(--warning-light)"><td class="bold" colspan="2">Cost of Goods Sold</td></tr>';
@@ -2471,6 +2539,14 @@ Object.keys(expByHead).sort().forEach(function(h){
 });
 
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Expenses</td><td class="r bold text-danger">'+fmt(totalExp)+'</td></tr>';
+
+// VAT/AIT Payable (Liabilities)
+if(totalVatCollected>0||totalAitCollected>0){
+rows+='<tr style="background:var(--info-light,#ecfeff)"><td class="bold" colspan="2">Tax Liabilities (Payable to Gov\'t)</td></tr>';
+if(totalVatCollected>0){rows+='<tr><td style="padding-left:24px">VAT/Tax Payable</td><td class="r bold text-info">'+fmt(totalVatCollected)+'</td></tr>';}
+if(totalAitCollected>0){rows+='<tr><td style="padding-left:24px">AIT Payable</td><td class="r bold text-info">'+fmt(totalAitCollected)+'</td></tr>';}
+rows+='<tr style="background:var(--bg)"><td class="bold">Total Tax Liabilities</td><td class="r bold text-info">'+fmt(totalVatCollected+totalAitCollected)+'</td></tr>';
+}
 
 // Net
 var netLabel=netProfit>=0?'NET PROFIT':'NET LOSS';
@@ -2504,7 +2580,24 @@ var trfFromCashBS=payments.filter(function(p){return p.type==='transfer'&&p.from
 var cashBal=salePaidCash+nonAutoReceipts-purPaidCash-nonAutoPayouts-cashExpenses+trfToCashBS-trfFromCashBS;
 var totalAssets=inventory+receivables+bankBal+Math.max(0,cashBal);
 var payables=0;parties.filter(function(p){return p.type==='supplier'}).forEach(function(s){var sob=s.openingBalance||0;var sp=purchases.filter(function(p){return p.supplierId===s._key});var py=payments.filter(function(p){return p.party===s.name&&p.type==='payment'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=sp.reduce(function(a,x){return a+(x.total||0)},0)+(sob>0?sob:0);var tp=sp.reduce(function(a,x){return a+(x.paid||0)},0)+py.reduce(function(a,x){return a+(x.amount||0)},0)+(sob<0?Math.abs(sob):0);payables+=Math.max(0,td-tp)});
-var totalLiabilities=payables;
+// Calculate VAT/AIT Payable from all sales
+var vatPayable=sales.reduce(function(s,x){
+  if(x.vatAmount) return s+x.vatAmount;
+  var vv2=+(x.vat||0);if(!vv2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.vatType==='percent'?base2*vv2/100:vv2);
+},0);
+var aitPayable=sales.reduce(function(s,x){
+  if(x.aitAmount) return s+x.aitAmount;
+  var av2=+(x.ait||0);if(!av2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.aitType==='percent'?base2*av2/100:av2);
+},0);
+var totalLiabilities=payables+vatPayable+aitPayable;
 var equity=totalAssets-totalLiabilities;
 var rows='<tr style="background:var(--accent-light)"><td class="bold" colspan="2">ASSETS</td></tr>';
 rows+='<tr><td style="padding-left:24px">Inventory (at cost)</td><td class="r">'+fmt(inventory)+'</td></tr>';
@@ -2514,6 +2607,8 @@ rows+='<tr><td style="padding-left:24px">Cash in Hand</td><td class="r">'+fmt(Ma
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Assets</td><td class="r bold">'+fmt(totalAssets)+'</td></tr>';
 rows+='<tr style="background:var(--danger-light)"><td class="bold" colspan="2">LIABILITIES</td></tr>';
 rows+='<tr><td style="padding-left:24px">Accounts Payable</td><td class="r">'+fmt(payables)+'</td></tr>';
+if(vatPayable>0){rows+='<tr><td style="padding-left:24px">VAT/Tax Payable</td><td class="r">'+fmt(vatPayable)+'</td></tr>';}
+if(aitPayable>0){rows+='<tr><td style="padding-left:24px">AIT Payable</td><td class="r">'+fmt(aitPayable)+'</td></tr>';}
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Liabilities</td><td class="r bold">'+fmt(totalLiabilities)+'</td></tr>';
 rows+='<tr style="background:var(--primary-light)"><td class="bold" colspan="2">EQUITY</td></tr>';
 rows+='<tr><td style="padding-left:24px">Owner Equity</td><td class="r">'+fmt(equity)+'</td></tr>';
@@ -2649,7 +2744,23 @@ async function loadTB(){
   // --- 9. PROFIT/LOSS (Periodic method) ---
   // COGS = Purchases - Closing Inventory (periodic)
   var cogs = Math.max(0, totalPurchases - closingInventory);
-  var grossProfit = totalSalesRevenue - cogs;
+  // Revenue for profit calc excludes VAT/AIT (calculated later, using pre-calc here)
+  var _tbVatP=sales.reduce(function(s,x){
+    if(x.vatAmount)return s+n(x.vatAmount);
+    var vv2=n(x.vat);if(!vv2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);return s+(x.vatType==='percent'?base2*vv2/100:vv2);
+  },0);
+  var _tbAitP=sales.reduce(function(s,x){
+    if(x.aitAmount)return s+n(x.aitAmount);
+    var av2=n(x.ait);if(!av2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);return s+(x.aitType==='percent'?base2*av2/100:av2);
+  },0);
+  var revenueExVat = totalSalesRevenue - _tbVatP - _tbAitP;
+  var grossProfit = revenueExVat - cogs;
   var netProfit = grossProfit - totalExpenses;
 
   // ================================================================
@@ -2689,10 +2800,34 @@ async function loadTB(){
   if (custAdvances > 0) {
     accounts.push({name:'Customer Advances (Unearned)', cat:'Liability', debit:0, credit:custAdvances});
   }
+  // VAT/AIT Payable (collected from customers, owed to Gov't)
+  var tbVatPayable=sales.reduce(function(s,x){
+    if(x.vatAmount) return s+n(x.vatAmount);
+    var vv2=n(x.vat);if(!vv2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);
+    return s+(x.vatType==='percent'?base2*vv2/100:vv2);
+  },0);
+  var tbAitPayable=sales.reduce(function(s,x){
+    if(x.aitAmount) return s+n(x.aitAmount);
+    var av2=n(x.ait);if(!av2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);
+    return s+(x.aitType==='percent'?base2*av2/100:av2);
+  },0);
+  if (tbVatPayable > 0) {
+    accounts.push({name:'VAT/Tax Payable', cat:'Liability', debit:0, credit:tbVatPayable});
+  }
+  if (tbAitPayable > 0) {
+    accounts.push({name:'AIT Payable', cat:'Liability', debit:0, credit:tbAitPayable});
+  }
 
-  // --- INCOME (Credit) ---
-  if (totalSalesRevenue > 0) {
-    accounts.push({name:'Sales Revenue', cat:'Income', debit:0, credit:totalSalesRevenue});
+  // --- INCOME (Credit) - Revenue excludes VAT/AIT ---
+  var salesRevenueExVat = totalSalesRevenue - tbVatPayable - tbAitPayable;
+  if (salesRevenueExVat > 0) {
+    accounts.push({name:'Sales Revenue (excl. VAT/AIT)', cat:'Income', debit:0, credit:salesRevenueExVat});
   }
   // Closing inventory is also a credit adjustment in periodic method
   // (reduces COGS: Dr Closing Inventory, Cr Trading A/c)
@@ -2814,7 +2949,7 @@ loadTB();
 function stockPage(){return `
 <div class="page-header"><div><div class="page-title">Stock & Valuation</div><div class="page-sub">Stock levels, value & alerts</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('stPrint','Stock')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('stTbl','Stock')">Export XLS</button></div></div>
 <div class="tabs"><button class="tab active" onclick="switchStTab('all',this)">All Stock</button><button class="tab" onclick="switchStTab('available',this)">Available</button><button class="tab" onclick="switchStTab('low',this)">Low Stock</button><button class="tab" onclick="switchStTab('out',this)">Out of Stock</button></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>Group</label><select id="stGroupFilter" onchange="renderSt()"><option value="">All Groups</option></select></div><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="stSearch" placeholder="Search product..." oninput="renderSt()"></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div><label>Group</label><select id="stGroupFilter" onchange="renderSt()"><option value="">All Groups</option></select></div><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="stSearch" placeholder="Search product..." oninput="renderSt()"></div></div></div>
 <div class="stats" id="stStats"></div>
 <div id="stPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="stTbl"><thead><tr><th>Product</th><th>Group</th><th>SKU</th><th class="r">Stock</th><th class="r">Buy Price</th><th class="r">Sell Price</th><th class="r">Cost Value</th><th class="r">Sale Value</th><th>Status</th></tr></thead><tbody id="stBody"></tbody></table></div></div></div>
 <script>
@@ -2832,7 +2967,7 @@ loadSt();
 function receivablePayablePage(){return `
 <div class="page-header"><div><div class="page-title">Receivable / Payable</div><div class="page-sub">Outstanding balances with DSO & filters</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('rpPrint','Receivable-Payable')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rpTbl','RecPayable')">Export XLS</button></div></div>
 <div class="tabs"><button class="tab active" onclick="switchRP('receivable',this)">Receivables</button><button class="tab" onclick="switchRP('payable',this)">Payables</button></div>
-<div class="card" style="margin-bottom:14px;padding:14px 16px">
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card" style="margin-bottom:14px;padding:14px 16px">
 <div class="rp-filter-grid" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;align-items:end"><style>@media(max-width:768px){.rp-filter-grid{grid-template-columns:1fr 1fr !important}}</style>
 <div><label>Search Party</label><input id="rpSearch" placeholder="Search name/phone..." oninput="renderRP()"></div>
 <div><label>Salesperson</label><select id="rpSP" onchange="renderRP()"><option value="">All Salespersons</option></select></div>
@@ -2848,7 +2983,7 @@ function receivablePayablePage(){return `
 <button class="btn btn-outline btn-xs" onclick="setRPDateRange('all')">All Time</button>
 <div><label style="margin:0;display:inline"><input type="checkbox" id="rpOnlyOutstanding" onchange="renderRP()" checked> Only Outstanding</label></div>
 </div>
-</div>
+</div></div>
 <div class="stats" id="rpStats"></div>
 <div id="rpPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rpTbl"><thead><tr><th>Party</th><th>Phone</th><th>Salesperson</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Outstanding</th><th class="r">Credit Limit</th><th class="r">DSO</th></tr></thead><tbody id="rpBody"></tbody></table></div></div></div>
 <script>
@@ -2900,8 +3035,8 @@ async function loadDay(){var d=await Promise.all([loadList('sale:'),loadList('pu
 window.changeDay=function(dir){var d=new Date(document.getElementById('dayDate').value);d.setDate(d.getDate()+dir);document.getElementById('dayDate').value=d.toISOString().slice(0,10);renderDay()}
 window.renderDay=function(){var dt=document.getElementById('dayDate').value;var ds=daySales.filter(function(s){return s.date===dt});var dp=dayPurchases.filter(function(p){return p.date===dt});var dr=dayPayments.filter(function(p){return p.date===dt&&p.status==='done'});var de=dayExpenses.filter(function(e){return e.date===dt});
 var totalSales=ds.reduce(function(s,x){return s+(x.total||0)},0);var totalPurchases=dp.reduce(function(s,x){return s+(x.total||0)},0);var totalReceipts=dr.filter(function(r){return r.type==='receipt'}).reduce(function(s,x){return s+(x.amount||0)},0);var totalPayments=dr.filter(function(r){return r.type==='payment'}).reduce(function(s,x){return s+(x.amount||0)},0);var totalExpenses=de.reduce(function(s,x){return s+(x.amount||0)},0);
-var dayCashIn=ds.filter(function(s){return s.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);
-var dayCashOut=dp.filter(function(p){return p.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method==='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayCashIn=ds.filter(function(s){var m=s.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayCashOut=dp.filter(function(p){var m=p.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method==='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 // Include transfers impact on cash
 var dayTrfToCash=dr.filter(function(r){return r.type==='transfer'&&r.toAcc==='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 var dayTrfFromCash=dr.filter(function(r){return r.type==='transfer'&&r.fromAcc==='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
@@ -2912,17 +3047,17 @@ var allSalesUpTo=daySales.filter(function(s){return s.date<=dt});
 var allPurUpTo=dayPurchases.filter(function(p){return p.date<=dt});
 var allPayUpTo=dayPayments.filter(function(p){return p.date<=dt&&p.status==='done'});
 var allExpUpTo=dayExpenses.filter(function(e){return e.date<=dt});
-var cihSalesCash=allSalesUpTo.filter(function(s){return s.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
+var cihSalesCash=allSalesUpTo.filter(function(s){var m=s.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
 var cihRecCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
-var cihPurCash=allPurUpTo.filter(function(p){return p.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
+var cihPurCash=allPurUpTo.filter(function(p){var m=p.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
 var cihPayCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='payment'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cihExpCash=allExpUpTo.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 var cihTrfTo=allPayUpTo.filter(function(p){return p.type==='transfer'&&p.toAcc==='Cash'}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cihTrfFrom=allPayUpTo.filter(function(p){return p.type==='transfer'&&p.fromAcc==='Cash'}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cashInHand=cihSalesCash+cihRecCash-cihPurCash-cihPayCash-cihExpCash+cihTrfTo-cihTrfFrom;
 
-var dayBankIn=ds.filter(function(s){return s.method!=='cash'&&s.method!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);
-var dayBankOut=dp.filter(function(p){return p.method!=='cash'&&p.method!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method!=='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayBankIn=ds.filter(function(s){var m=s.method||'cash';return m!=='cash'&&m!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayBankOut=dp.filter(function(p){var m=p.method||'cash';return m!=='cash'&&m!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method!=='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 document.getElementById('dayStats').innerHTML='<div class="stat"><div class="label">Sales</div><div class="value text-success">'+fmt(totalSales)+'</div></div><div class="stat"><div class="label">Purchases</div><div class="value text-primary">'+fmt(totalPurchases)+'</div></div><div class="stat"><div class="label">Receipts</div><div class="value text-info">'+fmt(totalReceipts)+'</div></div><div class="stat"><div class="label">Payments Out</div><div class="value text-warning">'+fmt(totalPayments)+'</div></div><div class="stat"><div class="label">Expenses</div><div class="value text-danger">'+fmt(totalExpenses)+'</div></div><div class="stat"><div class="label">Cash In</div><div class="value text-success">'+fmt(dayCashIn)+'</div></div><div class="stat"><div class="label">Cash Out</div><div class="value text-danger">'+fmt(dayCashOut)+'</div></div><div class="stat" style="border:2px solid var(--primary)"><div class="label">Cash in Hand</div><div class="value '+(cashInHand>=0?'text-success':'text-danger')+'">'+fmt(cashInHand)+'</div></div><div class="stat"><div class="label">Bank In</div><div class="value text-success">'+fmt(dayBankIn)+'</div></div><div class="stat"><div class="label">Bank Out</div><div class="value text-danger">'+fmt(dayBankOut)+'</div></div>';
 // Separate Cash, Bank & Transfer transactions
 var cashRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)});
@@ -2930,11 +3065,11 @@ var cashPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method==='cash
 var bankRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)});
 var bankPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)});
 var transferTxn=dr.filter(function(r){return r.type==='transfer'});
-var cashSales=ds.filter(function(s){return s.method==='cash'});
-var bankSales=ds.filter(function(s){return s.method!=='cash'&&s.method!=='credit'});
+var cashSales=ds.filter(function(s){var m=s.method||'cash';return m==='cash'});
+var bankSales=ds.filter(function(s){var m=s.method||'cash';return m!=='cash'&&m!=='credit'});
 var creditSales=ds.filter(function(s){return s.method==='credit'});
-var cashPurchases=dp.filter(function(p){return p.method==='cash'});
-var bankPurchases=dp.filter(function(p){return p.method!=='cash'&&p.method!=='credit'});
+var cashPurchases=dp.filter(function(p){var m=p.method||'cash';return m==='cash'});
+var bankPurchases=dp.filter(function(p){var m=p.method||'cash';return m!=='cash'&&m!=='credit'});
 var cashExpenses=de.filter(function(e){return e.method==='cash'});
 var bankExpenses=de.filter(function(e){return e.method!=='cash'});
 
@@ -3158,7 +3293,7 @@ loadSP();
 function ordersPage(){return `
 <div class="page-header"><div><div class="page-title">Orders</div><div class="page-sub">SP portal orders - approve, deny, convert</div></div></div>
 <div class="tabs"><button class="tab active" onclick="switchOrdTab('pending',this)">Pending</button><button class="tab" onclick="switchOrdTab('approved',this)">Approved</button><button class="tab" onclick="switchOrdTab('denied',this)">Denied</button><button class="tab" onclick="switchOrdTab('converted',this)">Converted</button><button class="tab" onclick="switchOrdTab('all',this)">All</button></div>
-<div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div><label>Group</label><select id="ordGroupF" onchange="renderOrd()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="ordBrandF" onchange="renderOrd()" style="font-size:12px"><option value="">All Brands</option></select></div><div><label>Product</label><select id="ordProdF" onchange="renderOrd()" style="font-size:12px"><option value="">All Products</option></select></div><div><label>Salesperson</label><select id="ordSPF" onchange="renderOrd()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>Customer</label><select id="ordCustF" onchange="renderOrd()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>Search</label><input id="ordSearch" placeholder="Search..." oninput="renderOrd()" style="font-size:12px"></div></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px;flex-wrap:wrap"><div><label>Group</label><select id="ordGroupF" onchange="renderOrd()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="ordBrandF" onchange="renderOrd()" style="font-size:12px"><option value="">All Brands</option></select></div><div><label>Product</label><select id="ordProdF" onchange="renderOrd()" style="font-size:12px"><option value="">All Products</option></select></div><div><label>Salesperson</label><select id="ordSPF" onchange="renderOrd()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>Customer</label><select id="ordCustF" onchange="renderOrd()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>Search</label><input id="ordSearch" placeholder="Search..." oninput="renderOrd()" style="font-size:12px"></div></div></div></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th>SP</th><th>Product Name</th><th class="r">Quantity</th><th class="r">Total</th><th>Status</th><th class="r">Act</th></tr></thead><tbody id="ordBody"></tbody></table></div></div>
 <div class="modal-overlay" id="ordDetailModal"><div class="modal" style="max-width:650px">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0" id="ordDetailTitle">Order Details</h3><div style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('ordDetailPrint','Order Details')">Print</button><button class="btn btn-outline btn-sm" onclick="closeModal('ordDetailModal')">Close</button></div></div>
@@ -3278,7 +3413,7 @@ window.purgeData=async function(){var prefix=document.getElementById('purgeType'
 
 function modLogPage(){return `
 <div class="page-header"><div><div class="page-title">Modification Log</div><div class="page-sub">All edit, delete & create operations</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('mlPrint','Modification Log')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('mlTbl','ModLog')">Export XLS</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>Action</label><select id="mlAction" onchange="renderML()"><option value="">All Actions</option><option value="create">Create</option><option value="edit">Edit</option><option value="delete">Delete</option></select></div><div><label>Search</label><input id="mlSearch" placeholder="Search detail..." oninput="renderML()"></div><div><label>From</label><input type="date" id="mlFrom" onchange="renderML()"></div><div><label>To</label><input type="date" id="mlTo" onchange="renderML()"></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div><label>Action</label><select id="mlAction" onchange="renderML()"><option value="">All Actions</option><option value="create">Create</option><option value="edit">Edit</option><option value="delete">Delete</option></select></div><div><label>Search</label><input id="mlSearch" placeholder="Search detail..." oninput="renderML()"></div><div><label>From</label><input type="date" id="mlFrom" onchange="renderML()"></div><div><label>To</label><input type="date" id="mlTo" onchange="renderML()"></div></div></div>
 <div id="mlPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="mlTbl"><thead><tr><th>Timestamp</th><th>User</th><th>Action</th><th>Detail</th><th>Key</th></tr></thead><tbody id="mlBody"></tbody></table></div></div></div>
 <script>
 var mlLogs=[];
