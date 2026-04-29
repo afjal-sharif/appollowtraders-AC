@@ -421,8 +421,7 @@ app.get('/admin', (c) => htmlRes(layout(adminPage(), "admin", getSession(c))));
 app.get('/mod-log', (c) => htmlRes(layout(modLogPage(), "modlog", getSession(c))));
 app.get('/approvals', (c) => htmlRes(layout(approvalsPage(), "approvals", getSession(c))));
 app.get('/company-settings', (c) => htmlRes(layout(companySettingsPage(), "companysettings", getSession(c))));
-app.get('/vat-ledger', (c) => htmlRes(layout(vatLedgerPage(), "vatledger", getSession(c))));
-app.get('/ait-ledger', (c) => htmlRes(layout(aitLedgerPage(), "aitledger", getSession(c))));
+// VAT/AIT Ledger integrated into Receivable/Payable page
 app.get('/truck-fare-report', (c) => htmlRes(layout(truckFareReportPage(), "truckfarereport", getSession(c))));
 app.get('/truck-fare-settings', (c) => htmlRes(layout(truckFareSettingsPage(), "truckfaresettings", getSession(c))));
 app.get('/sp-portal', (c) => htmlRes(spPortalPage(c)));
@@ -431,49 +430,11 @@ app.get('/login', async (c) => {
   return htmlRes(loginPage("", users.length > 0));
 });
 
-function vatLedgerPage(){return `
-<div class="page-header"><div><div class="page-title">VAT/Tax Ledger</div><div class="page-sub">VAT collected from customers (Liability - Payable to Gov't)</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('vatPrint','VAT Ledger')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('vatTbl','VATLedger')">Export XLS</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="vatFrom" onchange="renderVatLedger()"></div><div><label>To</label><input type="date" id="vatTo" onchange="renderVatLedger()"></div></div>
-<div class="stats" id="vatStats"></div>
-<div id="vatPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="vatTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">VAT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="vatBody"></tbody></table></div></div></div>
-<script>
-async function loadVatLedger(){var s=await loadList('sale:');window._vatSales=s;renderVatLedger()}
-window.renderVatLedger=function(){var from=document.getElementById('vatFrom').value;var to=document.getElementById('vatTo').value;
-var sales=window._vatSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
-sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
-var rows=[];var total=0;var bal=0;
-sales.forEach(function(s){
-  var vatAmt=0;
-  if(s.vatAmount){vatAmt=s.vatAmount}
-  else{var vv=+(s.vat||0);if(vv){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));vatAmt=s.vatType==='percent'?base*vv/100:vv}}
-  if(vatAmt>0){total+=vatAmt;bal+=vatAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,vatAmt:vatAmt,bal:bal,key:s._key})}
-});
-document.getElementById('vatStats').innerHTML='<div class="stat"><div class="label">Total VAT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">VAT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with VAT</div><div class="value">'+rows.length+'</div></div>';
-document.getElementById('vatBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No VAT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+r.key+'\\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.vatAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'}
-loadVatLedger();
-</script>`}
+// vatLedgerPage removed - integrated into receivablePayablePage
 
-function aitLedgerPage(){return `
-<div class="page-header"><div><div class="page-title">AIT Ledger</div><div class="page-sub">AIT collected from customers (Liability - Payable to Gov't)</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('aitPrint','AIT Ledger')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('aitTbl','AITLedger')">Export XLS</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="aitFrom" onchange="renderAitLedger()"></div><div><label>To</label><input type="date" id="aitTo" onchange="renderAitLedger()"></div></div>
-<div class="stats" id="aitStats"></div>
-<div id="aitPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="aitTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">AIT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="aitBody"></tbody></table></div></div></div>
-<script>
-async function loadAitLedger(){var s=await loadList('sale:');window._aitSales=s;renderAitLedger()}
-window.renderAitLedger=function(){var from=document.getElementById('aitFrom').value;var to=document.getElementById('aitTo').value;
-var sales=window._aitSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
-sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
-var rows=[];var total=0;var bal=0;
-sales.forEach(function(s){
-  var aitAmt=0;
-  if(s.aitAmount){aitAmt=s.aitAmount}
-  else{var av=+(s.ait||0);if(av){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));aitAmt=s.aitType==='percent'?base*av/100:av}}
-  if(aitAmt>0){total+=aitAmt;bal+=aitAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,aitAmt:aitAmt,bal:bal,key:s._key})}
-});
-document.getElementById('aitStats').innerHTML='<div class="stat"><div class="label">Total AIT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">AIT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with AIT</div><div class="value">'+rows.length+'</div></div>';
-document.getElementById('aitBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No AIT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+r.key+'\\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.aitAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'}
-loadAitLedger();
-</script>`}
+
+// aitLedgerPage removed - integrated into receivablePayablePage
+
 
 function truckFareSettingsPage(){return `
 <div class="page-header"><div><div class="page-title">Truck Fare Settings</div><div class="page-sub">Configure max truck fare per quantity per Thana</div></div><button class="btn btn-outline" onclick="openModal('tfImportModal')"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-primary" onclick="openAddTF()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Thana Fare</button></div>
@@ -830,8 +791,8 @@ function layout(content: string, active: string, session: any) {
   
   // Role-based access control map
   const roleAccess: Record<string, string[]> = {
-    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog','truckfarereport','truckfaresettings','vatledger','aitledger'],
-    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog','truckfarereport','truckfaresettings','vatledger','aitledger'],
+    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog','truckfarereport','truckfaresettings'],
+    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog','truckfarereport','truckfaresettings'],
     entry: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','daydetails','truckfarereport','reports'],
     viewer: ['dashboard','stockcheck','reports','profitloss','balancesheet','trialbalance','stock','recpay','ledger','expledger','daydetails','truckfarereport'],
   };
@@ -864,8 +825,7 @@ function layout(content: string, active: string, session: any) {
       { path:"/trial-balance", icon:"balance", label:"Trial Balance", id:"trialbalance" },
       { path:"/stock", icon:"warehouse", label:"Stock & Valuation", id:"stock" },
       { path:"/truck-fare-report", icon:"local_shipping", label:"Truck Fare Report", id:"truckfarereport" },
-      { path:"/vat-ledger", icon:"gavel", label:"VAT Ledger", id:"vatledger" },
-      { path:"/ait-ledger", icon:"policy", label:"AIT Ledger", id:"aitledger" },
+
     ]},
     { group: 'System', items: [
       { path:"/users", icon:"manage_accounts", label:"Users & Access", id:"users" },
@@ -2542,7 +2502,7 @@ rows+='<tr style="background:var(--bg)"><td class="bold">Total Expenses</td><td 
 
 // VAT/AIT Payable (Liabilities)
 if(totalVatCollected>0||totalAitCollected>0){
-rows+='<tr style="background:var(--info-light,#ecfeff)"><td class="bold" colspan="2">Tax Liabilities (Payable to Gov\'t)</td></tr>';
+rows+='<tr style="background:var(--info-light,#ecfeff)"><td class="bold" colspan="2">Tax Liabilities (Payable to Government)</td></tr>';
 if(totalVatCollected>0){rows+='<tr><td style="padding-left:24px">VAT/Tax Payable</td><td class="r bold text-info">'+fmt(totalVatCollected)+'</td></tr>';}
 if(totalAitCollected>0){rows+='<tr><td style="padding-left:24px">AIT Payable</td><td class="r bold text-info">'+fmt(totalAitCollected)+'</td></tr>';}
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Tax Liabilities</td><td class="r bold text-info">'+fmt(totalVatCollected+totalAitCollected)+'</td></tr>';
@@ -2800,7 +2760,7 @@ async function loadTB(){
   if (custAdvances > 0) {
     accounts.push({name:'Customer Advances (Unearned)', cat:'Liability', debit:0, credit:custAdvances});
   }
-  // VAT/AIT Payable (collected from customers, owed to Gov't)
+  // VAT/AIT Payable (collected from customers, owed to Government)
   var tbVatPayable=sales.reduce(function(s,x){
     if(x.vatAmount) return s+n(x.vatAmount);
     var vv2=n(x.vat);if(!vv2)return s;
@@ -2965,8 +2925,8 @@ loadSt();
 </script>`}
 
 function receivablePayablePage(){return `
-<div class="page-header"><div><div class="page-title">Receivable / Payable</div><div class="page-sub">Outstanding balances with DSO & filters</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('rpPrint','Receivable-Payable')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rpTbl','RecPayable')">Export XLS</button></div></div>
-<div class="tabs"><button class="tab active" onclick="switchRP('receivable',this)">Receivables</button><button class="tab" onclick="switchRP('payable',this)">Payables</button></div>
+<div class="page-header"><div><div class="page-title">Receivable / Payable</div><div class="page-sub">Outstanding balances, VAT/AIT Ledgers & DSO</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('rpPrint','Receivable-Payable')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rpTbl','RecPayable')">Export XLS</button></div></div>
+<div class="tabs"><button class="tab active" onclick="switchRP('receivable',this)">Receivables</button><button class="tab" onclick="switchRP('payable',this)">Payables</button><button class="tab" onclick="switchRP('vatledger',this)">VAT Ledger</button><button class="tab" onclick="switchRP('aitledger',this)">AIT Ledger</button></div>
 <div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card" style="margin-bottom:14px;padding:14px 16px">
 <div class="rp-filter-grid" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;align-items:end"><style>@media(max-width:768px){.rp-filter-grid{grid-template-columns:1fr 1fr !important}}</style>
 <div><label>Search Party</label><input id="rpSearch" placeholder="Search name/phone..." oninput="renderRP()"></div>
@@ -2985,13 +2945,31 @@ function receivablePayablePage(){return `
 </div>
 </div></div>
 <div class="stats" id="rpStats"></div>
+<div id="rpMainSection">
 <div id="rpPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rpTbl"><thead><tr><th>Party</th><th>Phone</th><th>Salesperson</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Outstanding</th><th class="r">Credit Limit</th><th class="r">DSO</th></tr></thead><tbody id="rpBody"></tbody></table></div></div></div>
+</div>
+<div id="rpVatSection" style="display:none">
+<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="rpVatFrom" onchange="renderVatInRP()"></div><div><label>To</label><input type="date" id="rpVatTo" onchange="renderVatInRP()"></div></div>
+<div class="stats" id="rpVatStats"></div>
+<div id="rpVatPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rpVatTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">VAT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="rpVatBody"></tbody></table></div></div></div>
+</div>
+<div id="rpAitSection" style="display:none">
+<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="rpAitFrom" onchange="renderAitInRP()"></div><div><label>To</label><input type="date" id="rpAitTo" onchange="renderAitInRP()"></div></div>
+<div class="stats" id="rpAitStats"></div>
+<div id="rpAitPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rpAitTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">AIT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="rpAitBody"></tbody></table></div></div></div>
+</div>
 <script>
 var rpParties=[],rpSales=[],rpPurchases=[],rpPayments=[],rpTab='receivable',rpSPList=[];
 async function loadRP(){var d=await Promise.all([loadList('party:'),loadList('sale:'),loadList('purchase:'),loadList('payment:'),loadList('salesperson:')]);rpParties=d[0];rpSales=d[1];rpPurchases=d[2];rpPayments=d[3];rpSPList=d[4]||[];
 document.getElementById('rpSP').innerHTML='<option value="">All Salespersons</option>'+rpSPList.map(function(s){return'<option value="'+s.name+'">'+s.name+'</option>'}).join('');
 renderRP()}
-window.switchRP=function(t,el){rpTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderRP()}
+window.switchRP=function(t,el){rpTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');
+var mainSec=document.getElementById('rpMainSection');var filterArea=mainSec.previousElementSibling;var filterToggle=filterArea?filterArea.previousElementSibling:null;
+var vatSec=document.getElementById('rpVatSection');var aitSec=document.getElementById('rpAitSection');var rpStats=document.getElementById('rpStats');
+if(t==='vatledger'){mainSec.style.display='none';vatSec.style.display='';aitSec.style.display='none';if(rpStats)rpStats.style.display='none';document.querySelector('.filter-toggle').style.display='none';document.querySelector('.filter-body').style.display='none';renderVatInRP();return}
+if(t==='aitledger'){mainSec.style.display='none';vatSec.style.display='none';aitSec.style.display='';if(rpStats)rpStats.style.display='none';document.querySelector('.filter-toggle').style.display='none';document.querySelector('.filter-body').style.display='none';renderAitInRP();return}
+mainSec.style.display='';vatSec.style.display='none';aitSec.style.display='none';if(rpStats)rpStats.style.display='';document.querySelector('.filter-toggle').style.display='';document.querySelector('.filter-body').style.display='';
+renderRP()}
 window.setRPDateRange=function(range){var today=new Date();var from='',to=todayISO();
 if(range==='today'){from=to}
 else if(range==='week'){var d=new Date(today);d.setDate(d.getDate()-d.getDay());from=d.toISOString().slice(0,10)}
@@ -3020,6 +2998,32 @@ if((total>0||ob!==0)&&(!onlyOut||out>0)){rows.push({name:p.name,phone:p.phone||'
 rows.sort(function(a,b){return b.out-a.out});
 document.getElementById('rpStats').innerHTML='<div class="stat"><div class="label">Total '+(isRec?'Receivable':'Payable')+'</div><div class="value '+(isRec?'text-info':'text-danger')+'">'+fmt(grandOut)+'</div></div><div class="stat"><div class="label">Parties</div><div class="value">'+rows.length+'</div></div><div class="stat"><div class="label">Total Billed</div><div class="value">'+fmt(grandTotal)+'</div></div><div class="stat"><div class="label">Total Collected</div><div class="value text-success">'+fmt(grandPaid)+'</div></div>';
 document.getElementById('rpBody').innerHTML=!rows.length?'<tr><td colspan="8" class="empty">No outstanding</td></tr>':rows.map(function(r){return'<tr><td class="bold">'+r.name+'</td><td class="text-muted">'+r.phone+'</td><td>'+(r.sp!=='-'?'<span class="badge badge-info">'+r.sp+'</span>':'-')+'</td><td class="r">'+fmt(r.total)+'</td><td class="r text-success">'+fmt(r.paid)+'</td><td class="r bold '+(r.out>0?'text-danger':'')+'">'+fmt(r.out)+'</td><td class="r">'+(r.cl?fmt(r.cl):'--')+'</td><td class="r text-muted">'+r.dso+' days</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="3">TOTAL</td><td class="r">'+fmt(grandTotal)+'</td><td class="r">'+fmt(grandPaid)+'</td><td class="r">'+fmt(grandOut)+'</td><td></td><td></td></tr>'}
+// === VAT LEDGER IN R/P ===
+window.renderVatInRP=function(){var from=document.getElementById('rpVatFrom').value;var to=document.getElementById('rpVatTo').value;
+var sales=rpSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
+sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
+var rows=[];var total=0;var bal=0;
+sales.forEach(function(s){
+  var vatAmt=0;
+  if(s.vatAmount){vatAmt=s.vatAmount}
+  else{var vv=+(s.vat||0);if(vv){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));vatAmt=s.vatType==='percent'?base*vv/100:vv}}
+  if(vatAmt>0){total+=vatAmt;bal+=vatAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,vatAmt:vatAmt,bal:bal,key:s._key})}
+});
+document.getElementById('rpVatStats').innerHTML='<div class="stat"><div class="label">Total VAT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">VAT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with VAT</div><div class="value">'+rows.length+'</div></div>';
+document.getElementById('rpVatBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No VAT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\x27sale\x27,\x27'+r.key+'\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.vatAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'};
+// === AIT LEDGER IN R/P ===
+window.renderAitInRP=function(){var from=document.getElementById('rpAitFrom').value;var to=document.getElementById('rpAitTo').value;
+var sales=rpSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
+sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
+var rows=[];var total=0;var bal=0;
+sales.forEach(function(s){
+  var aitAmt=0;
+  if(s.aitAmount){aitAmt=s.aitAmount}
+  else{var av=+(s.ait||0);if(av){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));aitAmt=s.aitType==='percent'?base*av/100:av}}
+  if(aitAmt>0){total+=aitAmt;bal+=aitAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,aitAmt:aitAmt,bal:bal,key:s._key})}
+});
+document.getElementById('rpAitStats').innerHTML='<div class="stat"><div class="label">Total AIT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">AIT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with AIT</div><div class="value">'+rows.length+'</div></div>';
+document.getElementById('rpAitBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No AIT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\x27sale\x27,\x27'+r.key+'\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.aitAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'};
 loadRP();
 </script>`}
 
