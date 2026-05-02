@@ -7,14 +7,14 @@
   "kv_namespaces": [
     {
       "binding": "DATA_STORE",
-      "id": "placeholder-production-id"
+      "id": "2e525dc3791f4e85b29214ed09b7324b"
     }
   ],
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "bizmanager-db",
-      "database_id": "placeholder-d1-database-id",
+      "database_name": "db",
+      "database_id": "fc390cde-7064-4358-9f49-3ad98f612db5",
       "migrations_dir": "d1"
     }
   ]
