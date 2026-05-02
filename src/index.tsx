@@ -1,12 +1,14 @@
 import { Hono } from 'hono'
+import { dbList, dbGet, dbSave, dbDelete, dbWriteLog, dbCreateApproval, dbProcessApproval, dbExportAll, dbImportAll, dbListKeys, PREFIX_TABLE_MAP } from './db'
+import { cachedDbList, cacheInvalidate, cacheInvalidateAll, getRelatedPrefixes, kvGetLicense, kvSetLicense, kvGetPin, kvSetPin, kvGetCompanySettings, kvSetCompanySettings } from './kv-cache'
 
 // ============================================================
 // BizManager v3.0 — Apollow Traders — Cloudflare Worker + Hono
 // Complete Business Accounting System
-// KV Namespace binding: DATA_STORE
+// D1 Database (primary) + KV (config & cache only)
 // ============================================================
 
-type Bindings = { DATA_STORE: KVNamespace }
+type Bindings = { DATA_STORE: KVNamespace; DB: D1Database }
 const app = new Hono<{ Bindings: Bindings }>()
 
 let CURRENT_PIN = "1234";
@@ -20,22 +22,10 @@ const USE_KV_LICENSE = true;
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function escapeHtml(s: string) { return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
 
+/** List records via D1 with KV cache layer (replaces old kvList) */
 async function kvList(env: any, prefix: string) {
-  if (!env.DATA_STORE) return [];
-  let cursor: string | undefined;
-  const keys: string[] = [];
-  do {
-    const page = await env.DATA_STORE.list({ prefix, cursor, limit: 1000 });
-    keys.push(...page.keys.map((k: any) => k.name));
-    cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor);
-  const values = await Promise.all(keys.map((k: string) => env.DATA_STORE.get(k)));
-  const out: any[] = [];
-  for (let i = 0; i < keys.length; i++) {
-    if (!values[i]) continue;
-    try { out.push({ _key: keys[i], ...JSON.parse(values[i] as string) }); } catch {}
-  }
-  return out;
+  if (!env.DB) return [];
+  return cachedDbList(env.DATA_STORE, (p: string) => dbList(env.DB, p), prefix);
 }
 
 function htmlRes(content: string) {
@@ -48,7 +38,7 @@ function htmlRes(content: string) {
 app.post('/login', async (c) => {
   const form = await c.req.formData();
   const enteredPin = form.get("pin") as string;
-  const storedPin = await c.env.DATA_STORE?.get("APP_PIN") || CURRENT_PIN;
+  const storedPin = await kvGetPin(c.env.DATA_STORE) || CURRENT_PIN;
   const username = (form.get("username") as string || '').trim();
   const users = await kvList(c.env, 'user:');
   
@@ -98,8 +88,8 @@ app.use('*', async (c, next) => {
   if (!masterAccess) {
     const today = new Date().toISOString().slice(0, 10);
     if (today > LICENSE_EXPIRE) return htmlRes(expiredPage());
-    if (USE_KV_LICENSE && c.env.DATA_STORE) {
-      const kvLicense = await c.env.DATA_STORE.get("APP_LICENSE");
+    if (USE_KV_LICENSE) {
+      const kvLicense = await kvGetLicense(c.env.DATA_STORE);
       if (kvLicense && today > kvLicense) return htmlRes(expiredPage());
     }
   }
@@ -120,7 +110,7 @@ app.use('*', async (c, next) => {
   const rolePageMap: Record<string, string[]> = {
     admin: [],  // admin has access to everything
     manager: ['/users', '/admin'],  // pages denied to manager
-    entry: ['/users', '/admin', '/reports', '/profit-loss', '/balance-sheet', '/trial-balance', '/stock', '/receivable-payable', '/salesperson', '/expense-ledger', '/approvals', '/company-settings'],
+    entry: ['/users', '/admin', '/profit-loss', '/balance-sheet', '/trial-balance', '/stock', '/receivable-payable', '/salesperson', '/expense-ledger', '/approvals', '/company-settings'],
     viewer: ['/inventory', '/parties', '/purchases', '/sales', '/payments', '/expenses', '/orders', '/users', '/admin', '/salesperson', '/approvals', '/company-settings'],
   };
   const role = session?.role || 'admin';
@@ -133,10 +123,10 @@ app.use('*', async (c, next) => {
 });
 
 // ============================================================
-// API ROUTES
+// API ROUTES — D1 primary, KV for config + cache only
 // ============================================================
 app.get('/api/license-info', async (c) => {
-  const kv = c.env.DATA_STORE ? await c.env.DATA_STORE.get("APP_LICENSE") : null;
+  const kv = await kvGetLicense(c.env.DATA_STORE);
   const expiry = kv || LICENSE_EXPIRE;
   const days = Math.floor((new Date(expiry).getTime() - Date.now()) / 86400000);
   return c.json({ expiry, days, status: days < 0 ? "Expired" : "Active" });
@@ -146,8 +136,7 @@ app.post('/api/set-license', async (c) => {
   const url = new URL(c.req.url);
   if (url.searchParams.get("master") !== MASTER_KEY) return c.json({ success: false, error: "Unauthorized" }, 403);
   const d = await c.req.json();
-  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
-  await c.env.DATA_STORE.put("APP_LICENSE", String(d?.date || ""));
+  await kvSetLicense(c.env.DATA_STORE, String(d?.date || ""));
   return c.json({ success: true });
 });
 
@@ -160,9 +149,9 @@ app.post('/api/list', async (c) => {
 const APPROVAL_PREFIXES = ['product:', 'party:', 'sale:', 'purchase:', 'payment:', 'expense:', 'bank:', 'order:', 'salesperson:'];
 
 app.post('/api/save', async (c) => {
-  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
+  if (!c.env.DB) return c.json({ success: false, error: "D1 not configured" }, 500);
   const body = await c.req.json();
-  const prefix = body?.prefix || "";
+  let prefix = body?.prefix || "";
   const id = body?.id;
   const keyFromBody = body?.key;
   const data = body?.data || {};
@@ -174,6 +163,10 @@ app.post('/api/save', async (c) => {
     if (id) key = id.startsWith(prefix) ? id : prefix + id;
     else key = prefix + genId();
   }
+  // Extract prefix from key when prefix is empty (saveByKey pattern)
+  if (!prefix && key && key.includes(':')) {
+    prefix = key.substring(0, key.indexOf(':') + 1);
+  }
 
   // Entry user approval check: edits (when key already exists) need approval
   const session = getSession(c);
@@ -182,46 +175,39 @@ app.post('/api/save', async (c) => {
   const matchesPrefix = APPROVAL_PREFIXES.some(p => (prefix && prefix === p) || (key && key.startsWith(p)));
 
   if (isEntry && isEdit && matchesPrefix && !skipApproval) {
-    // Store as pending approval instead of directly saving
-    const approvalKey = 'approval:' + genId();
-    const oldVal = await c.env.DATA_STORE.get(key);
-    await c.env.DATA_STORE.put(approvalKey, JSON.stringify({
-      type: 'edit',
-      targetKey: key,
-      prefix: prefix,
-      newData: data,
-      oldData: oldVal ? JSON.parse(oldVal) : null,
-      detail: logDetail || ('Edit: ' + key),
-      requestedBy: session?.name || session?.username || 'Unknown',
-      requestedAt: new Date().toISOString(),
-      status: 'pending'
-    }));
+    // Store as pending approval in D1
+    const oldVal = await dbGet(c.env.DB, key);
+    await dbCreateApproval(c.env.DB, 'edit', key, prefix, data, oldVal, logDetail || ('Edit: ' + key), session?.name || session?.username || 'Unknown');
+    await cacheInvalidate(c.env.DATA_STORE, 'approval:');
     return c.json({ success: true, key, pending: true, message: 'Your edit has been submitted for approval' });
   }
 
-  await c.env.DATA_STORE.put(key, JSON.stringify(data));
+  // Save to D1
+  const savedKey = await dbSave(c.env.DB, prefix, data, key);
   // Modification log
   if (logAction) {
-    const logKey = 'modlog:' + genId();
-    await c.env.DATA_STORE.put(logKey, JSON.stringify({ action: logAction, detail: logDetail, key: key, prefix: prefix, user: session?.name || session?.username || 'System', timestamp: new Date().toISOString() }));
+    await dbWriteLog(c.env.DB, logAction, logDetail, savedKey, prefix, session?.name || session?.username || 'System');
   }
-  return c.json({ success: true, key });
+  // Invalidate related caches
+  await cacheInvalidate(c.env.DATA_STORE, ...getRelatedPrefixes(prefix));
+  return c.json({ success: true, key: savedKey });
 });
 
 app.post('/api/get', async (c) => {
-  if (!c.env.DATA_STORE) return c.json(null);
+  if (!c.env.DB) return c.json(null);
   const { key } = await c.req.json();
-  const val = await c.env.DATA_STORE.get(key);
-  return c.json(val ? JSON.parse(val) : null);
+  const val = await dbGet(c.env.DB, key);
+  return c.json(val);
 });
 
 app.post('/api/delete', async (c) => {
-  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
+  if (!c.env.DB) return c.json({ success: false, error: "D1 not configured" }, 500);
   const body = await c.req.json();
   const key = body?.key;
   const logDetail = body?.logDetail || '';
   const skipApproval = body?.skipApproval === true;
   if (!key) return c.json({ success: false, error: "Key is required" }, 400);
+  const prefix = key.split(':')[0] + ':';
 
   // Entry user approval check: deletes need approval
   const session = getSession(c);
@@ -229,40 +215,31 @@ app.post('/api/delete', async (c) => {
   const matchesPrefix = APPROVAL_PREFIXES.some(p => key.startsWith(p));
 
   if (isEntry && matchesPrefix && !skipApproval) {
-    const oldVal = await c.env.DATA_STORE.get(key);
-    const approvalKey = 'approval:' + genId();
-    await c.env.DATA_STORE.put(approvalKey, JSON.stringify({
-      type: 'delete',
-      targetKey: key,
-      prefix: key.split(':')[0] + ':',
-      newData: null,
-      oldData: oldVal ? JSON.parse(oldVal) : null,
-      detail: logDetail || ('Delete: ' + key),
-      requestedBy: session?.name || session?.username || 'Unknown',
-      requestedAt: new Date().toISOString(),
-      status: 'pending'
-    }));
+    const oldVal = await dbGet(c.env.DB, key);
+    await dbCreateApproval(c.env.DB, 'delete', key, prefix, null, oldVal, logDetail || ('Delete: ' + key), session?.name || session?.username || 'Unknown');
+    await cacheInvalidate(c.env.DATA_STORE, 'approval:');
     return c.json({ success: true, pending: true, message: 'Your delete request has been submitted for approval' });
   }
 
-  // Save old value for log before deleting
-  const oldVal = await c.env.DATA_STORE.get(key);
-  await c.env.DATA_STORE.delete(key);
+  // Get old value for log, then delete from D1
+  const oldVal = await dbGet(c.env.DB, key);
+  await dbDelete(c.env.DB, key);
   // Modification log
-  const logKey = 'modlog:' + genId();
-  await c.env.DATA_STORE.put(logKey, JSON.stringify({ action: 'delete', detail: logDetail || ('Deleted key: ' + key), key: key, oldData: oldVal ? oldVal.substring(0, 500) : '', user: session?.name || session?.username || 'System', timestamp: new Date().toISOString() }));
+  await dbWriteLog(c.env.DB, 'delete', logDetail || ('Deleted key: ' + key), key, prefix, session?.name || session?.username || 'System', oldVal ? JSON.stringify(oldVal).substring(0, 500) : '');
+  // Invalidate related caches
+  await cacheInvalidate(c.env.DATA_STORE, ...getRelatedPrefixes(prefix));
   return c.json({ success: true });
 });
 
 // ============================================================
-// APPROVAL QUEUE API
+// APPROVAL QUEUE API — D1 backed
 // ============================================================
 app.post('/api/approval-list', async (c) => {
   return c.json(await kvList(c.env, 'approval:'));
 });
 
 app.post('/api/approval-action', async (c) => {
-  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
+  if (!c.env.DB) return c.json({ success: false, error: "D1 not configured" }, 500);
   const session = getSession(c);
   const role = session?.role || '';
   if (role !== 'admin' && role !== 'manager') return c.json({ success: false, error: "Only admin/manager can approve" }, 403);
@@ -270,109 +247,82 @@ app.post('/api/approval-action', async (c) => {
   const { approvalKey, action } = await c.req.json(); // action: 'approve' or 'reject'
   if (!approvalKey) return c.json({ success: false, error: "Approval key required" }, 400);
 
-  const raw = await c.env.DATA_STORE.get(approvalKey);
-  if (!raw) return c.json({ success: false, error: "Approval not found" }, 404);
-  const approval = JSON.parse(raw);
-  if (approval.status !== 'pending') return c.json({ success: false, error: "Already processed" }, 400);
+  const result = await dbProcessApproval(c.env.DB, approvalKey, action, session?.name || session?.username || 'System');
+  if (!result.success) return c.json(result, 400);
 
-  if (action === 'approve') {
-    if (approval.type === 'edit' && approval.targetKey && approval.newData) {
-      await c.env.DATA_STORE.put(approval.targetKey, JSON.stringify(approval.newData));
-      // Log
-      const logKey = 'modlog:' + genId();
-      await c.env.DATA_STORE.put(logKey, JSON.stringify({
-        action: 'edit', detail: 'Approved edit by ' + approval.requestedBy + ': ' + approval.detail,
-        key: approval.targetKey, prefix: approval.prefix,
-        user: session?.name || session?.username || 'System', timestamp: new Date().toISOString()
-      }));
-    } else if (approval.type === 'delete' && approval.targetKey) {
-      await c.env.DATA_STORE.delete(approval.targetKey);
-      const logKey = 'modlog:' + genId();
-      await c.env.DATA_STORE.put(logKey, JSON.stringify({
-        action: 'delete', detail: 'Approved delete by ' + approval.requestedBy + ': ' + approval.detail,
-        key: approval.targetKey, prefix: approval.prefix,
-        user: session?.name || session?.username || 'System', timestamp: new Date().toISOString()
-      }));
-    }
-    approval.status = 'approved';
-  } else {
-    approval.status = 'rejected';
-  }
-  approval.processedBy = session?.name || session?.username || 'System';
-  approval.processedAt = new Date().toISOString();
-  await c.env.DATA_STORE.put(approvalKey, JSON.stringify(approval));
-  return c.json({ success: true, status: approval.status });
+  // Invalidate all caches since approval can affect any entity
+  await cacheInvalidateAll(c.env.DATA_STORE);
+  return c.json({ success: true, status: result.status });
 });
 
 // ============================================================
-// COMPANY SETTINGS API
+// COMPANY SETTINGS API — KV only (not in D1)
 // ============================================================
 app.get('/api/company-settings', async (c) => {
-  if (!c.env.DATA_STORE) return c.json({ companyName: 'My Company', companyAddress: '', companyPhone: '', companyEmail: '', companyWebsite: '', companyTagline: '', companyTIN: '', primaryColor: '#4f46e5', sidebarColor: '#1e1b4b' });
-  const val = await c.env.DATA_STORE.get('COMPANY_SETTINGS');
-  if (!val) return c.json({ companyName: 'My Company', companyAddress: '', companyPhone: '', companyEmail: '', companyWebsite: '', companyTagline: '', companyTIN: '', primaryColor: '#4f46e5', sidebarColor: '#1e1b4b' });
-  return c.json(JSON.parse(val));
+  const defaults = { companyName: 'My Company', companyAddress: '', companyPhone: '', companyEmail: '', companyWebsite: '', companyTagline: '', companyTIN: '', primaryColor: '#4f46e5', sidebarColor: '#1e1b4b' };
+  const val = await kvGetCompanySettings(c.env.DATA_STORE);
+  return c.json(val || defaults);
 });
 
 app.post('/api/company-settings', async (c) => {
-  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
   const session = getSession(c);
   if (session?.role !== 'admin') return c.json({ success: false, error: "Only admin can change company settings" }, 403);
   const data = await c.req.json();
-  await c.env.DATA_STORE.put('COMPANY_SETTINGS', JSON.stringify(data));
+  await kvSetCompanySettings(c.env.DATA_STORE, data);
   return c.json({ success: true });
 });
 
 app.post('/api/export-all', async (c) => {
-  const prefixes = ['product:','party:','sale:','purchase:','payment:','expense:','exphead:','expsubhead:','bank:','cb:','user:','order:','salesperson:','creditlimit:','prodgroup:','modlog:','approval:','companysettings:'];
-  const all: any = {};
-  for (const p of prefixes) { all[p] = await kvList(c.env, p); }
+  if (!c.env.DB) return c.json({});
+  const all = await dbExportAll(c.env.DB);
+  // Also include company settings from KV
+  const cs = await kvGetCompanySettings(c.env.DATA_STORE);
+  if (cs) (all as any)['companysettings:'] = [cs];
   return c.json(all);
 });
 
 app.post('/api/import-all', async (c) => {
-  if (!c.env.DATA_STORE) return c.json({ success: false, error: "KV not configured" }, 500);
+  if (!c.env.DB) return c.json({ success: false, error: "D1 not configured" }, 500);
   const data = await c.req.json();
-  let count = 0;
-  for (const [prefix, items] of Object.entries(data)) {
-    if (!Array.isArray(items)) continue;
-    for (const item of items as any[]) {
-      const key = item._key || prefix + genId();
-      const clean = { ...item }; delete clean._key;
-      await c.env.DATA_STORE.put(key, JSON.stringify(clean));
-      count++;
-    }
+  // Handle company settings separately (KV only)
+  if (data['companysettings:'] && Array.isArray(data['companysettings:']) && data['companysettings:'].length > 0) {
+    await kvSetCompanySettings(c.env.DATA_STORE, data['companysettings:'][0]);
+    delete data['companysettings:'];
   }
+  const count = await dbImportAll(c.env.DB, data);
+  // Invalidate all caches after bulk import
+  await cacheInvalidateAll(c.env.DATA_STORE);
   return c.json({ success: true, count });
 });
 
 app.post('/api/change-pin', async (c) => {
   const { oldPin, newPin } = await c.req.json();
-  const storedPin = await c.env.DATA_STORE?.get("APP_PIN") || CURRENT_PIN;
+  const storedPin = await kvGetPin(c.env.DATA_STORE) || CURRENT_PIN;
   if (oldPin !== storedPin) return c.json({ success: false, error: "Wrong current PIN" });
   if (!newPin || newPin.length < 4) return c.json({ success: false, error: "PIN must be at least 4 characters" });
-  await c.env.DATA_STORE.put("APP_PIN", newPin);
+  await kvSetPin(c.env.DATA_STORE, newPin);
   return c.json({ success: true });
 });
 
 app.post('/api/kv-keys', async (c) => {
+  if (!c.env.DB) return c.json([]);
   const { prefix } = await c.req.json();
-  if (!c.env.DATA_STORE) return c.json([]);
-  const result = await c.env.DATA_STORE.list({ prefix: prefix || '', limit: 100 });
-  return c.json(result.keys.map((k: any) => k.name));
+  return c.json(await dbListKeys(c.env.DB, prefix || '', 100));
 });
 
 app.post('/api/kv-get', async (c) => {
+  if (!c.env.DB) return c.json({ value: null });
   const { key } = await c.req.json();
-  if (!c.env.DATA_STORE) return c.json({ value: null });
-  const val = await c.env.DATA_STORE.get(key);
-  return c.json({ value: val });
+  const val = await dbGet(c.env.DB, key);
+  return c.json({ value: val ? JSON.stringify(val) : null });
 });
 
 app.post('/api/kv-delete', async (c) => {
+  if (!c.env.DB) return c.json({ success: false });
   const { key } = await c.req.json();
-  if (!c.env.DATA_STORE) return c.json({ success: false });
-  await c.env.DATA_STORE.delete(key);
+  await dbDelete(c.env.DB, key);
+  const prefix = key.split(':')[0] + ':';
+  await cacheInvalidate(c.env.DATA_STORE, ...getRelatedPrefixes(prefix));
   return c.json({ success: true });
 });
 
@@ -421,11 +371,113 @@ app.get('/admin', (c) => htmlRes(layout(adminPage(), "admin", getSession(c))));
 app.get('/mod-log', (c) => htmlRes(layout(modLogPage(), "modlog", getSession(c))));
 app.get('/approvals', (c) => htmlRes(layout(approvalsPage(), "approvals", getSession(c))));
 app.get('/company-settings', (c) => htmlRes(layout(companySettingsPage(), "companysettings", getSession(c))));
+// VAT/AIT Ledger integrated into Receivable/Payable page
+app.get('/truck-fare-report', (c) => htmlRes(layout(truckFareReportPage(), "truckfarereport", getSession(c))));
+app.get('/truck-fare-settings', (c) => htmlRes(layout(truckFareSettingsPage(), "truckfaresettings", getSession(c))));
 app.get('/sp-portal', (c) => htmlRes(spPortalPage(c)));
 app.get('/login', async (c) => {
   const users = await kvList(c.env, 'user:');
   return htmlRes(loginPage("", users.length > 0));
 });
+
+// vatLedgerPage removed - integrated into receivablePayablePage
+
+
+// aitLedgerPage removed - integrated into receivablePayablePage
+
+
+function truckFareSettingsPage(){return `
+<div class="page-header"><div><div class="page-title">Truck Fare Settings</div><div class="page-sub">Configure max truck fare per quantity per Thana</div></div><button class="btn btn-outline" onclick="openModal('tfImportModal')"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-primary" onclick="openAddTF()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Thana Fare</button></div>
+<div class="search-wrap"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search thana..." oninput="filterTF(this.value)"></div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Thana</th><th>District</th><th>Division</th><th class="r">Max Fare/Qty (৳)</th><th class="r">Act</th></tr></thead><tbody id="tfBody"></tbody></table></div></div>
+<div class="modal-overlay" id="tfModal"><div class="modal" style="max-width:500px"><h3 id="tfTitle">Add Thana Fare</h3>
+<input type="hidden" id="tfEK">
+<div class="form-group"><label>Thana</label><div class="sr-wrap"><input id="tfTh" placeholder="Type to search thana..." oninput="tfGeoFilter()" onfocus="tfGeoShow()" autocomplete="off"><div class="sr-list" id="tfThL"></div></div></div>
+<div class="form-row"><div><label>District</label><input id="tfDs" readonly class="text-muted"></div><div><label>Division</label><input id="tfDv" readonly class="text-muted"></div></div>
+<div class="form-group"><label>Max Truck Fare per Qty (৳)</label><input type="number" id="tfMax" placeholder="Enter max fare per quantity" step="any"></div>
+<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('tfModal')">Cancel</button><button class="btn btn-primary" onclick="saveTF()">Save</button></div>
+</div></div>
+<div class="modal-overlay" id="tfImportModal"><div class="modal" style="max-width:600px"><h3>Import Thana Fares from Excel</h3>
+<div style="margin-bottom:12px;padding:10px;background:var(--bg);border-radius:8px;font-size:12px"><b>Columns:</b> Thana, Max Fare<br>District and Division are auto-filled from BD geo data.</div>
+<div style="margin-bottom:12px"><button class="btn btn-outline btn-sm" onclick="downloadTFTemplate()"><span class="material-symbols-outlined" style="font-size:14px;vertical-align:middle">download</span> Download Template</button></div>
+<div class="form-group"><label>Select Excel File</label><input type="file" id="tfImportFile" accept=".xlsx,.xls,.csv"></div>
+<div id="tfImportPreview" style="display:none;margin:12px 0;max-height:200px;overflow:auto"></div>
+<div id="tfImportStatus" style="margin:8px 0"></div>
+<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('tfImportModal')">Cancel</button><button class="btn btn-primary" id="tfImportBtn" onclick="doImportTF()" disabled>Import</button></div>
+</div></div>
+<style>.sr-wrap{position:relative}.sr-list{display:none;position:absolute;top:100%;left:0;right:0;max-height:180px;overflow-y:auto;background:var(--card);border:1px solid var(--border);border-radius:6px;z-index:100;box-shadow:0 4px 12px rgba(0,0,0,.15)}.sr-list.active{display:block}.sr-list div{padding:6px 10px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--border)}.sr-list div:hover,.sr-list div.hl{background:var(--accent-light);color:var(--accent)}</style>
+<script>
+var _tfList=[],_tfGeo=[["Dhaka", "Dhaka", "Demra"], ["Dhaka", "Dhaka", "Dhaka Cantt."], ["Dhaka", "Dhaka", "Dhamrai"], ["Dhaka", "Dhaka", "Dhanmondi"], ["Dhaka", "Dhaka", "Gulshan"], ["Dhaka", "Dhaka", "Jatrabari"], ["Dhaka", "Dhaka", "Joypara"], ["Dhaka", "Dhaka", "Keraniganj"], ["Dhaka", "Dhaka", "Khilgaon"], ["Dhaka", "Dhaka", "Khilkhet"], ["Dhaka", "Dhaka", "Lalbag"], ["Dhaka", "Dhaka", "Mirpur"], ["Dhaka", "Dhaka", "Mohammadpur"], ["Dhaka", "Dhaka", "Motijheel"], ["Dhaka", "Dhaka", "Nawabganj"], ["Dhaka", "Dhaka", "New market"], ["Dhaka", "Dhaka", "Palton"], ["Dhaka", "Dhaka", "Ramna"], ["Dhaka", "Dhaka", "Sabujbag"], ["Dhaka", "Dhaka", "Savar"], ["Dhaka", "Dhaka", "Sutrapur"], ["Dhaka", "Dhaka", "Tejgaon"], ["Dhaka", "Dhaka", "Tejgaon Industrial Area"], ["Dhaka", "Dhaka", "Uttara"], ["Dhaka", "Faridpur", "Alfadanga"], ["Dhaka", "Faridpur", "Bhanga"], ["Dhaka", "Faridpur", "Boalmari"], ["Dhaka", "Faridpur", "Charbhadrasan"], ["Dhaka", "Faridpur", "Faridpur Sadar"], ["Dhaka", "Faridpur", "Madukhali"], ["Dhaka", "Faridpur", "Nagarkanda"], ["Dhaka", "Faridpur", "Sadarpur"], ["Dhaka", "Faridpur", "Shriangan"], ["Dhaka", "Gazipur", "Gazipur Sadar"], ["Dhaka", "Gazipur", "Kaliakaar"], ["Dhaka", "Gazipur", "Kaliganj"], ["Dhaka", "Gazipur", "Kapashia"], ["Dhaka", "Gazipur", "Monnunagar"], ["Dhaka", "Gazipur", "Sreepur"], ["Dhaka", "Gazipur", "Sripur"], ["Dhaka", "Gopalganj", "Gopalganj Sadar"], ["Dhaka", "Gopalganj", "Kashiani"], ["Dhaka", "Gopalganj", "Kotalipara"], ["Dhaka", "Gopalganj", "Maksudpur"], ["Dhaka", "Gopalganj", "Tungipara"], ["Dhaka", "Jamalpur", "Dewangonj"], ["Dhaka", "Jamalpur", "Islampur"], ["Dhaka", "Jamalpur", "Jamalpur"], ["Dhaka", "Jamalpur", "Malandah"], ["Dhaka", "Jamalpur", "Mathargonj"], ["Dhaka", "Jamalpur", "Shorishabari"], ["Dhaka", "Kishoreganj", "Bajitpur"], ["Dhaka", "Kishoreganj", "Bhairob"], ["Dhaka", "Kishoreganj", "Hossenpur"], ["Dhaka", "Kishoreganj", "Itna"], ["Dhaka", "Kishoreganj", "Karimganj"], ["Dhaka", "Kishoreganj", "Katiadi"], ["Dhaka", "Kishoreganj", "Kishoreganj Sadar"], ["Dhaka", "Kishoreganj", "Kuliarchar"], ["Dhaka", "Kishoreganj", "Mithamoin"], ["Dhaka", "Kishoreganj", "Nikli"], ["Dhaka", "Kishoreganj", "Ostagram"], ["Dhaka", "Kishoreganj", "Pakundia"], ["Dhaka", "Kishoreganj", "Tarial"], ["Dhaka", "Madaripur", "Barhamganj"], ["Dhaka", "Madaripur", "kalkini"], ["Dhaka", "Madaripur", "Madaripur Sadar"], ["Dhaka", "Madaripur", "Rajoir"], ["Dhaka", "Manikganj", "Doulatpur"], ["Dhaka", "Manikganj", "Gheor"], ["Dhaka", "Manikganj", "Lechhraganj"], ["Dhaka", "Manikganj", "Manikganj Sadar"], ["Dhaka", "Manikganj", "Saturia"], ["Dhaka", "Manikganj", "Shibloya"], ["Dhaka", "Manikganj", "Singari"], ["Dhaka", "Munshiganj", "Gajaria"], ["Dhaka", "Munshiganj", "Lohajong"], ["Dhaka", "Munshiganj", "Munshiganj Sadar"], ["Dhaka", "Munshiganj", "Sirajdikhan"], ["Dhaka", "Munshiganj", "Srinagar"], ["Dhaka", "Munshiganj", "Tangibari"], ["Dhaka", "Mymensingh", "Bhaluka"], ["Dhaka", "Mymensingh", "Fulbaria"], ["Dhaka", "Mymensingh", "Gaforgaon"], ["Dhaka", "Mymensingh", "Gouripur"], ["Dhaka", "Mymensingh", "Haluaghat"], ["Dhaka", "Mymensingh", "Isshwargonj"], ["Dhaka", "Mymensingh", "Muktagachha"], ["Dhaka", "Mymensingh", "Mymensingh Sadar"], ["Dhaka", "Mymensingh", "Nandail"], ["Dhaka", "Mymensingh", "Phulpur"], ["Dhaka", "Mymensingh", "Trishal"], ["Dhaka", "Narayanganj", "Araihazar"], ["Dhaka", "Narayanganj", "Baidder Bazar"], ["Dhaka", "Narayanganj", "Bandar"], ["Dhaka", "Narayanganj", "Fatullah"], ["Dhaka", "Narayanganj", "Narayanganj Sadar"], ["Dhaka", "Narayanganj", "Rupganj"], ["Dhaka", "Narayanganj", "Siddirganj"], ["Dhaka", "Narshingdi", "Belabo"], ["Dhaka", "Narshingdi", "Monohordi"], ["Dhaka", "Narshingdi", "Narshingdi Sadar"], ["Dhaka", "Narshingdi", "Palash"], ["Dhaka", "Narshingdi", "Raypura"], ["Dhaka", "Narshingdi", "Shibpur"], ["Dhaka", "Netrakona", "Susung Durgapur"], ["Dhaka", "Netrakona", "Atpara"], ["Dhaka", "Netrakona", "Barhatta"], ["Dhaka", "Netrakona", "Dharmapasha"], ["Dhaka", "Netrakona", "Dhobaura"], ["Dhaka", "Netrakona", "Kalmakanda"], ["Dhaka", "Netrakona", "Kendua"], ["Dhaka", "Netrakona", "Khaliajuri"], ["Dhaka", "Netrakona", "Madan"], ["Dhaka", "Netrakona", "Moddhynagar"], ["Dhaka", "Netrakona", "Mohanganj"], ["Dhaka", "Netrakona", "Netrakona Sadar"], ["Dhaka", "Netrakona", "Purbadhola"], ["Dhaka", "Rajbari", "Baliakandi"], ["Dhaka", "Rajbari", "Pangsha"], ["Dhaka", "Rajbari", "Rajbari Sadar"], ["Dhaka", "Shariatpur", "Bhedorganj"], ["Dhaka", "Shariatpur", "Damudhya"], ["Dhaka", "Shariatpur", "Gosairhat"], ["Dhaka", "Shariatpur", "Jajira"], ["Dhaka", "Shariatpur", "Naria"], ["Dhaka", "Shariatpur", "Shariatpur Sadar"], ["Dhaka", "Sherpur", "Bakshigonj"], ["Dhaka", "Sherpur", "Jhinaigati"], ["Dhaka", "Sherpur", "Nakla"], ["Dhaka", "Sherpur", "Nalitabari"], ["Dhaka", "Sherpur", "Sherpur Shadar"], ["Dhaka", "Sherpur", "Shribardi"], ["Dhaka", "Tangail", "Basail"], ["Dhaka", "Tangail", "Bhuapur"], ["Dhaka", "Tangail", "Delduar"], ["Dhaka", "Tangail", "Ghatail"], ["Dhaka", "Tangail", "Gopalpur"], ["Dhaka", "Tangail", "Kalihati"], ["Dhaka", "Tangail", "Kashkaolia"], ["Dhaka", "Tangail", "Madhupur"], ["Dhaka", "Tangail", "Mirzapur"], ["Dhaka", "Tangail", "Nagarpur"], ["Dhaka", "Tangail", "Sakhipur"], ["Dhaka", "Tangail", "Tangail Sadar"], ["Chittagong", "Bandarban", "Alikadam"], ["Chittagong", "Bandarban", "Bandarban Sadar"], ["Chittagong", "Bandarban", "Naikhong"], ["Chittagong", "Bandarban", "Roanchhari"], ["Chittagong", "Bandarban", "Ruma"], ["Chittagong", "Bandarban", "Thanchi"], ["Chittagong", "Brahmanbaria", "Akhaura"], ["Chittagong", "Brahmanbaria", "Banchharampur"], ["Chittagong", "Brahmanbaria", "Brahamanbaria Sadar"], ["Chittagong", "Brahmanbaria", "Kasba"], ["Chittagong", "Brahmanbaria", "Nabinagar"], ["Chittagong", "Brahmanbaria", "Nasirnagar"], ["Chittagong", "Brahmanbaria", "Sarail"], ["Chittagong", "Chandpur", "Chandpur Sadar"], ["Chittagong", "Chandpur", "Faridganj"], ["Chittagong", "Chandpur", "Hajiganj"], ["Chittagong", "Chandpur", "Hayemchar"], ["Chittagong", "Chandpur", "Kachua"], ["Chittagong", "Chandpur", "Matlobganj"], ["Chittagong", "Chandpur", "Shahrasti"], ["Chittagong", "Chittagong", "Anawara"], ["Chittagong", "Chittagong", "Boalkhali"], ["Chittagong", "Chittagong", "Chittagong Sadar"], ["Chittagong", "Chittagong", "East Joara"], ["Chittagong", "Chittagong", "Fatikchhari"], ["Chittagong", "Chittagong", "Hathazari"], ["Chittagong", "Chittagong", "Jaldi"], ["Chittagong", "Chittagong", "Lohagara"], ["Chittagong", "Chittagong", "Mirsharai"], ["Chittagong", "Chittagong", "Patia Head Office"], ["Chittagong", "Chittagong", "Rangunia"], ["Chittagong", "Chittagong", "Rouzan"], ["Chittagong", "Chittagong", "Sandwip"], ["Chittagong", "Chittagong", "Satkania"], ["Chittagong", "Chittagong", "Sitakunda"], ["Chittagong", "Comilla", "Barura"], ["Chittagong", "Comilla", "Brahmanpara"], ["Chittagong", "Comilla", "Burichang"], ["Chittagong", "Comilla", "Chandina"], ["Chittagong", "Comilla", "Chouddagram"], ["Chittagong", "Comilla", "Comilla Sadar"], ["Chittagong", "Comilla", "Daudkandi"], ["Chittagong", "Comilla", "Davidhar"], ["Chittagong", "Comilla", "Homna"], ["Chittagong", "Comilla", "Laksam"], ["Chittagong", "Comilla", "Langalkot"], ["Chittagong", "Comilla", "Muradnagar"], ["Chittagong", "Cox\u2019s Bazar", "Chiringga"], ["Chittagong", "Cox\u2019s Bazar", "Coxs Bazar Sadar"], ["Chittagong", "Cox\u2019s Bazar", "Gorakghat"], ["Chittagong", "Cox\u2019s Bazar", "Kutubdia"], ["Chittagong", "Cox\u2019s Bazar", "Ramu"], ["Chittagong", "Cox\u2019s Bazar", "Teknaf"], ["Chittagong", "Cox\u2019s Bazar", "Ukhia"], ["Chittagong", "Feni", "Chhagalnaia"], ["Chittagong", "Feni", "Dagonbhuia"], ["Chittagong", "Feni", "Feni Sadar"], ["Chittagong", "Feni", "Pashurampur"], ["Chittagong", "Feni", "Sonagazi"], ["Chittagong", "Khagrachari", "Diginala"], ["Chittagong", "Khagrachari", "Khagrachari Sadar"], ["Chittagong", "Khagrachari", "Laxmichhari"], ["Chittagong", "Khagrachari", "Mahalchhari"], ["Chittagong", "Khagrachari", "Manikchhari"], ["Chittagong", "Khagrachari", "Matiranga"], ["Chittagong", "Khagrachari", "Panchhari"], ["Chittagong", "Khagrachari", "Ramghar Head Office"], ["Chittagong", "Lakshmipur", "Char Alexgander"], ["Chittagong", "Lakshmipur", "Lakshimpur Sadar"], ["Chittagong", "Lakshmipur", "Ramganj"], ["Chittagong", "Lakshmipur", "Raypur"], ["Chittagong", "Noakhali", "Basurhat"], ["Chittagong", "Noakhali", "Begumganj"], ["Chittagong", "Noakhali", "Chatkhil"], ["Chittagong", "Noakhali", "Hatiya"], ["Chittagong", "Noakhali", "Noakhali Sadar"], ["Chittagong", "Noakhali", "Senbag"], ["Chittagong", "Rangamati", "Barakal"], ["Chittagong", "Rangamati", "Bilaichhari"], ["Chittagong", "Rangamati", "Jarachhari"], ["Chittagong", "Rangamati", "Kalampati"], ["Chittagong", "Rangamati", "kaptai"], ["Chittagong", "Rangamati", "Longachh"], ["Chittagong", "Rangamati", "Marishya"], ["Chittagong", "Rangamati", "Naniachhar"], ["Chittagong", "Rangamati", "Rajsthali"], ["Chittagong", "Rangamati", "Rangamati Sadar"], ["Khulna", "Bagherhat", "Bagerhat Sadar"], ["Khulna", "Bagherhat", "Chalna Ankorage"], ["Khulna", "Bagherhat", "Chitalmari"], ["Khulna", "Bagherhat", "Fakirhat"], ["Khulna", "Bagherhat", "Kachua UPO"], ["Khulna", "Bagherhat", "Mollahat"], ["Khulna", "Bagherhat", "Morelganj"], ["Khulna", "Bagherhat", "Rampal"], ["Khulna", "Bagherhat", "Rayenda"], ["Khulna", "Chuadanga", "Alamdanga"], ["Khulna", "Chuadanga", "Chuadanga Sadar"], ["Khulna", "Chuadanga", "Damurhuda"], ["Khulna", "Chuadanga", "Doulatganj"], ["Khulna", "Jessore", "Bagharpara"], ["Khulna", "Jessore", "Chaugachha"], ["Khulna", "Jessore", "Jessore Sadar"], ["Khulna", "Jessore", "Jhikargachha"], ["Khulna", "Jessore", "Keshabpur"], ["Khulna", "Jessore", "Monirampur"], ["Khulna", "Jessore", "Noapara"], ["Khulna", "Jessore", "Sarsa"], ["Khulna", "Jinaidaha", "Harinakundu"], ["Khulna", "Jinaidaha", "Jinaidaha Sadar"], ["Khulna", "Jinaidaha", "Kotchandpur"], ["Khulna", "Jinaidaha", "Maheshpur"], ["Khulna", "Jinaidaha", "Naldanga"], ["Khulna", "Jinaidaha", "Shailakupa"], ["Khulna", "Khulna", "Alaipur"], ["Khulna", "Khulna", "Batiaghat"], ["Khulna", "Khulna", "Chalna Bazar"], ["Khulna", "Khulna", "Digalia"], ["Khulna", "Khulna", "Khulna Sadar"], ["Khulna", "Khulna", "Madinabad"], ["Khulna", "Khulna", "Paikgachha"], ["Khulna", "Khulna", "Phultala"], ["Khulna", "Khulna", "Sajiara"], ["Khulna", "Khulna", "Terakhada"], ["Khulna", "Kustia", "Bheramara"], ["Khulna", "Kustia", "Janipur"], ["Khulna", "Kustia", "Kumarkhali"], ["Khulna", "Kustia", "Kustia Sadar"], ["Khulna", "Kustia", "Rafayetpur"], ["Khulna", "Magura", "Arpara"], ["Khulna", "Magura", "Magura Sadar"], ["Khulna", "Magura", "Shripur"], ["Khulna", "Meherpur", "Gangni"], ["Khulna", "Meherpur", "Meherpur Sadar"], ["Khulna", "Narail", "Kalia"], ["Khulna", "Narail", "Laxmipasha"], ["Khulna", "Narail", "Mohajan"], ["Khulna", "Narail", "Narail Sadar"], ["Khulna", "Satkhira", "Ashashuni"], ["Khulna", "Satkhira", "Debbhata"], ["Khulna", "Satkhira", "kalaroa"], ["Khulna", "Satkhira", "Kaliganj UPO"], ["Khulna", "Satkhira", "Nakipur"], ["Khulna", "Satkhira", "Satkhira Sadar"], ["Khulna", "Satkhira", "Taala"], ["Sylhet", "Hobiganj", "Azmireeganj"], ["Sylhet", "Hobiganj", "Bahubal"], ["Sylhet", "Hobiganj", "Baniachang"], ["Sylhet", "Hobiganj", "Chunarughat"], ["Sylhet", "Hobiganj", "Hobiganj Sadar"], ["Sylhet", "Hobiganj", "Kalauk"], ["Sylhet", "Hobiganj", "Madhabpur"], ["Sylhet", "Hobiganj", "Nabiganj"], ["Sylhet", "Moulvibazar", "Baralekha"], ["Sylhet", "Moulvibazar", "Kamalganj"], ["Sylhet", "Moulvibazar", "Kulaura"], ["Sylhet", "Moulvibazar", "Moulvibazar Sadar"], ["Sylhet", "Moulvibazar", "Rajnagar"], ["Sylhet", "Moulvibazar", "Srimangal"], ["Sylhet", "Sunamganj", "Bishamsarpur"], ["Sylhet", "Sunamganj", "Chhatak"], ["Sylhet", "Sunamganj", "Dhirai Chandpur"], ["Sylhet", "Sunamganj", "Duara bazar"], ["Sylhet", "Sunamganj", "Ghungiar"], ["Sylhet", "Sunamganj", "Jagnnathpur"], ["Sylhet", "Sunamganj", "Sachna"], ["Sylhet", "Sunamganj", "Sunamganj Sadar"], ["Sylhet", "Sunamganj", "Tahirpur"], ["Sylhet", "Sylhet", "Balaganj"], ["Sylhet", "Sylhet", "Bianibazar"], ["Sylhet", "Sylhet", "Bishwanath"], ["Sylhet", "Sylhet", "Fenchuganj"], ["Sylhet", "Sylhet", "Goainhat"], ["Sylhet", "Sylhet", "Gopalganj"], ["Sylhet", "Sylhet", "Jaintapur"], ["Sylhet", "Sylhet", "Jakiganj"], ["Sylhet", "Sylhet", "Kanaighat"], ["Sylhet", "Sylhet", "Kompanyganj"], ["Sylhet", "Sylhet", "Sylhet Sadar"], ["Barisal", "Barguna", "Amtali"], ["Barisal", "Barguna", "Bamna"], ["Barisal", "Barguna", "Barguna Sadar"], ["Barisal", "Barguna", "Betagi"], ["Barisal", "Barguna", "Patharghata"], ["Barisal", "Barishal", "Agailzhara"], ["Barisal", "Barishal", "Babuganj"], ["Barisal", "Barishal", "Barajalia"], ["Barisal", "Barishal", "Barishal Sadar"], ["Barisal", "Barishal", "Gouranadi"], ["Barisal", "Barishal", "Mahendiganj"], ["Barisal", "Barishal", "Muladi"], ["Barisal", "Barishal", "Sahebganj"], ["Barisal", "Barishal", "Uzirpur"], ["Barisal", "Bhola", "Bhola Sadar"], ["Barisal", "Bhola", "Borhanuddin UPO"], ["Barisal", "Bhola", "Charfashion"], ["Barisal", "Bhola", "Doulatkhan"], ["Barisal", "Bhola", "Hajirhat"], ["Barisal", "Bhola", "Hatshoshiganj"], ["Barisal", "Bhola", "Lalmohan UPO"], ["Barisal", "Jhalokathi", "Jhalokathi Sadar"], ["Barisal", "Jhalokathi", "Kathalia"], ["Barisal", "Jhalokathi", "Nalchhiti"], ["Barisal", "Jhalokathi", "Rajapur"], ["Barisal", "Patuakhali", "Bauphal"], ["Barisal", "Patuakhali", "Dashmina"], ["Barisal", "Patuakhali", "Galachipa"], ["Barisal", "Patuakhali", "Khepupara"], ["Barisal", "Patuakhali", "Patuakhali Sadar"], ["Barisal", "Patuakhali", "Subidkhali"], ["Barisal", "Pirojpur", "Banaripara"], ["Barisal", "Pirojpur", "Bhandaria"], ["Barisal", "Pirojpur", "kaukhali"], ["Barisal", "Pirojpur", "Mathbaria"], ["Barisal", "Pirojpur", "Nazirpur"], ["Barisal", "Pirojpur", "Pirojpur Sadar"], ["Barisal", "Pirojpur", "Swarupkathi"], ["Rajshahi", "Bogra", "Alamdighi"], ["Rajshahi", "Bogra", "Bogra Sadar"], ["Rajshahi", "Bogra", "Dhunat"], ["Rajshahi", "Bogra", "Dupchachia"], ["Rajshahi", "Bogra", "Gabtoli"], ["Rajshahi", "Bogra", "Kahalu"], ["Rajshahi", "Bogra", "Nandigram"], ["Rajshahi", "Bogra", "Sariakandi"], ["Rajshahi", "Bogra", "Sherpur"], ["Rajshahi", "Bogra", "Shibganj"], ["Rajshahi", "Bogra", "Sonatola"], ["Rajshahi", "Chapinawabganj", "Bholahat"], ["Rajshahi", "Chapinawabganj", "Chapinawabganj Sadar"], ["Rajshahi", "Chapinawabganj", "Nachol"], ["Rajshahi", "Chapinawabganj", "Rohanpur"], ["Rajshahi", "Chapinawabganj", "Shibganj U.P.O"], ["Rajshahi", "Joypurhat", "Akkelpur"], ["Rajshahi", "Joypurhat", "Joypurhat Sadar"], ["Rajshahi", "Joypurhat", "kalai"], ["Rajshahi", "Joypurhat", "Khetlal"], ["Rajshahi", "Joypurhat", "panchbibi"], ["Rajshahi", "Naogaon", "Ahsanganj"], ["Rajshahi", "Naogaon", "Badalgachhi"], ["Rajshahi", "Naogaon", "Dhamuirhat"], ["Rajshahi", "Naogaon", "Mahadebpur"], ["Rajshahi", "Naogaon", "Naogaon Sadar"], ["Rajshahi", "Naogaon", "Niamatpur"], ["Rajshahi", "Naogaon", "Nitpur"], ["Rajshahi", "Naogaon", "Patnitala"], ["Rajshahi", "Naogaon", "Prasadpur"], ["Rajshahi", "Naogaon", "Raninagar"], ["Rajshahi", "Naogaon", "Sapahar"], ["Rajshahi", "Natore", "Gopalpur UPO"], ["Rajshahi", "Natore", "Harua"], ["Rajshahi", "Natore", "Hatgurudaspur"], ["Rajshahi", "Natore", "Laxman"], ["Rajshahi", "Natore", "Natore Sadar"], ["Rajshahi", "Natore", "Singra"], ["Rajshahi", "Pabna", "Banwarinagar"], ["Rajshahi", "Pabna", "Bera"], ["Rajshahi", "Pabna", "Bhangura"], ["Rajshahi", "Pabna", "Chatmohar"], ["Rajshahi", "Pabna", "Debottar"], ["Rajshahi", "Pabna", "Ishwardi"], ["Rajshahi", "Pabna", "Pabna Sadar"], ["Rajshahi", "Pabna", "Sathia"], ["Rajshahi", "Pabna", "Sujanagar"], ["Rajshahi", "Rajshahi", "Bagha"], ["Rajshahi", "Rajshahi", "Bhabaniganj"], ["Rajshahi", "Rajshahi", "Charghat"], ["Rajshahi", "Rajshahi", "Durgapur"], ["Rajshahi", "Rajshahi", "Godagari"], ["Rajshahi", "Rajshahi", "Khod Mohanpur"], ["Rajshahi", "Rajshahi", "Lalitganj"], ["Rajshahi", "Rajshahi", "Putia"], ["Rajshahi", "Rajshahi", "Rajshahi Sadar"], ["Rajshahi", "Rajshahi", "Tanor"], ["Rajshahi", "Sirajganj", "Baiddya Jam Toil"], ["Rajshahi", "Sirajganj", "Belkuchi"], ["Rangpur", "Dinajpur", "Bangla Hili"], ["Rangpur", "Dinajpur", "Biral"], ["Rangpur", "Dinajpur", "Birampur"], ["Rangpur", "Dinajpur", "Birganj"], ["Rangpur", "Dinajpur", "Chrirbandar"], ["Rangpur", "Dinajpur", "Dinajpur Sadar"], ["Rangpur", "Dinajpur", "Khansama"], ["Rangpur", "Dinajpur", "Maharajganj"], ["Rangpur", "Dinajpur", "Nababganj"], ["Rangpur", "Dinajpur", "Osmanpur"], ["Rangpur", "Dinajpur", "Parbatipur"], ["Rangpur", "Dinajpur", "Phulbari"], ["Rangpur", "Dinajpur", "Setabganj"], ["Rangpur", "Gaibandha", "Bonarpara"], ["Rangpur", "Gaibandha", "Gaibandha Sadar"], ["Rangpur", "Gaibandha", "Gobindaganj"], ["Rangpur", "Gaibandha", "Palashbari"], ["Rangpur", "Gaibandha", "Phulchhari"], ["Rangpur", "Gaibandha", "Saadullapur"], ["Rangpur", "Gaibandha", "Sundarganj"], ["Rangpur", "Kurigram", "Bhurungamari"], ["Rangpur", "Kurigram", "Chilmari"], ["Rangpur", "Kurigram", "Kurigram Sadar"], ["Rangpur", "Kurigram", "Nageshwar"], ["Rangpur", "Kurigram", "Rajarhat"], ["Rangpur", "Kurigram", "Rajibpur"], ["Rangpur", "Kurigram", "Roumari"], ["Rangpur", "Kurigram", "Ulipur"], ["Rangpur", "Lalmonirhat", "Aditmari"], ["Rangpur", "Lalmonirhat", "Hatibandha"], ["Rangpur", "Lalmonirhat", "Lalmonirhat Sadar"], ["Rangpur", "Lalmonirhat", "Patgram"], ["Rangpur", "Lalmonirhat", "Tushbhandar"], ["Rangpur", "Nilphamari", "Dimla"], ["Rangpur", "Nilphamari", "Domar"], ["Rangpur", "Nilphamari", "Jaldhaka"], ["Rangpur", "Nilphamari", "Kishoriganj"], ["Rangpur", "Nilphamari", "Nilphamari Sadar"], ["Rangpur", "Nilphamari", "Syedpur"], ["Rangpur", "Panchagarh", "Boda"], ["Rangpur", "Panchagarh", "Chotto Dab"], ["Rangpur", "Panchagarh", "Dabiganj"], ["Rangpur", "Panchagarh", "Panchagra Sadar"], ["Rangpur", "Panchagarh", "Tetulia"], ["Rangpur", "Rangpur", "Badarganj"], ["Rangpur", "Rangpur", "Gangachara"], ["Rangpur", "Rangpur", "Kaunia"], ["Rangpur", "Rangpur", "Mithapukur"], ["Rangpur", "Rangpur", "Pirgachha"], ["Rangpur", "Rangpur", "Rangpur Sadar"], ["Rangpur", "Rangpur", "Taraganj"], ["Rangpur", "Thakurgaon", "Baliadangi"], ["Rangpur", "Thakurgaon", "Jibanpur"], ["Rangpur", "Thakurgaon", "Pirganj"], ["Rangpur", "Thakurgaon", "Rani Sankail"], ["Rangpur", "Thakurgaon", "Thakurgaon Sadar"]];
+function tfThanas(){return _tfGeo}
+async function loadTF(){_tfList=await loadList('thanafare:');renderTF()}
+function renderTF(list){var l=list||_tfList;document.getElementById('tfBody').innerHTML=!l.length?'<tr><td colspan="5" class="empty">No thana fares configured</td></tr>':l.sort(function(a,b){return(a.thana||'').localeCompare(b.thana)}).map(function(t){return'<tr><td class="bold">'+t.thana+'</td><td class="text-muted">'+(t.district||'')+'</td><td class="text-muted">'+(t.division||'')+'</td><td class="r bold">'+fmt(t.maxFare||0)+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editTF(\\x27'+t._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delTF(\\x27'+t._key+'\\x27)">Del</button></td></tr>'}).join('')}
+window.filterTF=function(q){var t=normalize(q);renderTF(_tfList.filter(function(f){return normalize(f.thana).includes(t)||normalize(f.district||'').includes(t)}))}
+window.openAddTF=function(){document.getElementById('tfTitle').textContent='Add Thana Fare';document.getElementById('tfEK').value='';document.getElementById('tfTh').value='';document.getElementById('tfDs').value='';document.getElementById('tfDv').value='';document.getElementById('tfMax').value='';openModal('tfModal')}
+window.tfGeoFilter=function(){var q=document.getElementById('tfTh').value.trim().toLowerCase();var items=tfThanas().filter(function(r){return r[2].toLowerCase().includes(q)}).slice(0,40);var el=document.getElementById('tfThL');el.innerHTML=items.map(function(r){return'<div onclick="tfSelectThana(this.textContent,\\x27'+r[1]+'\\x27,\\x27'+r[0]+'\\x27)">'+r[2]+' ('+r[1]+')</div>'}).join('');el.classList.add('active')}
+window.tfGeoShow=function(){var el=document.getElementById('tfThL');if(!el.innerHTML)tfGeoFilter();el.classList.add('active')}
+window.tfSelectThana=function(th,ds,dv){th=th.replace(/\\s*\\(.*\\)/,'');document.getElementById('tfTh').value=th;document.getElementById('tfDs').value=ds;document.getElementById('tfDv').value=dv;document.getElementById('tfThL').classList.remove('active')}
+document.addEventListener('click',function(e){if(!e.target.closest('.sr-wrap'))document.querySelectorAll('.sr-list').forEach(function(x){x.classList.remove('active')})})
+window.editTF=function(k){var t=_tfList.find(function(x){return x._key===k});if(!t)return;document.getElementById('tfTitle').textContent='Edit Thana Fare';document.getElementById('tfEK').value=k;document.getElementById('tfTh').value=t.thana||'';document.getElementById('tfDs').value=t.district||'';document.getElementById('tfDv').value=t.division||'';document.getElementById('tfMax').value=t.maxFare||'';openModal('tfModal')}
+window.saveTF=async function(){var ek=document.getElementById('tfEK').value;var th=document.getElementById('tfTh').value.trim();var ds=document.getElementById('tfDs').value.trim();var dv=document.getElementById('tfDv').value.trim();var mx=+document.getElementById('tfMax').value||0;
+if(!th){showToast('Please select a thana','warning');return}if(mx<=0){showToast('Please enter a valid max fare','warning');return}
+var dup=_tfList.find(function(x){return x.thana===th&&(!ek||x._key!==ek)});if(dup){showToast('Thana "'+th+'" already has a fare configured','warning');return}
+var data={thana:th,district:ds,division:dv,maxFare:mx};
+try{if(ek){await saveByKey(ek,data,'edit','Updated thana fare: '+th)}else{await saveItem('thanafare:',data,null,'create','Added thana fare: '+th)}invalidateCache('thanafare:');closeModal('tfModal');loadTF();showToast(ek?'Thana fare updated':'Thana fare added','success')}catch(e){showToast('Failed: '+e.message,'error')}}
+window.delTF=async function(k){if(!confirm('Delete this thana fare setting?'))return;var t=_tfList.find(function(x){return x._key===k});await deleteItem(k,false,'Deleted thana fare: '+(t?t.thana:''));invalidateCache('thanafare:');loadTF();showToast('Deleted','success')}
+window.downloadTFTemplate=function(){var ws=XLSX.utils.aoa_to_sheet([['Thana','Max Fare'],['Dhanmondi','50'],['Gulshan','60'],['Uttara','70']]);var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Template');XLSX.writeFile(wb,'thana_fare_template.xlsx')}
+document.getElementById('tfImportFile').addEventListener('change',function(e){var file=e.target.files[0];if(!file)return;var reader=new FileReader();reader.onload=function(ev){try{var wb=XLSX.read(ev.target.result,{type:'array'});var ws=wb.Sheets[wb.SheetNames[0]];var rows=XLSX.utils.sheet_to_json(ws,{defval:''});if(!rows.length){document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--danger)">No data found</span>';return}window._tfImportRows=rows.map(function(r){var thana=String(r['Thana']||r['thana']||r['THANA']||'').trim();var maxFare=parseFloat(r['Max Fare']||r['max fare']||r['MaxFare']||r['Fare']||r['fare']||0)||0;var geo=_tfGeo.find(function(g){return g[2].toLowerCase()===thana.toLowerCase()});return{thana:geo?geo[2]:thana,district:geo?geo[1]:'',division:geo?geo[0]:'',maxFare:maxFare}}).filter(function(r){return r.thana&&r.maxFare>0});var prev=document.getElementById('tfImportPreview');prev.style.display='block';prev.innerHTML='<div style="font-weight:600;margin-bottom:6px">Preview ('+window._tfImportRows.length+' thanas):</div><table class="tbl" style="font-size:11px"><thead><tr><th>Thana</th><th>District</th><th>Division</th><th class="r">Max Fare</th></tr></thead><tbody>'+window._tfImportRows.slice(0,20).map(function(r){return'<tr><td>'+r.thana+'</td><td>'+r.district+'</td><td>'+r.division+'</td><td class="r">'+r.maxFare+'</td></tr>'}).join('')+'</tbody></table>';document.getElementById('tfImportBtn').disabled=false;document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--accent)">'+window._tfImportRows.length+' thanas ready to import</span>'}catch(err){document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--danger)">Error: '+err.message+'</span>'}};reader.readAsArrayBuffer(file)})
+window.doImportTF=async function(){if(!window._tfImportRows||!window._tfImportRows.length)return;document.getElementById('tfImportBtn').disabled=true;document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--primary)">Importing...</span>';var ok=0,fail=0;for(var i=0;i<window._tfImportRows.length;i++){try{var r=window._tfImportRows[i];var dup=_tfList.find(function(x){return x.thana===r.thana});if(dup){await saveByKey(dup._key,{thana:r.thana,district:r.district,division:r.division,maxFare:r.maxFare})}else{await saveItem('thanafare:',{thana:r.thana,district:r.district,division:r.division,maxFare:r.maxFare})}ok++}catch(e){fail++}}invalidateCache('thanafare:');loadTF();closeModal('tfImportModal');showToast('Imported '+ok+' thana fares'+(fail?' ('+fail+' failed)':''),'success');window._tfImportRows=[]}
+loadTF();
+</script>`}
+
+function truckFareReportPage(){return `
+<div class="page-header"><div><div class="page-title">Truck Fare Report</div><div class="page-sub">Thana-wise fare analysis with exceed tracking</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('tfrPrint','Truck Fare Report')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('tfrTbl','TruckFareReport')">Export XLS</button></div></div>
+<div class="card" style="margin-bottom:14px;padding:14px 16px">
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="align-items:end"><div><label>From</label><input type="date" id="tfrFrom" onchange="renderTFR()"></div><div><label>To</label><input type="date" id="tfrTo" onchange="renderTFR()"></div><div><label>Thana</label><select id="tfrThana" onchange="renderTFR()"><option value="">All Thanas</option></select></div><div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:16px"><button class="btn btn-outline btn-xs" onclick="setTFRRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setTFRRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setTFRRange('all')">All Time</button><label style="margin:0;display:inline;font-size:12px"><input type="checkbox" id="tfrOnlyExceed" onchange="renderTFR()"> Only Exceeded</label></div></div></div>
+</div>
+<div class="stats" id="tfrStats"></div>
+<div id="tfrPrint">
+<div class="section-title" style="margin:14px 0 8px">Thana-wise Summary</div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="tfrTbl"><thead><tr><th>Thana</th><th>District</th><th class="r">Total Trips</th><th class="r">Total Fare</th><th class="r">Max Fare Limit</th><th class="r">Exceeded Trips</th><th class="r">Exceed Amount</th><th class="r">Avg Fare</th></tr></thead><tbody id="tfrBody"></tbody></table></div></div>
+<div class="section-title" style="margin:18px 0 8px">Detailed Transactions</div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="tfrDetailTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th>Thana</th><th class="r">Fare</th><th class="r">Max Limit</th><th>Status</th></tr></thead><tbody id="tfrDetailBody"></tbody></table></div></div>
+</div>
+<script>
+var tfrSales=[],tfrFares=[],tfrParties=[];
+async function loadTFR(){var d=await Promise.all([loadList('sale:'),loadList('thanafare:'),loadList('party:')]);tfrSales=d[0];tfrFares=d[1];tfrParties=d[2];
+var thanas={};tfrSales.filter(function(s){return s.truckFare>0}).forEach(function(s){var th=s.customerThana||'';if(th&&!thanas[th])thanas[th]=true});tfrFares.forEach(function(f){if(f.thana&&!thanas[f.thana])thanas[f.thana]=true});
+document.getElementById('tfrThana').innerHTML='<option value="">All Thanas</option>'+Object.keys(thanas).sort().map(function(t){return'<option value="'+t+'">'+t+'</option>'}).join('');
+renderTFR()}
+window.setTFRRange=function(r){var today=new Date();var from='',to=todayISO();
+if(r==='month'){from=today.getFullYear()+'-'+(today.getMonth()+1<10?'0':'')+(today.getMonth()+1)+'-01'}
+else if(r==='year'){from=today.getFullYear()+'-01-01'}
+else{from='';to=''}
+document.getElementById('tfrFrom').value=from;document.getElementById('tfrTo').value=to;renderTFR()}
+window.renderTFR=function(){var from=document.getElementById('tfrFrom').value;var to=document.getElementById('tfrTo').value;var thFilter=document.getElementById('tfrThana').value;var onlyExceed=document.getElementById('tfrOnlyExceed').checked;
+var fareSales=tfrSales.filter(function(s){return s.truckFare>0&&(!from||s.date>=from)&&(!to||s.date<=to)});
+// Build fare map for thanas
+var fareMap={};tfrFares.forEach(function(f){fareMap[f.thana]=f.maxFare||0});
+// Attach max fare to each sale for easy access
+fareSales.forEach(function(s){var th=s.customerThana||'';var perQtyMax=fareMap[th]||0;var saleQty=(s.items||[]).reduce(function(a,it){return a+(it.qty||0)},0)||1;s._maxFarePerQty=perQtyMax;s._maxFare=perQtyMax*saleQty;s._saleQty=saleQty;s._exceeded=s._maxFare>0&&s.truckFare>s._maxFare;s._exceedAmt=s._exceeded?(s.truckFare-s._maxFare):0});
+if(thFilter)fareSales=fareSales.filter(function(s){return s.customerThana===thFilter});
+if(onlyExceed)fareSales=fareSales.filter(function(s){return s._exceeded});
+// Thana-wise aggregation
+var byThana={};fareSales.forEach(function(s){var th=s.customerThana||'Unknown';if(!byThana[th])byThana[th]={thana:th,district:'',trips:0,totalFare:0,maxFarePerQty:0,totalQty:0,exceeded:0,exceedAmt:0};byThana[th].trips++;byThana[th].totalFare+=s.truckFare;byThana[th].maxFarePerQty=s._maxFarePerQty||0;byThana[th].totalQty+=(s._saleQty||0);if(s._exceeded){byThana[th].exceeded++;byThana[th].exceedAmt+=s._exceedAmt}});
+// Fill district from parties
+tfrParties.forEach(function(p){if(p.thana&&byThana[p.thana]&&!byThana[p.thana].district)byThana[p.thana].district=p.district||''});
+tfrFares.forEach(function(f){if(f.thana&&byThana[f.thana]&&!byThana[f.thana].district)byThana[f.thana].district=f.district||''});
+var rows=Object.values(byThana).sort(function(a,b){return b.totalFare-a.totalFare});
+var grandTrips=rows.reduce(function(s,r){return s+r.trips},0);
+var grandFare=rows.reduce(function(s,r){return s+r.totalFare},0);
+var grandExceeded=rows.reduce(function(s,r){return s+r.exceeded},0);
+var grandExceedAmt=rows.reduce(function(s,r){return s+r.exceedAmt},0);
+document.getElementById('tfrStats').innerHTML='<div class="stat"><div class="label">Total Trips</div><div class="value">'+grandTrips+'</div></div><div class="stat"><div class="label">Total Fare</div><div class="value text-info">'+fmt(grandFare)+'</div></div><div class="stat"><div class="label">Exceeded Trips</div><div class="value text-danger">'+grandExceeded+'</div></div><div class="stat"><div class="label">Total Exceed Amount</div><div class="value text-danger">'+fmt(grandExceedAmt)+'</div></div><div class="stat"><div class="label">Avg Fare/Trip</div><div class="value">'+fmt(grandTrips?Math.round(grandFare/grandTrips):0)+'</div></div>';
+document.getElementById('tfrBody').innerHTML=!rows.length?'<tr><td colspan="8" class="empty">No truck fare data</td></tr>':rows.map(function(r){return'<tr><td class="bold">'+r.thana+'</td><td class="text-muted">'+r.district+'</td><td class="r">'+r.trips+'</td><td class="r bold">'+fmt(r.totalFare)+'</td><td class="r">'+(r.maxFarePerQty?fmt(r.maxFarePerQty)+'/qty':'<span class="text-muted">Not set</span>')+'</td><td class="r '+(r.exceeded?'text-danger':'text-success')+'">'+r.exceeded+'</td><td class="r '+(r.exceedAmt?'text-danger':'')+'">'+fmt(r.exceedAmt)+'</td><td class="r text-muted">'+fmt(Math.round(r.totalFare/r.trips))+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="2">TOTAL</td><td class="r">'+grandTrips+'</td><td class="r">'+fmt(grandFare)+'</td><td></td><td class="r">'+grandExceeded+'</td><td class="r">'+fmt(grandExceedAmt)+'</td><td class="r">'+fmt(grandTrips?Math.round(grandFare/grandTrips):0)+'</td></tr>';
+// Detail table
+fareSales.sort(function(a,b){return(b.date||'').localeCompare(a.date)});
+document.getElementById('tfrDetailBody').innerHTML=!fareSales.length?'<tr><td colspan="7" class="empty">No data</td></tr>':fareSales.map(function(s){var status=s._maxFare>0?(s._exceeded?'<span class="badge badge-danger">Exceeded (+'+fmt(s._exceedAmt)+')</span>':'<span class="badge badge-success">OK</span>'):'<span class="badge badge-cash">No limit</span>';return'<tr><td>'+s.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+s._key+'\\x27)">'+s.invoiceNo+'</span></td><td>'+s.customerName+'</td><td>'+(s.customerThana||'-')+'</td><td class="r bold">'+fmt(s.truckFare)+'</td><td class="r">'+(s._maxFarePerQty?fmt(s._maxFarePerQty)+'/qty x'+s._saleQty+'='+fmt(s._maxFare):'-')+'</td><td>'+status+'</td></tr>'}).join('')}
+loadTFR();
+</script>`}
 
 export default app
 
@@ -675,6 +727,7 @@ label{display:block;font-size:10px;font-weight:700;color:var(--muted);margin-bot
 .bottom-nav{display:none !important}
 .fab{display:none !important}
 }
+.filter-toggle{cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:10px;user-select:none;-webkit-tap-highlight-color:transparent}.filter-toggle:hover{background:var(--bg)}.filter-toggle .ft-label{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;display:flex;align-items:center;gap:6px}.filter-toggle .ft-arrow{transition:transform .2s;font-size:18px;color:var(--muted)}.filter-toggle.open .ft-arrow{transform:rotate(180deg)}.filter-body{display:none;animation:filterSlide .2s ease}.filter-body.open{display:block}@keyframes filterSlide{from{opacity:0;max-height:0}to{opacity:1;max-height:500px}}
 </style>`;
 }
 
@@ -688,10 +741,10 @@ function layout(content: string, active: string, session: any) {
   
   // Role-based access control map
   const roleAccess: Record<string, string[]> = {
-    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog'],
-    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog'],
-    entry: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','daydetails'],
-    viewer: ['dashboard','stockcheck','reports','profitloss','balancesheet','trialbalance','stock','recpay','ledger','expledger','daydetails'],
+    admin: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','users','admin','companysettings','approvals','modlog','truckfarereport','truckfaresettings'],
+    manager: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','expledger','profitloss','balancesheet','trialbalance','recpay','reports','stock','salesperson','daydetails','approvals','modlog','truckfarereport','truckfaresettings'],
+    entry: ['dashboard','inventory','stockcheck','parties','purchases','sales','payments','expenses','orders','ledger','daydetails','truckfarereport','reports'],
+    viewer: ['dashboard','stockcheck','reports','profitloss','balancesheet','trialbalance','stock','recpay','ledger','expledger','daydetails','truckfarereport'],
   };
   const allowed = roleAccess[role] || roleAccess['viewer'];
   
@@ -721,10 +774,13 @@ function layout(content: string, active: string, session: any) {
       { path:"/balance-sheet", icon:"account_balance", label:"Balance Sheet", id:"balancesheet" },
       { path:"/trial-balance", icon:"balance", label:"Trial Balance", id:"trialbalance" },
       { path:"/stock", icon:"warehouse", label:"Stock & Valuation", id:"stock" },
+      { path:"/truck-fare-report", icon:"local_shipping", label:"Truck Fare Report", id:"truckfarereport" },
+
     ]},
     { group: 'System', items: [
       { path:"/users", icon:"manage_accounts", label:"Users & Access", id:"users" },
       { path:"/salesperson", icon:"badge", label:"Salesperson Mgmt", id:"salesperson" },
+      { path:"/truck-fare-settings", icon:"local_shipping", label:"Truck Fare Settings", id:"truckfaresettings" },
       { path:"/approvals", icon:"task_alt", label:"Approval Queue", id:"approvals" },
       { path:"/company-settings", icon:"domain", label:"Company Settings", id:"companysettings" },
       { path:"/admin", icon:"settings", label:"Admin", id:"admin" },
@@ -805,9 +861,9 @@ window.loadDocPreview=async function(type,key){
   var html='';
   if(type==='sale'){html=await buildSaleInvoice(data);}
   else if(type==='purchase'){html=buildPurchaseInvoice(data);}
-  else if(type==='payment'||type==='receipt'){html=buildVoucher(data);}
+  else if(type==='payment'||type==='receipt'){html=await buildVoucher(data);}
   else if(type==='expense'){html=buildExpenseVoucher(data);}
-  else if(type==='transfer'){html=buildVoucher(data);}
+  else if(type==='transfer'){html=await buildVoucher(data);}
   else{html='<pre>'+JSON.stringify(data,null,2)+'</pre>';}
   document.getElementById('docPreviewContent').innerHTML='<div id="docPrintArea">'+html+'</div>';
 };
@@ -840,9 +896,49 @@ window.buildPurchaseInvoice=function(p){
   var base=sub-(p.discount||0)+(p.extra||0);var vatAmt=(p.vatType==='percent')?(base*(p.vat||0)/100):(p.vat||0);
   return '<div style="max-width:700px;margin:0 auto">'+getCompanyHeader()+'<div style="display:flex;justify-content:space-between;border-bottom:2px solid #333;padding-bottom:10px;margin-bottom:12px"><div><h2 style="margin:0;font-size:18px">PURCHASE INVOICE</h2><b>No:</b> '+p.purchaseNo+'</div><div style="text-align:right"><b>Date:</b> '+p.date+'<br><b>Supplier:</b> '+p.supplierName+'</div></div><table class="tbl"><thead><tr style="background:#f3f3f3"><th>#</th><th>Item</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>'+(p.items||[]).map(function(it,i){return'<tr><td>'+(i+1)+'</td><td>'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r">'+fmt(it.amount)+'</td></tr>';}).join('')+'</tbody></table><div style="display:flex;justify-content:flex-end;margin-top:12px"><div style="width:260px;line-height:1.8;font-size:12px"><div style="display:flex;justify-content:space-between"><span>Subtotal:</span><span>'+fmt(sub)+'</span></div><div style="display:flex;justify-content:space-between;color:#dc2626"><span>Discount:</span><span>-'+fmt(p.discount||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>Extra:</span><span>+'+fmt(p.extra||0)+'</span></div><div style="display:flex;justify-content:space-between"><span>VAT:</span><span>+'+fmt(vatAmt)+'</span></div><div style="display:flex;justify-content:space-between;font-weight:800;font-size:14px;border-top:2px solid #333;margin-top:4px;padding-top:4px"><span>Total:</span><span>'+fmt(p.total)+'</span></div><div style="display:flex;justify-content:space-between;color:#059669"><span>Paid:</span><span>'+fmt(p.paid)+'</span></div><div style="display:flex;justify-content:space-between;border-top:1px dashed #666"><span>Balance:</span><span>'+fmt((p.total||0)-(p.paid||0))+'</span></div></div></div></div>';
 };
-window.buildVoucher=function(p){
+window.buildVoucher=async function(p){
   if(!p)return'';
-  return '<div style="max-width:500px;margin:0 auto;border:2px solid #333;padding:20px">'+getCompanyHeader()+'<div style="display:flex;justify-content:space-between;border-bottom:1px solid #333;padding-bottom:8px"><h2 style="margin:0;font-size:16px">'+(p.type||'').toUpperCase()+' VOUCHER</h2><b>'+p.no+'</b></div><div style="margin:16px 0;line-height:2"><b>Date:</b> '+p.date+'<br><b>Party:</b> '+(p.party||'')+'<br><b>Method:</b> '+(p.method||'').toUpperCase()+(p.chequeNo?' (Chq: '+p.chequeNo+')':'')+'<br><b>Note:</b> '+(p.note||'N/A')+'<br><br><div style="font-size:22px;font-weight:bold">Amount: '+fmt(p.amount)+'</div></div><div style="margin-top:40px;display:flex;justify-content:space-between"><span>________________<br>Receiver</span><span>________________<br>Authorized</span></div></div>';
+  var vType=(p.type||'').toUpperCase();
+  var title=vType==='RECEIPT'?'RECEIPT VOUCHER':vType==='PAYMENT'?'PAYMENT VOUCHER':vType==='TRANSFER'?'TRANSFER VOUCHER':vType+' VOUCHER';
+  var subtitle=vType==='RECEIPT'?'Money Received':vType==='PAYMENT'?'Money Paid':vType==='TRANSFER'?'Fund Transfer':'Transaction';
+  var bankLine=(p.bankName&&p.method!=='cash')?'<br><b>Bank:</b> '+p.bankName:'';
+  var chequeLine=p.chequeNo?'<br><b>Cheque No:</b> '+p.chequeNo:'';
+  var billLine=(p.billKeys&&p.billKeys.length)?'<br><b>Applied to:</b> '+p.billKeys.length+' bill(s)':'';
+  var autoLine=p._autoInvoice?'<br><b>Ref Invoice:</b> '+p._autoInvoice:'';
+  // Calculate previous balance for the party (like sales invoice)
+  var prevBal=0;var curBal=0;var partyType='';
+  try{
+    var allParties=await cachedList('party:',30000);
+    var partyRec=allParties.find(function(x){return x.name===p.party});
+    if(partyRec){
+      partyType=partyRec.type||'';
+      var ob=Number(partyRec.openingBalance)||0;
+      if(partyRec.type==='customer'){
+        var allSales=await cachedList('sale:',30000);
+        var allPays=await cachedList('payment:',30000);
+        var cSales=allSales.filter(function(s){return s.customerId===partyRec._key});
+        var cReceipts=allPays.filter(function(x){return x.party===p.party&&x.type==='receipt'&&x.status==='done'&&!x._autoInvoice&&!(x.billKeys&&x.billKeys.length)});
+        var totalBilled=cSales.reduce(function(s,x){return s+(Number(x.total)||0)},0)+(ob>0?ob:0);
+        var totalCollected=cSales.reduce(function(s,x){return s+(Number(x.paid)||0)},0)+cReceipts.reduce(function(s,x){return s+(Number(x.amount)||0)},0)+(ob<0?Math.abs(ob):0);
+        prevBal=totalBilled-totalCollected;
+        curBal=prevBal-(Number(p.amount)||0);
+      }else if(partyRec.type==='supplier'){
+        var allPurchases=await cachedList('purchase:',30000);
+        var allPays2=await cachedList('payment:',30000);
+        var sPur=allPurchases.filter(function(x){return x.supplierId===partyRec._key});
+        var sPays=allPays2.filter(function(x){return x.party===p.party&&x.type==='payment'&&x.status==='done'&&!x._autoInvoice&&!(x.billKeys&&x.billKeys.length)});
+        var totalOwed=sPur.reduce(function(s,x){return s+(Number(x.total)||0)},0)+(ob>0?ob:0);
+        var totalPaidS=sPur.reduce(function(s,x){return s+(Number(x.paid)||0)},0)+sPays.reduce(function(s,x){return s+(Number(x.amount)||0)},0)+(ob<0?Math.abs(ob):0);
+        prevBal=totalOwed-totalPaidS;
+        curBal=prevBal-(Number(p.amount)||0);
+      }
+    }
+  }catch(e){}
+  var balSection='';
+  if(p.party&&vType!=='TRANSFER'){
+    balSection='<div style="border-top:2px solid #333;margin-top:12px;padding-top:10px"><div style="display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin-bottom:4px"><span>Previous Balance:</span><span>'+fmt(Math.abs(prevBal))+' '+(prevBal>0?'Dr':'Cr')+'</span></div><div style="display:flex;justify-content:space-between;font-size:13px;font-weight:800;color:'+(curBal>0?'#dc2626':'#059669')+'"><span>Current Balance:</span><span>'+fmt(Math.abs(curBal))+' '+(curBal>0?'Dr':'Cr')+'</span></div></div>';
+  }
+  return '<div style="max-width:500px;margin:0 auto;border:2px solid #333;padding:20px">'+getCompanyHeader()+'<div style="display:flex;justify-content:space-between;border-bottom:2px solid #333;padding-bottom:8px;margin-bottom:14px"><div><h2 style="margin:0;font-size:16px">'+title+'</h2><div style="font-size:11px;color:#666;margin-top:2px">'+subtitle+'</div></div><b style="font-size:14px">'+p.no+'</b></div><div style="margin:16px 0;line-height:2.2;font-size:13px"><b>Date:</b> '+p.date+'<br><b>Party:</b> <span style="font-weight:700;font-size:14px">'+(p.party||'')+'</span>'+(partyType?'<span style="font-size:10px;color:#666;margin-left:6px">('+partyType.charAt(0).toUpperCase()+partyType.slice(1)+')</span>':'')+'<br><b>Method:</b> <span style="text-transform:uppercase">'+(p.method||'')+'</span>'+bankLine+chequeLine+billLine+autoLine+'<br><b>Note:</b> '+(p.note||'N/A')+'</div><div style="background:#f3f3f3;border-radius:8px;padding:16px;margin:20px 0;text-align:center"><div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Amount</div><div style="font-size:26px;font-weight:800">'+fmt(p.amount)+'</div></div>'+balSection+'<div style="margin-top:40px;display:flex;justify-content:space-between;font-size:12px"><div style="text-align:center"><div style="border-top:1px solid #333;width:120px;margin-bottom:4px"></div>Receiver</div><div style="text-align:center"><div style="border-top:1px solid #333;width:120px;margin-bottom:4px"></div>Authorized By</div></div></div>';
 };
 window.buildExpenseVoucher=function(e){
   if(!e)return'';
@@ -982,6 +1078,8 @@ window.getCompanyHeader=function(){
             {p:'/balance-sheet',i:'account_balance',l:'Balance Sheet',id:'balancesheet'},
             {p:'/trial-balance',i:'balance',l:'Trial Balance',id:'trialbalance'},
             {p:'/stock',i:'warehouse',l:'Stock & Valuation',id:'stock'},
+            {p:'/truck-fare-report',i:'local_shipping',l:'Truck Fare Report',id:'truckfarereport'},
+            {p:'/truck-fare-settings',i:'local_shipping',l:'Truck Fare Settings',id:'truckfaresettings'},
           ]},
           {group:'System',items:[
             {p:'/users',i:'manage_accounts',l:'Users & Access',id:'users'},
@@ -1049,7 +1147,7 @@ window.toggleBnavMore=function(){
 })();
 // Mobile: Update page title in header
 (function(){
-  var titleMap={dashboard:'Dashboard',inventory:'Inventory',stockcheck:'Stock Check',parties:'Customers & Suppliers',purchases:'Purchases',sales:'Sales',payments:'Accounts & Banking',expenses:'Expenses',ledger:'Ledger',expledger:'Expense Ledger',profitloss:'Profit & Loss',balancesheet:'Balance Sheet',trialbalance:'Trial Balance',stock:'Stock & Valuation',recpay:'Receivable/Payable',daydetails:'Day Details',reports:'Reports',salesperson:'Salesperson',orders:'Orders',users:'Users & Access',admin:'Admin',modlog:'Mod Log',approvals:'Approvals',companysettings:'Company Settings'};
+  var titleMap={dashboard:'Dashboard',inventory:'Inventory',stockcheck:'Stock Check',parties:'Customers & Suppliers',purchases:'Purchases',sales:'Sales',payments:'Accounts & Banking',expenses:'Expenses',ledger:'Ledger',expledger:'Expense Ledger',profitloss:'Profit & Loss',balancesheet:'Balance Sheet',trialbalance:'Trial Balance',stock:'Stock & Valuation',recpay:'Receivable/Payable',daydetails:'Day Details',reports:'Reports',salesperson:'Salesperson',orders:'Orders',users:'Users & Access',admin:'Admin',modlog:'Mod Log',approvals:'Approvals',companysettings:'Company Settings',truckfarereport:'Truck Fare Report',truckfaresettings:'Truck Fare Settings'};
   var mhTitle=document.querySelector('.mh-title');
   if(mhTitle&&titleMap['${active}'])mhTitle.textContent=titleMap['${active}'];
 })();
@@ -1090,7 +1188,7 @@ if(cs.primaryColor){document.documentElement.style.setProperty('--primary',cs.pr
 </body></html>`;
 }
 function expiredPage() { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>License Expired</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><div class="login-card"><h2>License Expired</h2><div class="sub">Please renew.</div></div></div></body></html>`; }
-function spLoginPage(msg: string) { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SP Portal</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><form class="login-card" method="POST" action="/sp-portal/login"><h2>Salesperson Portal</h2><div class="sub">Enter code and PIN</div>${msg?`<div class="err">${msg}</div>`:''}<input name="code" placeholder="Code" style="text-align:center" required><input type="password" name="pin" placeholder="PIN" style="text-align:center" required><button type="submit" class="btn btn-primary">Login</button><div style="margin-top:12px"><a href="/login" style="font-size:11px;color:var(--muted)">Admin Login</a></div></form></div></body></html>`; }
+function spLoginPage(msg: string) { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><meta name="theme-color" content="#1e1b4b"><meta name="apple-mobile-web-app-capable" content="yes"><title>SP Portal</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><form class="login-card" method="POST" action="/sp-portal/login"><h2>Salesperson Portal</h2><div class="sub">Enter code and PIN</div>${msg?`<div class="err">${msg}</div>`:''}<input name="code" placeholder="Code" style="text-align:center" required><input type="password" name="pin" placeholder="PIN" style="text-align:center" required><button type="submit" class="btn btn-primary">Login</button><div style="margin-top:12px"><a href="/login" style="font-size:11px;color:var(--muted)">Admin Login</a></div></form></div></body></html>`; }
 function spPortalPage(c: any) {
   const cookie = c.req.header("Cookie") || "";
   const spMatch = cookie.match(/sp_session=([^;]+)/);
@@ -1099,42 +1197,171 @@ function spPortalPage(c: any) {
   const spId = spSession.spId || '';
   const spName = spSession.spName || 'Salesperson';
   const spCode = spSession.spCode || '';
-  return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SP Portal - ${escapeHtml(spName)}</title>
+  return `<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#1e1b4b"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>SP Portal - ${escapeHtml(spName)}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
 ${getCSS()}
-</head><body style="background:var(--bg);padding:20px">
-<div style="max-width:900px;margin:0 auto">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-<div><h2 style="margin:0">Salesperson Portal</h2><p class="text-muted" style="margin:4px 0 0">Welcome, <b>${escapeHtml(spName)}</b> (${escapeHtml(spCode)})</p></div>
-<a href="/sp-portal/logout" class="btn btn-outline btn-sm">Logout</a>
+<style>
+/* SP Portal Mobile-First Styles */
+.sp-app{min-height:100vh;background:var(--bg)}
+.sp-header{position:fixed;top:0;left:0;right:0;z-index:40;background:linear-gradient(135deg,#1e1b4b,#312e81);color:#fff;padding:env(safe-area-inset-top,0) 0 0}
+.sp-header-inner{display:flex;align-items:center;justify-content:space-between;padding:12px 16px}
+.sp-header h2{font-size:16px;font-weight:700;margin:0;letter-spacing:-.2px}
+.sp-header .sp-user{font-size:11px;opacity:.7;margin-top:1px}
+.sp-header .sp-logout{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);color:#fff;padding:6px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:4px;transition:all .2s;-webkit-tap-highlight-color:transparent}
+.sp-header .sp-logout:hover{background:rgba(255,255,255,.2)}
+.sp-header .sp-logout .material-symbols-outlined{font-size:16px}
+.sp-body{padding:calc(72px + env(safe-area-inset-top,0)) 16px calc(68px + env(safe-area-inset-bottom,4px)) 16px;max-width:960px;margin:0 auto}
+/* SP Bottom Tab Navigation */
+.sp-bnav{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--border);z-index:40;padding:4px 0 env(safe-area-inset-bottom,4px);box-shadow:0 -2px 10px rgba(0,0,0,.06)}
+.sp-bnav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:6px 2px;cursor:pointer;color:var(--muted);border:none;background:none;font-family:inherit;-webkit-tap-highlight-color:transparent;transition:color .2s;position:relative}
+.sp-bnav-item .sp-bnav-icon{font-size:22px;line-height:1;transition:all .2s}
+.sp-bnav-item .sp-bnav-label{font-size:9px;font-weight:600;margin-top:2px;letter-spacing:.2px}
+.sp-bnav-item.active{color:var(--primary)}
+.sp-bnav-item.active .sp-bnav-icon{transform:translateY(-2px);font-variation-settings:'FILL' 1}
+.sp-bnav-item.active::before{content:'';position:absolute;top:-1px;left:50%;transform:translateX(-50%);width:36px;height:3px;background:var(--primary);border-radius:0 0 3px 3px}
+.sp-bnav-item:active{opacity:.7}
+/* Desktop top tabs (visible on desktop, hidden on mobile) */
+.sp-tabs-desktop{display:flex;gap:3px;background:var(--bg);border-radius:8px;padding:3px;margin-bottom:14px;width:fit-content;border:1px solid var(--border)}
+.sp-tabs-desktop .tab{padding:6px 14px;border:none;border-radius:6px;background:transparent;color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;transition:var(--transition)}
+.sp-tabs-desktop .tab.active{background:var(--card);color:var(--primary);box-shadow:var(--shadow)}
+/* Order item cards for mobile */
+.sp-item-card{background:var(--bg);border-radius:10px;padding:12px;margin-bottom:8px;border:1px solid var(--border)}
+.sp-item-card .sp-item-row{display:grid;grid-template-columns:1fr;gap:8px}
+.sp-item-card .sp-item-footer{display:flex;justify-content:space-between;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid var(--border)}
+.sp-item-card .sp-item-amt{font-weight:700;font-size:15px;color:var(--primary)}
+.sp-item-card .sp-item-rm{background:var(--danger-light);color:var(--danger);border:none;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}
+/* Order total bar */
+.sp-total-bar{position:sticky;bottom:0;background:var(--card);border-top:2px solid var(--primary);padding:14px 16px;border-radius:12px 12px 0 0;margin:12px -16px 0;display:flex;justify-content:space-between;align-items:center;box-shadow:0 -4px 12px rgba(0,0,0,.06)}
+.sp-total-bar .sp-total-label{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.3px}
+.sp-total-bar .sp-total-value{font-size:20px;font-weight:800;color:var(--primary)}
+/* Mobile order card list */
+.sp-order-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:8px}
+.sp-order-card .sp-oc-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
+.sp-order-card .sp-oc-no{font-weight:700;font-size:13px}
+.sp-order-card .sp-oc-date{font-size:11px;color:var(--muted)}
+.sp-order-card .sp-oc-cust{font-size:12px;color:var(--text);margin-bottom:4px}
+.sp-order-card .sp-oc-bottom{display:flex;justify-content:space-between;align-items:center}
+.sp-order-card .sp-oc-total{font-weight:700;font-size:15px}
+/* Mobile customer card */
+.sp-cust-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:8px}
+.sp-cust-card .sp-cc-name{font-weight:700;font-size:14px;margin-bottom:2px}
+.sp-cust-card .sp-cc-info{font-size:12px;color:var(--muted);margin-bottom:6px}
+.sp-cust-card .sp-cc-stats{display:flex;gap:16px}
+.sp-cust-card .sp-cc-stat{text-align:center}
+.sp-cust-card .sp-cc-stat .label{font-size:9px;text-transform:uppercase;letter-spacing:.3px;color:var(--muted);font-weight:600}
+.sp-cust-card .sp-cc-stat .value{font-size:14px;font-weight:700}
+/* Mobile report controls */
+.sp-rpt-controls{display:flex;flex-direction:column;gap:8px}
+.sp-rpt-actions{display:flex;gap:6px;margin-top:4px}
+/* Responsive breakpoints */
+@media(min-width:769px){
+  .sp-bnav{display:none !important}
+  .sp-tabs-desktop{display:flex}
+  .sp-body{padding:calc(72px + env(safe-area-inset-top,0)) 28px 28px;max-width:960px}
+  .sp-header-inner{padding:14px 28px}
+  .sp-header h2{font-size:18px}
+  .sp-item-card .sp-item-row{grid-template-columns:2fr 70px 90px 90px 34px;align-items:end;gap:8px}
+  .sp-order-cards{display:none}
+  .sp-order-table{display:block}
+  .sp-cust-cards{display:none}
+  .sp-cust-table{display:block}
+  .sp-rpt-controls{flex-direction:row;align-items:end}
+  .sp-total-bar{margin:12px 0 0;border-radius:12px;position:static}
+}
+@media(max-width:768px){
+  .sp-bnav{display:flex}
+  .sp-tabs-desktop{display:none !important}
+  .sp-item-card .sp-item-row{grid-template-columns:1fr 1fr}
+  .sp-item-card .sp-item-row .sp-item-product{grid-column:1/-1}
+  .sp-order-table{display:none}
+  .sp-order-cards{display:block}
+  .sp-cust-table{display:none}
+  .sp-cust-cards{display:block}
+  .sp-body .card{border-radius:10px;padding:14px}
+  .sp-rpt-controls{flex-direction:column}
+  .sp-rpt-actions{flex-wrap:wrap}
+}
+@media(max-width:400px){
+  .sp-header h2{font-size:14px}
+  .sp-header .sp-user{font-size:10px}
+  .sp-item-card{padding:10px}
+}
+@media(max-height:500px) and (max-width:768px){
+  .sp-bnav .sp-bnav-item{padding:3px 2px}
+  .sp-bnav .sp-bnav-icon{font-size:20px}
+  .sp-bnav .sp-bnav-label{font-size:8px;margin-top:1px}
+  .sp-body{padding-bottom:56px}
+}
+</style>
+</head><body>
+<div class="sp-app">
+<!-- Fixed Header -->
+<div class="sp-header">
+<div class="sp-header-inner">
+<div><h2><span class="material-symbols-outlined" style="font-size:20px;vertical-align:middle;margin-right:4px">storefront</span>SP Portal</h2><div class="sp-user">Welcome, <b>${escapeHtml(spName)}</b> (${escapeHtml(spCode)})</div></div>
+<a href="/sp-portal/logout" class="sp-logout"><span class="material-symbols-outlined">logout</span>Logout</a>
 </div>
-<div class="tabs" style="margin-bottom:14px"><button class="tab active" id="tabPlace" onclick="switchSPTab('place')">Place Order</button><button class="tab" id="tabOrders" onclick="switchSPTab('orders')">My Orders</button><button class="tab" id="tabReports" onclick="switchSPTab('reports')">My Reports</button><button class="tab" id="tabCustomers" onclick="switchSPTab('customers')">My Customers</button></div>
+</div>
+<!-- Main Content -->
+<div class="sp-body">
+<!-- Desktop-only top tabs -->
+<div class="sp-tabs-desktop"><button class="tab active" id="tabPlace" onclick="switchSPTab('place')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">add_shopping_cart</span> Place Order</button><button class="tab" id="tabOrders" onclick="switchSPTab('orders')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">list_alt</span> My Orders</button><button class="tab" id="tabReports" onclick="switchSPTab('reports')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">bar_chart</span> My Reports</button><button class="tab" id="tabCustomers" onclick="switchSPTab('customers')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">group</span> My Customers</button></div>
+
 <div id="placeSection">
 <div class="card">
-<h3 style="font-size:15px;margin-bottom:14px">New Order</h3>
-<div class="form-row"><div><label style="font-size:12px">Customer</label><select id="spCust" style="padding:12px 14px;font-size:14px"></select></div><div><label style="font-size:12px">Date</label><input type="date" id="spDate" style="padding:12px 14px;font-size:14px"></div></div>
+<h3 style="font-size:15px;margin-bottom:14px"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle;color:var(--primary)">shopping_cart</span> New Order</h3>
+<div class="form-row"><div><label>Customer</label><select id="spCust"></select></div><div><label>Date</label><input type="date" id="spDate"></div></div>
 <div id="spItems"></div>
-<div style="margin:12px 0;display:flex;gap:8px"><button class="btn btn-outline" onclick="addSPItem()" style="padding:10px 16px;font-size:13px">+ Add Item</button><button class="btn btn-primary" onclick="submitOrd()" style="padding:10px 20px;font-size:13px">Submit Order</button></div>
-<div id="spTotal" style="font-weight:700;font-size:17px;margin-top:10px;color:var(--primary)"></div>
+<div style="margin:12px 0;display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-outline" onclick="addSPItem()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">add</span> Add Item</button><button class="btn btn-primary" onclick="submitOrd()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">send</span> Submit Order</button></div>
+<div id="spTotal" class="sp-total-bar" style="display:none"><div><div class="sp-total-label">Order Total</div><div class="sp-total-value" id="spTotalVal">0</div></div><button class="btn btn-primary" onclick="submitOrd()" style="padding:10px 20px"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">send</span> Submit</button></div>
 </div>
 </div>
+
 <div id="ordersSection" class="hidden">
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th class="r">Total</th><th>Status</th></tr></thead><tbody id="spOrdBody"></tbody></table></div></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:end"><div class="search-wrap" style="margin-bottom:0;max-width:220px"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search orders..." oninput="filterSPOrders()" id="spOrdSearch" style="padding:10px 10px 10px 34px;font-size:13px"></div><div><label style="font-size:9px;font-weight:700;color:var(--muted)">Status</label><select id="spOrdStatusF" onchange="filterSPOrders()" style="font-size:12px;padding:10px 8px"><option value="">All</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="denied">Denied</option></select></div><div><label style="font-size:9px;font-weight:700;color:var(--muted)">From</label><input type="date" id="spOrdFromF" onchange="filterSPOrders()" style="font-size:12px;padding:10px 8px"></div><div><label style="font-size:9px;font-weight:700;color:var(--muted)">To</label><input type="date" id="spOrdToF" onchange="filterSPOrders()" style="font-size:12px;padding:10px 8px"></div></div>
+<!-- Desktop table -->
+<div class="sp-order-table card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th class="r">Total</th><th>Status</th></tr></thead><tbody id="spOrdBody"></tbody></table></div></div>
+<!-- Mobile card list -->
+<div class="sp-order-cards" id="spOrdCards"></div>
 </div>
+<!-- Order Detail Modal -->
+<div style="display:none;position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.5);backdrop-filter:blur(2px)" id="spOrdDetailOverlay" onclick="if(event.target===this)closeSPOrdDetail()">
+<div style="position:absolute;bottom:0;left:0;right:0;max-height:90vh;background:var(--card);border-radius:20px 20px 0 0;padding:20px 16px;overflow-y:auto;animation:slideUp .3s ease" id="spOrdDetailInner">
+<div style="width:36px;height:4px;background:var(--border-dark);border-radius:2px;margin:0 auto 14px"></div>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0;font-size:16px">Order Details</h3><button style="background:none;border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer" onclick="closeSPOrdDetail()">Close</button></div>
+<div id="spOrdDetailContent"></div>
+</div>
+</div>
+
 <div id="reportsSection" class="hidden">
 <div class="card" style="margin-bottom:14px">
-<h3 style="font-size:15px;margin-bottom:10px">My Sales Reports</h3>
-<div class="form-row"><div><label>Report</label><select id="spRptType" style="padding:10px 12px;font-size:13px"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer Breakdown</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option></select></div><div><label>From</label><input type="date" id="spRptFrom" style="padding:10px 12px;font-size:13px"></div><div><label>To</label><input type="date" id="spRptTo" style="padding:10px 12px;font-size:13px"></div></div>
-<div style="margin-top:8px"><button class="btn btn-primary" onclick="renderSPReport()" style="padding:10px 20px;font-size:13px"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button> <button class="btn btn-outline" onclick="exportXLS('spRptTbl','SP_Report')" style="padding:10px 14px;font-size:13px">Export XLS</button></div>
+<h3 style="font-size:15px;margin-bottom:10px"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle;color:var(--primary)">bar_chart</span> My Sales Reports</h3>
+<div class="sp-rpt-controls"><div style="flex:1;min-width:150px"><label>Report</label><select id="spRptType"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option><option value="date-sales">Date-wise Sales</option><option value="customer-outstanding">Customer Outstanding</option></select></div><div style="min-width:120px"><label>From</label><input type="date" id="spRptFrom"></div><div style="min-width:120px"><label>To</label><input type="date" id="spRptTo"></div></div>
+<div class="sp-rpt-actions" style="margin-top:8px"><button class="btn btn-primary" onclick="renderSPReport()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button><button class="btn btn-outline" onclick="exportXLS('spRptTbl','SP_Report')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">download</span> Export</button></div>
 </div>
 <div id="spRptPlaceholder" class="rpt-placeholder"><span class="material-symbols-outlined">assessment</span><p>Select report type and date range, then click <b>View Report</b></p></div>
 <div id="spRptContent" class="hidden"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="spRptTbl"><thead id="spRptHead"></thead><tbody id="spRptBody"></tbody><tfoot id="spRptFoot"></tfoot></table></div></div></div>
 </div>
+
 <div id="customersSection" class="hidden">
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Customer Name</th><th>Phone</th><th>Address</th><th class="r">Total Sales</th><th class="r">Outstanding</th></tr></thead><tbody id="spCustListBody"></tbody></table></div></div>
+<!-- Desktop table -->
+<div class="sp-cust-table card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Customer Name</th><th>Phone</th><th>Address</th><th class="r">Total Sales</th><th class="r">Outstanding</th></tr></thead><tbody id="spCustListBody"></tbody></table></div></div>
+<!-- Mobile card list -->
+<div class="sp-cust-cards" id="spCustCards"></div>
 </div>
 </div>
+<!-- Bottom Navigation (mobile only) -->
+<nav class="sp-bnav" id="spBnav">
+<button class="sp-bnav-item active" data-tab="place" onclick="switchSPTab('place')"><span class="material-symbols-outlined sp-bnav-icon">add_shopping_cart</span><span class="sp-bnav-label">Order</span></button>
+<button class="sp-bnav-item" data-tab="orders" onclick="switchSPTab('orders')"><span class="material-symbols-outlined sp-bnav-icon">list_alt</span><span class="sp-bnav-label">Orders</span></button>
+<button class="sp-bnav-item" data-tab="reports" onclick="switchSPTab('reports')"><span class="material-symbols-outlined sp-bnav-icon">bar_chart</span><span class="sp-bnav-label">Reports</span></button>
+<button class="sp-bnav-item" data-tab="customers" onclick="switchSPTab('customers')"><span class="material-symbols-outlined sp-bnav-icon">group</span><span class="sp-bnav-label">Customers</span></button>
+</nav>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"><\/script>
 <script>
 window.api=async function(p,b){var r=await fetch(p,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(b||{})});return r.json();};
 window.loadList=async function(p){return api(\'/api/list\',{prefix:p});};
@@ -1142,6 +1369,7 @@ window.saveItem=async function(p,d){return api(\'/api/save\',{prefix:p,data:d});
 window.fmt=function(n){return Number(n||0).toLocaleString(\'en-IN\');};
 window.todayISO=function(){return new Date().toISOString().slice(0,10);};
 window.txnNo=function(p){return p+\'-\'+todayISO().replace(/-/g,\'\')+\'-\'+Math.random().toString(36).slice(2,7).toUpperCase();};
+window.exportXLS=function(tableId,fileName){try{var tbl=document.getElementById(tableId);if(!tbl)return;var wb=XLSX.utils.table_to_book(tbl,{sheet:\'Sheet1\'});XLSX.writeFile(wb,(fileName||\'export\')+\'.xlsx\');}catch(e){alert(\'Export failed: \'+e.message);}};
 var spP=[],spC=[],spI=[{pk:\'\',pn:\'\',q:1,r:0,a:0}],spOrders=[],spSales=[];
 var SP_ID=\'${escapeHtml(spId)}\';
 var SP_NAME=\'${escapeHtml(spName)}\';
@@ -1151,12 +1379,16 @@ window.switchSPTab=function(t){
   document.getElementById(\'ordersSection\').classList.toggle(\'hidden\',t!==\'orders\');
   document.getElementById(\'reportsSection\').classList.toggle(\'hidden\',t!==\'reports\');
   document.getElementById(\'customersSection\').classList.toggle(\'hidden\',t!==\'customers\');
-  document.getElementById(\'tabPlace\').classList.toggle(\'active\',t===\'place\');
-  document.getElementById(\'tabOrders\').classList.toggle(\'active\',t===\'orders\');
-  document.getElementById(\'tabReports\').classList.toggle(\'active\',t===\'reports\');
-  document.getElementById(\'tabCustomers\').classList.toggle(\'active\',t===\'customers\');
-  if(t===\'orders\')renderSPOrders();
+  /* Desktop top tabs */
+  var tabPlace=document.getElementById(\'tabPlace\');if(tabPlace){tabPlace.classList.toggle(\'active\',t===\'place\');}
+  var tabOrders=document.getElementById(\'tabOrders\');if(tabOrders){tabOrders.classList.toggle(\'active\',t===\'orders\');}
+  var tabReports=document.getElementById(\'tabReports\');if(tabReports){tabReports.classList.toggle(\'active\',t===\'reports\');}
+  var tabCustomers=document.getElementById(\'tabCustomers\');if(tabCustomers){tabCustomers.classList.toggle(\'active\',t===\'customers\');}
+  /* Mobile bottom nav */
+  document.querySelectorAll(\'.sp-bnav-item\').forEach(function(el){el.classList.toggle(\'active\',el.getAttribute(\'data-tab\')===t);});
+  if(t===\'orders\')filterSPOrders();
   if(t===\'customers\')renderSPCustList();
+  window.scrollTo(0,0);
 };
 (async function(){
   var d=await Promise.all([loadList(\'product:\'),loadList(\'party:\'),loadList(\'order:\'),loadList(\'sale:\')]);
@@ -1180,34 +1412,60 @@ window.spSelProd=function(idx,val){
 window.spChgQty=function(idx,val){spI[idx].q=+val||0;spI[idx].a=spI[idx].q*spI[idx].r;var aEl=document.getElementById(\'sp_amt_\'+idx);if(aEl)aEl.textContent=fmt(spI[idx].a);updateSPTotals();};
 window.spChgRate=function(idx,val){spI[idx].r=+val||0;spI[idx].a=spI[idx].q*spI[idx].r;var aEl=document.getElementById(\'sp_amt_\'+idx);if(aEl)aEl.textContent=fmt(spI[idx].a);updateSPTotals();};
 window.spRmItem=function(idx){spI.splice(idx,1);if(!spI.length)spI.push({pk:\'\',pn:\'\',q:1,r:0,a:0});renderSI();};
-window.updateSPTotals=function(){var total=spI.reduce(function(s,x){return s+x.a;},0);document.getElementById(\'spTotal\').textContent=\'Order Total: \'+fmt(total);};
+window.updateSPTotals=function(){var total=spI.reduce(function(s,x){return s+x.a;},0);var bar=document.getElementById(\'spTotal\');var valEl=document.getElementById(\'spTotalVal\');if(total>0){bar.style.display=\'flex\';if(valEl)valEl.textContent=fmt(total);}else{bar.style.display=\'none\';}};
 window.renderSI=function(){
   var html=\'\';
   for(var i=0;i<spI.length;i++){
     var it=spI[i];
-    html+=\'<div class="form-row" style="grid-template-columns:2fr 70px 90px 90px 34px;align-items:end;margin-bottom:6px;gap:8px">\';
-    html+=\'<select id="sp_sel_\'+i+\'" onchange="spSelProd(\'+i+\',this.value)" style="padding:11px 12px;font-size:14px"><option value="">Select Product</option>\';
+    html+=\'<div class="sp-item-card">\';
+    html+=\'<div class="sp-item-row">\';
+    html+=\'<div class="sp-item-product" style="grid-column:1/-1"><label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:3px;display:block">Product</label><select id="sp_sel_\'+i+\'" onchange="spSelProd(\'+i+\',this.value)"><option value="">Select Product</option>\';
     for(var j=0;j<spP.length;j++){
       var p=spP[j];
       html+=\'<option value="\'+p._key+\'"\'+(it.pk===p._key?\' selected\':\'\')+\'>\'+p.name+\' [\'+(p.stock||0)+\']</option>\';
     }
-    html+=\'</select>\';
-    html+=\'<input id="sp_qty_\'+i+\'" type="number" value="\'+it.q+\'" min="1" oninput="spChgQty(\'+i+\',this.value)" style="padding:11px 8px;font-size:14px;text-align:center">\';
-    html+=\'<input id="sp_rate_\'+i+\'" type="number" value="\'+it.r+\'" oninput="spChgRate(\'+i+\',this.value)" style="padding:11px 8px;font-size:14px;text-align:right" placeholder="Price">\';
-    html+=\'<div id="sp_amt_\'+i+\'" style="font-weight:700;font-size:14px;padding:11px 4px;text-align:right">\'+fmt(it.a)+\'</div>\';
-    html+=\'<button class="btn btn-danger btn-sm" onclick="spRmItem(\'+i+\')" style="padding:8px 10px">x</button>\';
+    html+=\'</select></div>\';
+    html+=\'<div><label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:3px;display:block">Qty</label><input id="sp_qty_\'+i+\'" type="number" value="\'+it.q+\'" min="1" oninput="spChgQty(\'+i+\',this.value)" style="text-align:center"></div>\';
+    html+=\'<div><label style="font-size:10px;font-weight:600;color:var(--muted);margin-bottom:3px;display:block">Rate</label><input id="sp_rate_\'+i+\'" type="number" value="\'+it.r+\'" oninput="spChgRate(\'+i+\',this.value)" style="text-align:right" placeholder="Price"></div>\';
+    html+=\'</div>\';
+    html+=\'<div class="sp-item-footer"><div class="sp-item-amt" id="sp_amt_\'+i+\'">\'+fmt(it.a)+\'</div><button class="sp-item-rm" onclick="spRmItem(\'+i+\')"><span class="material-symbols-outlined" style="font-size:14px;vertical-align:middle">delete</span> Remove</button></div>\';
     html+=\'</div>\';
   }
   document.getElementById(\'spItems\').innerHTML=html;
   updateSPTotals();
 };
-window.renderSPOrders=function(){
+window.renderSPOrders=function(){filterSPOrders();return};
+window._renderSPOrdersOrig=function(){
   var sorted=spOrders.slice().sort(function(a,b){return(b.date||\'\').localeCompare(a.date||\'\');});
-  document.getElementById(\'spOrdBody\').innerHTML=!sorted.length?\'<tr><td colspan="5" class="empty">No orders yet</td></tr>\':sorted.map(function(o){
+  /* Desktop table */
+  document.getElementById(\'spOrdBody\').innerHTML=!sorted.length?\'<tr><td colspan="5" class="empty">No orders yet</td></tr>\':sorted.map(function(o,idx){
     var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
-    return\'<tr><td>\'+o.date+\'</td><td class="bold">\'+o.orderNo+\'</td><td>\'+o.customerName+\'</td><td class="r bold">\'+fmt(o.total)+\'</td><td><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></td></tr>\';
+    return\'<tr style="cursor:pointer" onclick="viewSPOrd(\'+idx+\')"><td>\'+o.date+\'</td><td class="bold" style="color:var(--primary)">\'+o.orderNo+\'</td><td>\'+o.customerName+\'</td><td class="r bold">\'+fmt(o.total)+\'</td><td><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></td></tr>\';
   }).join(\'\');
+  /* Mobile cards */
+  var cardsEl=document.getElementById(\'spOrdCards\');
+  if(cardsEl){cardsEl.innerHTML=!sorted.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No orders yet</div>\':sorted.map(function(o,idx){
+    var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
+    return\'<div class="sp-order-card" style="cursor:pointer" onclick="viewSPOrd(\'+idx+\')"><div class="sp-oc-top"><div><div class="sp-oc-no" style="color:var(--primary)">\'+o.orderNo+\'</div><div class="sp-oc-date">\'+o.date+\'</div></div><span class="badge \'+badge+\'">\'+(o.status||\'pending\')+\'</span></div><div class="sp-oc-cust">\'+o.customerName+\'</div><div class="sp-oc-bottom"><div class="sp-oc-total">\'+fmt(o.total)+\'</div><span style="font-size:11px;color:var(--primary);font-weight:600">View Details &rarr;</span></div></div>\';
+  }).join(\'\');}
 };
+window.filterSPOrders=function(){var q=(document.getElementById(\'spOrdSearch\')?document.getElementById(\'spOrdSearch\').value:\'\').trim().toLowerCase();var sf=document.getElementById(\'spOrdStatusF\')?document.getElementById(\'spOrdStatusF\').value:\'\';var from=document.getElementById(\'spOrdFromF\')?document.getElementById(\'spOrdFromF\').value:\'\';var to=document.getElementById(\'spOrdToF\')?document.getElementById(\'spOrdToF\').value:\'\';var filtered=spOrders.filter(function(o){if(q&&(o.orderNo||\'\').toLowerCase().indexOf(q)<0&&(o.customerName||\'\').toLowerCase().indexOf(q)<0)return false;if(sf&&(o.status||\'pending\')!==sf)return false;if(from&&o.date<from)return false;if(to&&o.date>to)return false;return true});renderSPOrdersFiltered(filtered)};
+window.renderSPOrdersFiltered=function(list){var sorted=list.slice().sort(function(a,b){return(b.date||\'\').localeCompare(a.date||\'\')});document.getElementById(\'spOrdBody\').innerHTML=!sorted.length?\'<tr><td colspan="5" class="empty">No orders found</td></tr>\':sorted.map(function(o,idx){var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';var realIdx=spOrders.indexOf(o);return\'<tr style="cursor:pointer" onclick="viewSPOrd(\'+realIdx+\')"><td>\'+o.date+\'</td><td class="bold" style="color:var(--primary)">\'+o.orderNo+\'</td><td>\'+o.customerName+\'</td><td class="r bold">\'+fmt(o.total)+\'</td><td><span class="badge \'+badge+\'">\'+((o.status||\'pending\'))+\'</span></td></tr>\';}).join(\'\');var cardsEl=document.getElementById(\'spOrdCards\');if(cardsEl){cardsEl.innerHTML=!sorted.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No orders found</div>\':sorted.map(function(o){var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';var realIdx=spOrders.indexOf(o);return\'<div class="sp-order-card" style="cursor:pointer" onclick="viewSPOrd(\'+realIdx+\')"><div class="sp-oc-top"><div><div class="sp-oc-no" style="color:var(--primary)">\'+o.orderNo+\'</div><div class="sp-oc-date">\'+o.date+\'</div></div><span class="badge \'+badge+\'">\'+((o.status||\'pending\'))+\'</span></div><div class="sp-oc-cust">\'+o.customerName+\'</div><div class="sp-oc-bottom"><div class="sp-oc-total">\'+fmt(o.total)+\'</div><span style="font-size:11px;color:var(--primary);font-weight:600">View &rarr;</span></div></div>\';}).join(\'\');}};
+window.viewSPOrd=function(idx){
+  var sorted=spOrders.slice().sort(function(a,b){return(b.date||\'\').localeCompare(a.date||\'\');});
+  var o=sorted[idx];if(!o)return;
+  var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
+  var html=\'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Order Number</div><div style="font-size:18px;font-weight:800">\'+o.orderNo+\'</div></div><span class="badge \'+badge+\'" style="font-size:12px;padding:5px 12px">\'+(o.status||\'pending\')+\'</span></div>\';
+  html+=\'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px"><div style="background:var(--bg);padding:10px 12px;border-radius:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Date</div><div style="font-weight:600;font-size:14px">\'+o.date+\'</div></div><div style="background:var(--bg);padding:10px 12px;border-radius:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Customer</div><div style="font-weight:600;font-size:14px">\'+o.customerName+\'</div></div></div>\';
+  if(o.convertedInvoice){html+=\'<div style="background:var(--accent-light);padding:8px 12px;border-radius:8px;margin-bottom:12px;font-size:12px"><b>Converted to Invoice:</b> <span style="color:var(--accent);font-weight:700;cursor:pointer;text-decoration:underline" onclick="alert(\\\'Invoice: \'+o.convertedInvoice+\'\\\')">\'+o.convertedInvoice+\'</span></div>\';}
+  html+=\'<div style="font-size:11px;font-weight:700;margin-bottom:8px;text-transform:uppercase;color:var(--muted);letter-spacing:.5px">Items (\'+((o.items||[]).length)+\')</div>\';
+  html+=\'<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="background:var(--bg)"><th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">#</th><th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Product</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Qty</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Rate</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Amount</th></tr></thead><tbody>\';
+  (o.items||[]).forEach(function(it,i){html+=\'<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 10px">\'+(i+1)+\'</td><td style="padding:8px 10px;font-weight:600">\'+it.productName+\'</td><td style="padding:8px 10px;text-align:right">\'+it.qty+\'</td><td style="padding:8px 10px;text-align:right">\'+fmt(it.rate)+\'</td><td style="padding:8px 10px;text-align:right;font-weight:700">\'+fmt(it.amount||it.qty*it.rate)+\'</td></tr>\';});
+  html+=\'<tr style="background:var(--bg)"><td colspan="4" style="padding:10px;text-align:right;font-weight:800;font-size:13px">Total</td><td style="padding:10px;text-align:right;font-weight:800;font-size:16px;color:var(--primary)">\'+fmt(o.total)+\'</td></tr></tbody></table>\';
+  document.getElementById(\'spOrdDetailContent\').innerHTML=html;
+  document.getElementById(\'spOrdDetailOverlay\').style.display=\'block\';
+};
+window.closeSPOrdDetail=function(){document.getElementById(\'spOrdDetailOverlay\').style.display=\'none\';};
 window.renderSPReport=function(){
   var type=document.getElementById(\'spRptType\').value;
   var from=document.getElementById(\'spRptFrom\').value;
@@ -1244,19 +1502,43 @@ window.renderSPReport=function(){
     var tQ4=0,tA4=0;var idx5=1;body=rows.map(function(r){tQ4+=r.qty;tA4+=r.amt;return\'<tr><td>\'+idx5++ +\'</td><td class="bold">\'+r.cust+\'</td><td class="text-muted">\'+r.phone+\'</td><td>\'+r.prod+\'</td><td class="r">\'+r.qty+\'</td><td class="r">\'+fmt(r.rate)+\'</td><td class="r bold">\'+fmt(r.amt)+\'</td></tr>\';}).join(\'\');
     foot=\'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">\'+tQ4+\'</td><td></td><td class="r">\'+fmt(tA4)+\'</td></tr>\';
   }
+  else if(type===\'date-sales\'){
+    head=\'<tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th></tr>\';
+    var byDate2={};filtered.forEach(function(s){var d=s.date;if(!byDate2[d])byDate2[d]=[];byDate2[d].push(s);});
+    var dates2=Object.keys(byDate2).sort();var gT=0,gP=0;
+    body=dates2.map(function(d){var rows=byDate2[d];var dT=0,dP=0;
+    var html=\'<tr style="background:rgba(79,70,229,.04);font-weight:700"><td colspan="6" style="font-size:13px">Date: \'+d+\'</td></tr>\';
+    rows.forEach(function(s){dT+=s.total||0;dP+=s.paid||0;
+    html+=\'<tr><td>\'+s.date+\'</td><td class="bold">\'+s.invoiceNo+\'</td><td>\'+s.customerName+\'</td><td class="r bold">\'+fmt(s.total)+\'</td><td class="r text-success">\'+fmt(s.paid)+\'</td><td class="r \'+(s.total-s.paid>0?\'text-danger\':\'\')+\'">\'+fmt((s.total||0)-(s.paid||0))+\'</td></tr>\';});
+    gT+=dT;gP+=dP;
+    html+=\'<tr style="background:rgba(79,70,229,.04);font-weight:700;border-top:1px solid var(--border-dark)"><td colspan="3" class="r bold">Sub Total (\'+d+\')</td><td class="r bold">\'+fmt(dT)+\'</td><td class="r">\'+fmt(dP)+\'</td><td class="r">\'+fmt(dT-dP)+\'</td></tr>\';
+    return html;}).join(\'\');
+    body+=\'<tr style="background:var(--bg);font-weight:800;border-top:3px solid #333"><td colspan="3" class="r bold" style="font-size:13px">Grand Total</td><td class="r bold" style="font-size:14px">\'+fmt(gT)+\'</td><td class="r">\'+fmt(gP)+\'</td><td class="r text-danger">\'+fmt(gT-gP)+\'</td></tr>\';
+  }else if(type===\'customer-outstanding\'){
+    head=\'<tr><th>#</th><th>Customer</th><th>Phone</th><th class="r">Total Sales</th><th class="r">Paid</th><th class="r">Outstanding</th></tr>\';
+    var tOS=0,tOP=0;var idx6=1;
+    var custOut=spC.map(function(c){var cs=spSales.filter(function(s){return s.customerId===c._key;});var totalS=cs.reduce(function(a,s){return a+(s.total||0);},0);var totalP=cs.reduce(function(a,s){return a+(s.paid||0);},0);return{name:c.name,phone:c.phone||\'\',sales:totalS,paid:totalP,out:Math.max(0,totalS-totalP)};}).filter(function(x){return x.sales>0;}).sort(function(a,b){return b.out-a.out;});
+    body=custOut.map(function(r){tOS+=r.sales;tOP+=r.paid;return\'<tr><td>\'+idx6++ +\'</td><td class="bold">\'+r.name+\'</td><td class="text-muted">\'+r.phone+\'</td><td class="r">\'+fmt(r.sales)+\'</td><td class="r text-success">\'+fmt(r.paid)+\'</td><td class="r \'+(r.out>0?\'text-danger bold\':\'\')+\'">\'+fmt(r.out)+\'</td></tr>\';}).join(\'\');
+    foot=\'<tr style="background:var(--bg);font-weight:800"><td colspan="3">TOTAL</td><td class="r">\'+fmt(tOS)+\'</td><td class="r">\'+fmt(tOP)+\'</td><td class="r text-danger">\'+fmt(tOS-tOP)+\'</td></tr>\';
+  }
   document.getElementById(\'spRptHead\').innerHTML=head;
   document.getElementById(\'spRptBody\').innerHTML=body||\'<tr><td colspan="7" class="empty">No sales data for selected period</td></tr>\';
   document.getElementById(\'spRptFoot\').innerHTML=foot;
 };
 window.renderSPCustList=function(){
-  var rows=spC.map(function(c){
+  var custData=spC.map(function(c){
     var cs=spSales.filter(function(s){return s.customerId===c._key;});
     var totalS=cs.reduce(function(a,s){return a+(s.total||0);},0);
     var totalP=cs.reduce(function(a,s){return a+(s.paid||0);},0);
     var out=Math.max(0,totalS-totalP);
-    return\'<tr><td class="bold">\'+c.name+\'</td><td class="text-muted">\'+( c.phone||\'\')+\'</td><td class="text-muted">\'+(c.address||\'\')+\'</td><td class="r">\'+fmt(totalS)+\'</td><td class="r \'+(out>0?\'text-danger bold\':\'\')+\'">\'+fmt(out)+\'</td></tr>\';
-  }).join(\'\');
+    return{c:c,totalS:totalS,out:out};
+  });
+  /* Desktop table */
+  var rows=custData.map(function(d){return\'<tr><td class="bold">\'+d.c.name+\'</td><td class="text-muted">\'+(d.c.phone||\'\')+\'</td><td class="text-muted">\'+(d.c.address||\'\')+\'</td><td class="r">\'+fmt(d.totalS)+\'</td><td class="r \'+(d.out>0?\'text-danger bold\':\'\')+\'">\'+fmt(d.out)+\'</td></tr>\';}).join(\'\');
   document.getElementById(\'spCustListBody\').innerHTML=rows||\'<tr><td colspan="5" class="empty">No tagged customers</td></tr>\';
+  /* Mobile cards */
+  var cardsEl=document.getElementById(\'spCustCards\');
+  if(cardsEl){cardsEl.innerHTML=!custData.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No tagged customers</div>\':custData.map(function(d){return\'<div class="sp-cust-card"><div class="sp-cc-name">\'+d.c.name+\'</div><div class="sp-cc-info">\'+(d.c.phone?\'<span class="material-symbols-outlined" style="font-size:12px;vertical-align:middle">phone</span> \'+d.c.phone:\'\')+(d.c.address?\' &bull; \'+d.c.address:\'\')+\'</div><div class="sp-cc-stats"><div class="sp-cc-stat"><div class="label">Total Sales</div><div class="value">\'+fmt(d.totalS)+\'</div></div><div class="sp-cc-stat"><div class="label">Outstanding</div><div class="value \'+(d.out>0?\'text-danger\':\'text-success\')+\'">\'+fmt(d.out)+\'</div></div></div></div>\';}).join(\'\');}
 };
 window.submitOrd=async function(){
   var ck=document.getElementById(\'spCust\').value;
@@ -1280,9 +1562,9 @@ window.submitOrd=async function(){
 
 function dashboardPage(){var t=new Date().toISOString().slice(0,10);var ym=t.slice(0,7);return `
 <div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">Business overview</div></div></div>
-<div class="card no-print" style="margin-bottom:14px;padding:14px 16px">
-<div class="form-row" style="align-items:end"><div><label>From</label><input type="date" id="dashFrom" value="${ym}-01"></div><div><label>To</label><input type="date" id="dashTo" value="${t}"></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="renderDash()">Apply</button><button class="btn btn-outline btn-xs" onclick="setDashRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setDashRange('today')">Today</button><button class="btn btn-outline btn-xs" onclick="setDashRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setDashRange('all')">All Time</button></div></div>
-</div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="margin-bottom:14px;padding:14px 16px">
+<div class="form-row" style="align-items:end;gap:8px;flex-wrap:wrap"><div><label>From</label><input type="date" id="dashFrom" value="${ym}-01"></div><div><label>To</label><input type="date" id="dashTo" value="${t}"></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="renderDash()">Apply</button><button class="btn btn-outline btn-xs" onclick="setDashRange('month')">This Month</button><button class="btn btn-outline btn-xs" onclick="setDashRange('today')">Today</button><button class="btn btn-outline btn-xs" onclick="setDashRange('year')">This Year</button><button class="btn btn-outline btn-xs" onclick="setDashRange('all')">All Time</button></div></div>
+</div></div>
 <div class="stats" id="stats"></div>
 <div class="dash-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px"><div class="card"><div class="section-title">Recent Sales</div><div id="recentSales" class="table-wrap"></div></div><div class="card"><div class="section-title">Recent Purchases</div><div id="recentPurchases" class="table-wrap"></div></div></div>
 <div class="dash-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><div class="card"><div class="section-title">Low Stock Alerts</div><div id="lowStockAlerts" class="table-wrap"></div></div><div class="card"><div class="section-title">Pending Orders</div><div id="pendingOrders" class="table-wrap"></div></div></div>
@@ -1308,8 +1590,8 @@ var customers=parties.filter(function(p){return p.type==='customer'});var suppli
 var receivables=0;customers.forEach(function(c){var cob=c.openingBalance||0;var cs=sales.filter(function(s){return s.customerId===c._key});var cr=payments.filter(function(p){return(p.party===c.name)&&p.type==='receipt'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=cs.reduce(function(s,x){return s+(x.total||0)},0)+(cob>0?cob:0);var tr=cs.reduce(function(s,x){return s+(x.paid||0)},0)+cr.reduce(function(s,x){return s+(x.amount||0)},0)+(cob<0?Math.abs(cob):0);receivables+=Math.max(0,td-tr)});
 var payables=0;suppliers.forEach(function(s){var sob=s.openingBalance||0;var sp=purchases.filter(function(p){return p.supplierId===s._key});var py=payments.filter(function(p){return p.party===s.name&&p.type==='payment'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=sp.reduce(function(a,x){return a+(x.total||0)},0)+(sob>0?sob:0);var tp=sp.reduce(function(a,x){return a+(x.paid||0)},0)+py.reduce(function(a,x){return a+(x.amount||0)},0)+(sob<0?Math.abs(sob):0);payables+=Math.max(0,td-tp)});
 var bankBal=banks.reduce(function(s,b){return s+(b.balance||b.openingBalance||0)},0);
-var cashReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&!p._autoInvoice}).reduce(function(s,p){return s+(p.amount||0)},0);
-var cashPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&!p._autoInvoice}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cashReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cashPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cashExpenses2=expenses.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 var salePaidCash=sales.filter(function(s){return s.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
 var purPaidCash=purchases.filter(function(p){return p.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
@@ -1324,17 +1606,22 @@ var po=allOrders.filter(function(o){return o.status==='pending'}).slice(0,5);doc
 </script>`}
 
 function inventoryPage(){return `
-<div class="page-header"><div><div class="page-title">Inventory</div><div class="page-sub">Products & stock (Group-wise)</div></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline" onclick="openImportProd()"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-outline" onclick="openGroupMgr()"><span class="material-symbols-outlined" style="font-size:16px">folder</span> Manage Groups</button><button class="btn btn-primary" onclick="openAddP()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Product</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search..." oninput="filterP(this.value)" id="pSearch"></div><div><label>Group Filter</label><select id="pGroupFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Groups</option></select></div></div>
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Group</th><th>SKU</th><th class="r">Buy</th><th class="r">Sell</th><th class="r">Stock</th><th class="r">Act</th></tr></thead><tbody id="pBody"></tbody></table></div></div>
-<div class="modal-overlay" id="addProduct"><div class="modal"><h3 id="pTitle">Add Product</h3><input type="hidden" id="editPK"><div class="form-group"><label>Name</label><input id="pN" placeholder="Name"></div><div class="form-row"><div><label>Group</label><select id="pG"><option value="">No Group</option></select></div><div><label>SKU</label><input id="pS" placeholder="Auto"></div></div><div class="form-row"><div><label>Unit</label><input id="pU" value="pcs"></div><div><label>Stock</label><input type="number" id="pSt" placeholder="0"></div></div><div class="form-row"><div><label>Purchase Price</label><input type="number" id="pB" placeholder="0"></div><div><label>Sale Price</label><input type="number" id="pSl" placeholder="0"></div></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('addProduct')">Cancel</button><button class="btn btn-primary" onclick="saveP()">Save</button></div></div></div>
+<div class="page-header"><div><div class="page-title">Inventory</div><div class="page-sub">Products & stock (Group & Brand wise)</div></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline" onclick="openImportProd()"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-outline" onclick="openGroupMgr()"><span class="material-symbols-outlined" style="font-size:16px">folder</span> Manage Groups</button><button class="btn btn-outline" onclick="openBrandMgr()"><span class="material-symbols-outlined" style="font-size:16px">label</span> Manage Brands</button><button class="btn btn-primary" onclick="openAddP()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Product</button></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search..." oninput="filterP(this.value)" id="pSearch"></div><div><label>Group</label><select id="pGroupFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="pBrandFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Brands</option></select></div></div></div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Group</th><th>Brand</th><th>SKU</th><th class="r">Buy</th><th class="r">Sell</th><th class="r">Stock</th><th class="r">Act</th></tr></thead><tbody id="pBody"></tbody></table></div></div>
+<div class="modal-overlay" id="addProduct"><div class="modal"><h3 id="pTitle">Add Product</h3><input type="hidden" id="editPK"><div class="form-group"><label>Name</label><input id="pN" placeholder="Name"></div><div class="form-row"><div><label>Group</label><select id="pG"><option value="">No Group</option></select></div><div><label>Brand</label><select id="pBr"><option value="">No Brand</option></select></div></div><div class="form-row"><div><label>SKU</label><input id="pS" placeholder="Auto"></div><div><label>Unit</label><input id="pU" value="pcs"></div></div><div class="form-row"><div><label>Stock</label><input type="number" id="pSt" placeholder="0"></div><div><label>Purchase Price</label><input type="number" id="pB" placeholder="0"></div></div><div class="form-row"><div><label>Sale Price</label><input type="number" id="pSl" placeholder="0"></div><div></div></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('addProduct')">Cancel</button><button class="btn btn-primary" onclick="saveP()">Save</button></div></div></div>
 <div class="modal-overlay" id="groupMgr"><div class="modal"><h3>Product Groups</h3>
 <div style="display:flex;gap:6px;margin-bottom:12px"><input id="newGroupName" placeholder="New group name"><button class="btn btn-primary" onclick="saveGroup()">Add</button></div>
 <div id="groupList"></div>
 <div style="text-align:right;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('groupMgr')">Close</button></div>
 </div></div>
+<div class="modal-overlay" id="brandMgr"><div class="modal"><h3>Product Brands</h3>
+<div style="display:flex;gap:6px;margin-bottom:12px"><input id="newBrandName" placeholder="New brand name"><button class="btn btn-primary" onclick="saveBrand()">Add</button></div>
+<div id="brandList"></div>
+<div style="text-align:right;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('brandMgr')">Close</button></div>
+</div></div>
 <div class="modal-overlay" id="importProdModal"><div class="modal" style="max-width:650px"><h3>Import Products from Excel</h3>
-<div style="margin-bottom:12px;padding:10px;background:var(--bg);border-radius:8px;font-size:12px"><b>Required columns:</b> Name<br><b>Optional columns:</b> Group, SKU, Unit, Purchase Price, Sale Price, Stock<br><b>Note:</b> If a Group doesn't exist, it will be auto-created.</div>
+<div style="margin-bottom:12px;padding:10px;background:var(--bg);border-radius:8px;font-size:12px"><b>Required columns:</b> Name<br><b>Optional columns:</b> Group, Brand, SKU, Unit, Purchase Price, Sale Price, Stock<br><b>Note:</b> If a Group/Brand doesn't exist, it will be auto-created.</div>
 <div style="margin-bottom:12px"><button class="btn btn-outline btn-sm" onclick="downloadProdTemplate()"><span class="material-symbols-outlined" style="font-size:14px;vertical-align:middle">download</span> Download Template</button></div>
 <div class="form-group"><label>Select Excel File (.xlsx, .xls, .csv)</label><input type="file" id="prodImportFile" accept=".xlsx,.xls,.csv"></div>
 <div id="prodImportPreview" style="display:none;margin:12px 0;max-height:250px;overflow:auto"></div>
@@ -1343,39 +1630,43 @@ function inventoryPage(){return `
 </div></div>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script>
-var prods=[],ek=null,prodGroups=[],_prodImportRows=[];
-async function loadP(){var d=await Promise.all([loadList('product:'),loadList('prodgroup:')]);prods=d[0];prodGroups=d[1]||[];updateGroupDropdowns();renderP(prods)}
-function updateGroupDropdowns(){var opts='<option value="">No Group</option>'+prodGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');document.getElementById('pG').innerHTML=opts;document.getElementById('pGroupFilter').innerHTML='<option value="">All Groups</option>'+prodGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('')}
-function renderP(l){document.getElementById('pBody').innerHTML=!l.length?'<tr><td colspan="7" class="empty">No products</td></tr>':l.map(function(p){return'<tr><td class="bold">'+p.name+'</td><td>'+(p.group?'<span class="badge badge-info">'+p.group+'</span>':'-')+'</td><td><span class="badge badge-info">'+(p.sku||'')+'</span></td><td class="r">'+fmt(p.purchasePrice)+'</td><td class="r">'+fmt(p.salePrice)+'</td><td class="r bold '+((p.stock||0)<=0?'text-danger':(p.stock||0)<=5?'text-warning':'')+'">'+fmt(p.stock)+'</td><td class="r"><button class="btn btn-outline btn-sm" onclick="editP(\\x27'+p._key+'\\x27)">E</button> <button class="btn btn-danger btn-sm" onclick="delP(\\x27'+p._key+'\\x27)">D</button></td></tr>'}).join('')}
-window.openAddP=function(){ek=null;document.getElementById('pTitle').textContent='Add Product';['pN','pS','pB','pSl','pSt'].forEach(function(i){document.getElementById(i).value=''});document.getElementById('pU').value='pcs';document.getElementById('pG').value='';openModal('addProduct')}
-window.editP=function(k){var p=prods.find(function(x){return x._key===k});if(!p)return;ek=k;document.getElementById('pTitle').textContent='Edit Product';document.getElementById('pN').value=p.name||'';document.getElementById('pS').value=p.sku||'';document.getElementById('pU').value=p.unit||'pcs';document.getElementById('pG').value=p.group||'';document.getElementById('pB').value=p.purchasePrice||0;document.getElementById('pSl').value=p.salePrice||0;document.getElementById('pSt').value=p.stock||0;openModal('addProduct')}
-window.saveP=async function(){var n=document.getElementById('pN').value.trim();if(!n){showToast('Product name is required','warning');return;}var s=document.getElementById('pS').value.trim()||(n.slice(0,3).toUpperCase()+'-'+Math.random().toString(36).slice(2,6).toUpperCase());var d={name:n,sku:s,group:document.getElementById('pG').value,unit:document.getElementById('pU').value||'pcs',purchasePrice:+document.getElementById('pB').value||0,salePrice:+document.getElementById('pSl').value||0,stock:+document.getElementById('pSt').value||0};try{if(ek){await saveByKey(ek,d,'edit','Edited product: '+n);ek=null;showToast('Product updated successfully','success')}else{await saveItem('product:',d,null,'create','Created product: '+n);showToast('Product added successfully','success')}invalidateCache('product:');closeModal('addProduct');loadP()}catch(e){showToast('Failed to save product: '+e.message,'error')}}
+var prods=[],ek=null,prodGroups=[],prodBrands=[],_prodImportRows=[];
+async function loadP(){var d=await Promise.all([loadList('product:'),loadList('prodgroup:'),loadList('prodbrand:')]);prods=d[0];prodGroups=d[1]||[];prodBrands=d[2]||[];updateGroupDropdowns();renderP(prods)}
+function updateGroupDropdowns(){var opts='<option value="">No Group</option>'+prodGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');document.getElementById('pG').innerHTML=opts;document.getElementById('pGroupFilter').innerHTML='<option value="">All Groups</option>'+prodGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');var bOpts='<option value="">No Brand</option>'+prodBrands.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');document.getElementById('pBr').innerHTML=bOpts;document.getElementById('pBrandFilter').innerHTML='<option value="">All Brands</option>'+prodBrands.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('')}
+function renderP(l){document.getElementById('pBody').innerHTML=!l.length?'<tr><td colspan="8" class="empty">No products</td></tr>':l.map(function(p){return'<tr><td class="bold">'+p.name+'</td><td>'+(p.group?'<span class="badge badge-info">'+p.group+'</span>':'-')+'</td><td>'+(p.brand?'<span class="badge badge-success">'+p.brand+'</span>':'-')+'</td><td><span class="badge badge-info">'+(p.sku||'')+'</span></td><td class="r">'+fmt(p.purchasePrice)+'</td><td class="r">'+fmt(p.salePrice)+'</td><td class="r bold '+((p.stock||0)<=0?'text-danger':(p.stock||0)<=5?'text-warning':'')+'">'+fmt(p.stock)+'</td><td class="r"><button class="btn btn-outline btn-sm" onclick="editP(\\x27'+p._key+'\\x27)">E</button> <button class="btn btn-danger btn-sm" onclick="delP(\\x27'+p._key+'\\x27)">D</button></td></tr>'}).join('')}
+window.openAddP=function(){ek=null;document.getElementById('pTitle').textContent='Add Product';['pN','pS','pB','pSl','pSt'].forEach(function(i){document.getElementById(i).value=''});document.getElementById('pU').value='pcs';document.getElementById('pG').value='';document.getElementById('pBr').value='';openModal('addProduct')}
+window.editP=function(k){var p=prods.find(function(x){return x._key===k});if(!p)return;ek=k;document.getElementById('pTitle').textContent='Edit Product';document.getElementById('pN').value=p.name||'';document.getElementById('pS').value=p.sku||'';document.getElementById('pU').value=p.unit||'pcs';document.getElementById('pG').value=p.group||'';document.getElementById('pBr').value=p.brand||'';document.getElementById('pB').value=p.purchasePrice||0;document.getElementById('pSl').value=p.salePrice||0;document.getElementById('pSt').value=p.stock||0;openModal('addProduct')}
+window.saveP=async function(){var n=document.getElementById('pN').value.trim();if(!n){showToast('Product name is required','warning');return;}var s=document.getElementById('pS').value.trim()||(n.slice(0,3).toUpperCase()+'-'+Math.random().toString(36).slice(2,6).toUpperCase());var d={name:n,sku:s,group:document.getElementById('pG').value,brand:document.getElementById('pBr').value,unit:document.getElementById('pU').value||'pcs',purchasePrice:+document.getElementById('pB').value||0,salePrice:+document.getElementById('pSl').value||0,stock:+document.getElementById('pSt').value||0};try{if(ek){await saveByKey(ek,d,'edit','Edited product: '+n);ek=null;showToast('Product updated successfully','success')}else{await saveItem('product:',d,null,'create','Created product: '+n);showToast('Product added successfully','success')}invalidateCache('product:');closeModal('addProduct');loadP()}catch(e){showToast('Failed to save product: '+e.message,'error')}}
 window.delP=async function(k){var p=prods.find(function(x){return x._key===k});if(!confirm('Delete '+(p?p.name:'')+'?'))return;try{await deleteItem(k,false,'Deleted product: '+(p?p.name:''));invalidateCache('product:');showToast('Product deleted successfully','success');loadP()}catch(e){showToast('Failed to delete product','error')}}
-window.filterP=function(q){var t=normalize(q);var gf=document.getElementById('pGroupFilter').value;renderP(prods.filter(function(p){return(!gf||p.group===gf)&&(normalize(p.name).includes(t)||normalize(p.sku).includes(t)||normalize(p.group).includes(t))}))}
+window.filterP=function(q){var t=normalize(q);var gf=document.getElementById('pGroupFilter').value;var bf=document.getElementById('pBrandFilter').value;renderP(prods.filter(function(p){return(!gf||p.group===gf)&&(!bf||p.brand===bf)&&(normalize(p.name).includes(t)||normalize(p.sku).includes(t)||normalize(p.group).includes(t)||normalize(p.brand||'').includes(t))}))}
 window.openGroupMgr=function(){document.getElementById('newGroupName').value='';var html=prodGroups.map(function(g){return'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)"><span>'+g.name+'</span><button class="btn btn-danger btn-xs" onclick="delGroup(\\x27'+g._key+'\\x27)">Del</button></div>'}).join('');document.getElementById('groupList').innerHTML=html||'<div class="empty">No groups</div>';openModal('groupMgr')}
 window.saveGroup=async function(){var n=document.getElementById('newGroupName').value.trim();if(!n)return;await saveItem('prodgroup:',{name:n});loadP();setTimeout(openGroupMgr,300)}
 window.delGroup=async function(k){await deleteItem(k,false,'Deleted product group');loadP();setTimeout(openGroupMgr,300)}
+window.openBrandMgr=function(){document.getElementById('newBrandName').value='';var html=prodBrands.map(function(b){return'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)"><span>'+b.name+'</span><button class="btn btn-danger btn-xs" onclick="delBrand(\\x27'+b._key+'\\x27)">Del</button></div>'}).join('');document.getElementById('brandList').innerHTML=html||'<div class="empty">No brands</div>';openModal('brandMgr')}
+window.saveBrand=async function(){var n=document.getElementById('newBrandName').value.trim();if(!n)return;await saveItem('prodbrand:',{name:n});invalidateCache('prodbrand:');loadP();setTimeout(openBrandMgr,300)}
+window.delBrand=async function(k){await deleteItem(k,false,'Deleted product brand');invalidateCache('prodbrand:');loadP();setTimeout(openBrandMgr,300)}
 window.openImportProd=function(){document.getElementById('prodImportFile').value='';document.getElementById('prodImportPreview').style.display='none';document.getElementById('prodImportStatus').innerHTML='';document.getElementById('prodImportBtn').disabled=true;_prodImportRows=[];openModal('importProdModal')}
-window.downloadProdTemplate=function(){var ws=XLSX.utils.aoa_to_sheet([['Name','Group','SKU','Unit','Purchase Price','Sale Price','Stock'],['Example Product','GroupA','EXP-001','pcs','100','150','50'],['Another Item','GroupB','','kg','200','280','30']]);var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Template');XLSX.writeFile(wb,'product_import_template.xlsx')}
-document.getElementById('prodImportFile').addEventListener('change',function(e){var file=e.target.files[0];if(!file)return;var reader=new FileReader();reader.onload=function(ev){try{var wb=XLSX.read(ev.target.result,{type:'array'});var ws=wb.Sheets[wb.SheetNames[0]];var rows=XLSX.utils.sheet_to_json(ws,{defval:''});if(!rows.length){document.getElementById('prodImportStatus').innerHTML='<span style="color:var(--danger)">No data found in file</span>';return}_prodImportRows=rows.map(function(r){var name=String(r['Name']||r['name']||r['NAME']||r['Product Name']||r['product name']||'').trim();var group=String(r['Group']||r['group']||r['GROUP']||r['Category']||'').trim();var sku=String(r['SKU']||r['sku']||r['Code']||'').trim();var unit=String(r['Unit']||r['unit']||'pcs').trim();var buy=parseFloat(r['Purchase Price']||r['purchase price']||r['Buy']||r['buy']||r['Cost']||0)||0;var sell=parseFloat(r['Sale Price']||r['sale price']||r['Sell']||r['sell']||r['Price']||0)||0;var stock=parseFloat(r['Stock']||r['stock']||r['Qty']||r['qty']||r['Quantity']||0)||0;return{name:name,group:group,sku:sku,unit:unit,purchasePrice:buy,salePrice:sell,stock:stock}}).filter(function(r){return r.name});
-var prev=document.getElementById('prodImportPreview');prev.style.display='block';prev.innerHTML='<div style="font-weight:600;margin-bottom:6px">Preview ('+_prodImportRows.length+' products):</div><table class="tbl" style="font-size:11px"><thead><tr><th>Name</th><th>Group</th><th>SKU</th><th>Unit</th><th class="r">Buy</th><th class="r">Sell</th><th class="r">Stock</th></tr></thead><tbody>'+_prodImportRows.slice(0,20).map(function(r){return'<tr><td>'+r.name+'</td><td>'+r.group+'</td><td>'+r.sku+'</td><td>'+r.unit+'</td><td class="r">'+r.purchasePrice+'</td><td class="r">'+r.salePrice+'</td><td class="r">'+r.stock+'</td></tr>'}).join('')+(_prodImportRows.length>20?'<tr><td colspan="7" class="text-muted">...and '+(_prodImportRows.length-20)+' more rows</td></tr>':'')+'</tbody></table>';
+window.downloadProdTemplate=function(){var ws=XLSX.utils.aoa_to_sheet([['Name','Group','Brand','SKU','Unit','Purchase Price','Sale Price','Stock'],['Example Product','GroupA','BrandX','EXP-001','pcs','100','150','50'],['Another Item','GroupB','BrandY','','kg','200','280','30']]);var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Template');XLSX.writeFile(wb,'product_import_template.xlsx')}
+document.getElementById('prodImportFile').addEventListener('change',function(e){var file=e.target.files[0];if(!file)return;var reader=new FileReader();reader.onload=function(ev){try{var wb=XLSX.read(ev.target.result,{type:'array'});var ws=wb.Sheets[wb.SheetNames[0]];var rows=XLSX.utils.sheet_to_json(ws,{defval:''});if(!rows.length){document.getElementById('prodImportStatus').innerHTML='<span style="color:var(--danger)">No data found in file</span>';return}_prodImportRows=rows.map(function(r){var name=String(r['Name']||r['name']||r['NAME']||r['Product Name']||r['product name']||'').trim();var group=String(r['Group']||r['group']||r['GROUP']||r['Category']||'').trim();var brand=String(r['Brand']||r['brand']||r['BRAND']||'').trim();var sku=String(r['SKU']||r['sku']||r['Code']||'').trim();var unit=String(r['Unit']||r['unit']||'pcs').trim();var buy=parseFloat(r['Purchase Price']||r['purchase price']||r['Buy']||r['buy']||r['Cost']||0)||0;var sell=parseFloat(r['Sale Price']||r['sale price']||r['Sell']||r['sell']||r['Price']||0)||0;var stock=parseFloat(r['Stock']||r['stock']||r['Qty']||r['qty']||r['Quantity']||0)||0;return{name:name,group:group,brand:brand,sku:sku,unit:unit,purchasePrice:buy,salePrice:sell,stock:stock}}).filter(function(r){return r.name});
+var prev=document.getElementById('prodImportPreview');prev.style.display='block';prev.innerHTML='<div style="font-weight:600;margin-bottom:6px">Preview ('+_prodImportRows.length+' products):</div><table class="tbl" style="font-size:11px"><thead><tr><th>Name</th><th>Group</th><th>Brand</th><th>SKU</th><th>Unit</th><th class="r">Buy</th><th class="r">Sell</th><th class="r">Stock</th></tr></thead><tbody>'+_prodImportRows.slice(0,20).map(function(r){return'<tr><td>'+r.name+'</td><td>'+r.group+'</td><td>'+r.brand+'</td><td>'+r.sku+'</td><td>'+r.unit+'</td><td class="r">'+r.purchasePrice+'</td><td class="r">'+r.salePrice+'</td><td class="r">'+r.stock+'</td></tr>'}).join('')+(_prodImportRows.length>20?'<tr><td colspan="8" class="text-muted">...and '+(_prodImportRows.length-20)+' more rows</td></tr>':'')+'</tbody></table>';
 document.getElementById('prodImportBtn').disabled=false;document.getElementById('prodImportStatus').innerHTML='<span style="color:var(--accent)">'+_prodImportRows.length+' valid products ready to import</span>'}catch(err){document.getElementById('prodImportStatus').innerHTML='<span style="color:var(--danger)">Error reading file: '+err.message+'</span>'}};reader.readAsArrayBuffer(file)})
 window.doImportProd=async function(){if(!_prodImportRows.length)return;document.getElementById('prodImportBtn').disabled=true;document.getElementById('prodImportStatus').innerHTML='<span style="color:var(--primary)">Importing...</span>';var ok=0,fail=0;
 var existingGroupNames=prodGroups.map(function(g){return g.name.toLowerCase()});var newGroups={};
-for(var i=0;i<_prodImportRows.length;i++){try{var r=_prodImportRows[i];if(r.group&&!existingGroupNames.includes(r.group.toLowerCase())&&!newGroups[r.group.toLowerCase()]){await saveItem('prodgroup:',{name:r.group});newGroups[r.group.toLowerCase()]=true;existingGroupNames.push(r.group.toLowerCase())}var sku=r.sku||(r.name.slice(0,3).toUpperCase()+'-'+Math.random().toString(36).slice(2,6).toUpperCase());var d={name:r.name,group:r.group,sku:sku,unit:r.unit||'pcs',purchasePrice:r.purchasePrice,salePrice:r.salePrice,stock:r.stock};await saveItem('product:',d);ok++}catch(e){fail++}}
-invalidateCache('product:');invalidateCache('prodgroup:');loadP();closeModal('importProdModal');showToast('Imported '+ok+' products'+(fail?' ('+fail+' failed)':''),'success');_prodImportRows=[]}
+var existingBrandNames=prodBrands.map(function(b){return b.name.toLowerCase()});var newBrands={};
+for(var i=0;i<_prodImportRows.length;i++){try{var r=_prodImportRows[i];if(r.group&&!existingGroupNames.includes(r.group.toLowerCase())&&!newGroups[r.group.toLowerCase()]){await saveItem('prodgroup:',{name:r.group});newGroups[r.group.toLowerCase()]=true;existingGroupNames.push(r.group.toLowerCase())}if(r.brand&&!existingBrandNames.includes(r.brand.toLowerCase())&&!newBrands[r.brand.toLowerCase()]){await saveItem('prodbrand:',{name:r.brand});newBrands[r.brand.toLowerCase()]=true;existingBrandNames.push(r.brand.toLowerCase())}var sku=r.sku||(r.name.slice(0,3).toUpperCase()+'-'+Math.random().toString(36).slice(2,6).toUpperCase());var d={name:r.name,group:r.group,brand:r.brand,sku:sku,unit:r.unit||'pcs',purchasePrice:r.purchasePrice,salePrice:r.salePrice,stock:r.stock};await saveItem('product:',d);ok++}catch(e){fail++}}
+invalidateCache('product:');invalidateCache('prodgroup:');invalidateCache('prodbrand:');loadP();closeModal('importProdModal');showToast('Imported '+ok+' products'+(fail?' ('+fail+' failed)':''),'success');_prodImportRows=[]}
 loadP();
 </script>`}
 
 function stockCheckPage(){return `
 <div class="page-header"><div><div class="page-title">Stock Check</div><div class="page-sub">Quick stock availability lookup</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('sckPrint','Stock Check')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('sckTbl','StockCheck')">Export XLS</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="sckSearch" placeholder="Search product name..." oninput="filterSck()" style="padding:12px 12px 12px 36px;font-size:15px"></div><div><label>Group</label><select id="sckGroup" onchange="filterSck()"><option value="">All Groups</option></select></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="sckSearch" placeholder="Search product name..." oninput="filterSck()" style="padding:12px 12px 12px 36px;font-size:15px"></div><div><label>Group</label><select id="sckGroup" onchange="filterSck()"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="sckBrand" onchange="filterSck()"><option value="">All Brands</option></select></div></div></div>
 <div id="sckPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="sckTbl"><thead><tr><th>Product Name</th><th>Group</th><th class="r">Available Qty</th></tr></thead><tbody id="sckBody"></tbody></table></div></div></div>
 <script>
-var sckProds=[],sckGroups=[];
-async function loadSck(){var d=await Promise.all([loadList('product:'),loadList('prodgroup:')]);sckProds=d[0];sckGroups=d[1]||[];sckProds.sort(function(a,b){return(a.name||'').localeCompare(b.name||'')});document.getElementById('sckGroup').innerHTML='<option value="">All Groups</option>'+sckGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');filterSck()}
+var sckProds=[],sckGroups=[],sckBrands=[];
+async function loadSck(){var d=await Promise.all([loadList('product:'),loadList('prodgroup:'),loadList('prodbrand:')]);sckProds=d[0];sckGroups=d[1]||[];sckBrands=d[2]||[];sckProds.sort(function(a,b){return(a.name||'').localeCompare(b.name||'')});document.getElementById('sckGroup').innerHTML='<option value="">All Groups</option>'+sckGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');document.getElementById('sckBrand').innerHTML='<option value="">All Brands</option>'+sckBrands.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');filterSck()}
 function renderSck(list){document.getElementById('sckBody').innerHTML=!list.length?'<tr><td colspan="3" class="empty">No products found</td></tr>':list.map(function(p){var st=p.stock||0;return'<tr><td class="bold" style="font-size:14px">'+p.name+'</td><td>'+(p.group?'<span class="badge badge-info">'+p.group+'</span>':'-')+'</td><td class="r bold" style="font-size:15px;'+(st<=0?'color:var(--danger)':st<=5?'color:var(--warning)':'color:var(--accent)')+'">'+st+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="2">TOTAL PRODUCTS: '+list.length+'</td><td class="r">'+list.reduce(function(s,p){return s+(p.stock||0)},0)+'</td></tr>'}
-window.filterSck=function(){var t=(document.getElementById('sckSearch').value||'').trim().toLowerCase();var gf=document.getElementById('sckGroup').value;var fl=sckProds.filter(function(p){return(!t||(p.name||'').toLowerCase().includes(t))&&(!gf||p.group===gf)});renderSck(fl)}
+window.filterSck=function(){var t=(document.getElementById('sckSearch').value||'').trim().toLowerCase();var gf=document.getElementById('sckGroup').value;var bf=document.getElementById('sckBrand').value;var fl=sckProds.filter(function(p){return(!t||(p.name||'').toLowerCase().includes(t))&&(!gf||p.group===gf)&&(!bf||p.brand===bf)});renderSck(fl)}
 loadSck();
 </script>`}
 
@@ -1383,33 +1674,92 @@ function partiesPage(){return `
 <div class="page-header"><div><div class="page-title">Customers & Suppliers</div><div class="page-sub">Contacts</div></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline" onclick="openImportParty()"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-primary" onclick="openAddParty()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add</button></div></div>
 <div class="tabs"><button class="tab active" onclick="switchPT('customer',this)">Customers</button><button class="tab" onclick="switchPT('supplier',this)">Suppliers</button></div>
 <div class="search-wrap"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search..." oninput="filterPa(this.value)"></div>
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Phone</th><th>Address</th><th>Salesperson</th><th class="r">Opening Bal</th><th class="r">Credit Limit</th><th class="r">Balance</th><th class="r">Act</th></tr></thead><tbody id="paBody"></tbody></table></div></div>
-<div class="modal-overlay" id="addParty"><div class="modal"><h3 id="paTitle">Add</h3><input type="hidden" id="paEK"><div class="form-group"><label>Name</label><input id="paN"></div><div class="form-row"><div><label>Phone</label><input id="paPh"></div><div><label>Opening Balance</label><input type="number" id="paOB" placeholder="0" step="any"><div style="font-size:10px;color:var(--text-muted);margin-top:2px">Positive = Receivable/Payable, Negative = Advance</div></div></div><div class="form-row"><div><label>Credit Limit</label><input type="number" id="paCL" placeholder="0=none"></div><div></div></div><div class="form-group"><label>Address</label><input id="paAd"></div><div class="form-group" id="paSPDiv"><label>Salesperson</label><select id="paSP"><option value="">None</option></select></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('addParty')">Cancel</button><button class="btn btn-primary" onclick="savePa()">Save</button></div></div></div>
-<div class="modal-overlay" id="importPartyModal"><div class="modal" style="max-width:600px"><h3>Import Customers/Suppliers from Excel</h3>
-<div style="margin-bottom:12px;padding:10px;background:var(--bg);border-radius:8px;font-size:12px"><b>Required columns:</b> Name, Address, Salesperson, Opening Balance, Credit Limit<br><b>Note:</b> Imports into currently selected tab (Customer or Supplier). Salesperson is matched by name.</div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Phone</th><th>Thana</th><th>Salesperson</th><th class="r">Opening Bal</th><th class="r">Credit Limit</th><th class="r">Balance</th><th class="r">Act</th></tr></thead><tbody id="paBody"></tbody></table></div></div>
+<div class="modal-overlay" id="addParty"><div class="modal" style="max-width:620px"><h3 id="paTitle">Add</h3><input type="hidden" id="paEK">
+<div class="form-group"><label>Name</label><input id="paN"></div>
+<div class="form-row"><div><label>Phone</label><input id="paPh"></div><div><label>Opening Balance</label><input type="number" id="paOB" placeholder="0" step="any"><div style="font-size:10px;color:var(--text-muted);margin-top:2px">Positive = Receivable/Payable, Negative = Advance</div></div></div>
+<div class="form-row"><div><label>Credit Limit</label><input type="number" id="paCL" placeholder="0=none"></div><div></div></div>
+<div class="form-group"><label>Address</label><input id="paAd"></div>
+<div class="section-title" style="margin-top:8px;font-size:12px">Location (auto-fill enabled)</div>
+<div class="form-row"><div><label>Division</label><div class="sr-wrap"><input id="paDv" placeholder="Type to search..." oninput="geoFilter('paDv','paDvL','division')" onfocus="geoShowList('paDvL')" autocomplete="off"><div class="sr-list" id="paDvL"></div></div></div><div><label>District</label><div class="sr-wrap"><input id="paDs" placeholder="Type to search..." oninput="geoFilter('paDs','paDsL','district')" onfocus="geoShowList('paDsL')" autocomplete="off"><div class="sr-list" id="paDsL"></div></div></div></div>
+<div class="form-row"><div><label>Thana</label><div class="sr-wrap"><input id="paTh" placeholder="Type to search..." oninput="geoFilter('paTh','paThL','thana')" onfocus="geoShowList('paThL')" autocomplete="off"><div class="sr-list" id="paThL"></div></div></div><div><label>Post Office</label><div class="sr-wrap"><input id="paPo" placeholder="Type to search..." oninput="geoFilter('paPo','paPoL','postoffice')" onfocus="geoShowList('paPoL')" autocomplete="off"><div class="sr-list" id="paPoL"></div></div></div></div>
+<div class="form-row"><div><label>Postcode</label><div class="sr-wrap"><input id="paPc" placeholder="Type to search..." oninput="geoFilter('paPc','paPcL','postcode')" onfocus="geoShowList('paPcL')" autocomplete="off"><div class="sr-list" id="paPcL"></div></div></div><div></div></div>
+<div class="form-group" id="paSPDiv"><label>Salesperson</label><select id="paSP"><option value="">None</option></select></div>
+<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('addParty')">Cancel</button><button class="btn btn-primary" onclick="savePa()">Save</button></div>
+</div></div>
+<div class="modal-overlay" id="importPartyModal"><div class="modal" style="max-width:700px"><h3>Import Customers/Suppliers from Excel</h3>
+<div style="margin-bottom:12px;padding:10px;background:var(--bg);border-radius:8px;font-size:12px"><b>Columns:</b> Name, Phone, Address, Division, District, Thana, Post Office, Postcode, Salesperson, Opening Balance, Credit Limit<br><b>Note:</b> Imports into currently selected tab. Location fields are auto-validated against BD geo data.</div>
 <div style="margin-bottom:12px"><button class="btn btn-outline btn-sm" onclick="downloadPartyTemplate()"><span class="material-symbols-outlined" style="font-size:14px;vertical-align:middle">download</span> Download Template</button></div>
 <div class="form-group"><label>Select Excel File (.xlsx, .xls, .csv)</label><input type="file" id="paImportFile" accept=".xlsx,.xls,.csv"></div>
 <div id="paImportPreview" style="display:none;margin:12px 0;max-height:250px;overflow:auto"></div>
 <div id="paImportStatus" style="margin:8px 0"></div>
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('importPartyModal')">Cancel</button><button class="btn btn-primary" id="paImportBtn" onclick="doImportParty()" disabled>Import</button></div>
 </div></div>
+<style>.sr-wrap{position:relative}.sr-list{display:none;position:absolute;top:100%;left:0;right:0;max-height:180px;overflow-y:auto;background:var(--card);border:1px solid var(--border);border-radius:6px;z-index:100;box-shadow:0 4px 12px rgba(0,0,0,.15)}.sr-list.active{display:block}.sr-list div{padding:6px 10px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--border)}.sr-list div:hover,.sr-list div.hl{background:var(--accent-light);color:var(--accent)}</style>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script>
 var aP=[],pT='customer',paSPList=[],_paImportRows=[];
+var _BD_GEO=[["Dhaka","Dhaka","Demra","Demra","1360"],["Dhaka","Dhaka","Demra","Matuail","1362"],["Dhaka","Dhaka","Demra","Sarulia","1361"],["Dhaka","Dhaka","Dhaka Cantt.","Dhaka CantonmentTSO","1206"],["Dhaka","Dhaka","Dhamrai","Dhamrai","1350"],["Dhaka","Dhaka","Dhamrai","Kamalpur","1351"],["Dhaka","Dhaka","Dhanmondi","Jigatala TSO","1209"],["Dhaka","Dhaka","Gulshan","Banani TSO","1213"],["Dhaka","Dhaka","Gulshan","Gulshan Model Town","1212"],["Dhaka","Dhaka","Jatrabari","Dhania TSO","1232"],["Dhaka","Dhaka","Joypara","Joypara","1330"],["Dhaka","Dhaka","Joypara","Narisha","1332"],["Dhaka","Dhaka","Joypara","Palamganj","1331"],["Dhaka","Dhaka","Keraniganj","Ati","1312"],["Dhaka","Dhaka","Keraniganj","Dhaka Jute Mills","1311"],["Dhaka","Dhaka","Keraniganj","Kalatia","1313"],["Dhaka","Dhaka","Keraniganj","Keraniganj","1310"],["Dhaka","Dhaka","Khilgaon","KhilgaonTSO","1219"],["Dhaka","Dhaka","Khilkhet","KhilkhetTSO","1229"],["Dhaka","Dhaka","Lalbag","Posta TSO","1211"],["Dhaka","Dhaka","Mirpur","Mirpur TSO","1216"],["Dhaka","Dhaka","Mohammadpur","Mohammadpur Housing","1207"],["Dhaka","Dhaka","Mohammadpur","Sangsad BhabanTSO","1225"],["Dhaka","Dhaka","Motijheel","BangabhabanTSO","1222"],["Dhaka","Dhaka","Motijheel","DilkushaTSO","1223"],["Dhaka","Dhaka","Nawabganj","Agla","1323"],["Dhaka","Dhaka","Nawabganj","Churain","1325"],["Dhaka","Dhaka","Nawabganj","Daudpur","1322"],["Dhaka","Dhaka","Nawabganj","Hasnabad","1321"],["Dhaka","Dhaka","Nawabganj","Khalpar","1324"],["Dhaka","Dhaka","Nawabganj","Nawabganj","1320"],["Dhaka","Dhaka","New market","New Market TSO","1205"],["Dhaka","Dhaka","Palton","Dhaka GPO","1000"],["Dhaka","Dhaka","Ramna","Shantinagr TSO","1217"],["Dhaka","Dhaka","Sabujbag","Basabo TSO","1214"],["Dhaka","Dhaka","Savar","Amin Bazar","1348"],["Dhaka","Dhaka","Savar","Dairy Farm","1341"],["Dhaka","Dhaka","Savar","EPZ","1349"],["Dhaka","Dhaka","Savar","Jahangirnagar Univer","1342"],["Dhaka","Dhaka","Savar","Kashem Cotton Mills","1346"],["Dhaka","Dhaka","Savar","Rajphulbaria","1347"],["Dhaka","Dhaka","Savar","Savar","1340"],["Dhaka","Dhaka","Savar","Savar Canttonment","1344"],["Dhaka","Dhaka","Savar","Saver P.A.T.C","1343"],["Dhaka","Dhaka","Savar","Shimulia","1345"],["Dhaka","Dhaka","Sutrapur","Dhaka Sadar HO","1100"],["Dhaka","Dhaka","Sutrapur","Gendaria TSO","1204"],["Dhaka","Dhaka","Sutrapur","Wari TSO","1203"],["Dhaka","Dhaka","Tejgaon","Tejgaon TSO","1215"],["Dhaka","Dhaka","Tejgaon Industrial Area","Dhaka Politechnic","1208"],["Dhaka","Dhaka","Uttara","Uttara Model TwonTSO","1230"],["Dhaka","Faridpur","Alfadanga","Alfadanga","7870"],["Dhaka","Faridpur","Bhanga","Bhanga","7830"],["Dhaka","Faridpur","Boalmari","Boalmari","7860"],["Dhaka","Faridpur","Boalmari","Rupatpat","7861"],["Dhaka","Faridpur","Charbhadrasan","Charbadrashan","7810"],["Dhaka","Faridpur","Faridpur Sadar","Ambikapur","7802"],["Dhaka","Faridpur","Faridpur Sadar","Baitulaman Politecni","7803"],["Dhaka","Faridpur","Faridpur Sadar","Faridpursadar","7800"],["Dhaka","Faridpur","Faridpur Sadar","Kanaipur","7801"],["Dhaka","Faridpur","Madukhali","Kamarkali","7851"],["Dhaka","Faridpur","Madukhali","Madukhali","7850"],["Dhaka","Faridpur","Nagarkanda","Nagarkanda","7840"],["Dhaka","Faridpur","Nagarkanda","Talma","7841"],["Dhaka","Faridpur","Sadarpur","Bishwa jaker Manjil","7822"],["Dhaka","Faridpur","Sadarpur","Hat Krishapur","7821"],["Dhaka","Faridpur","Sadarpur","Sadarpur","7820"],["Dhaka","Faridpur","Shriangan","Shriangan","7804"],["Dhaka","Gazipur","Gazipur Sadar","B.O.F","1703"],["Dhaka","Gazipur","Gazipur Sadar","B.R.R","1701"],["Dhaka","Gazipur","Gazipur Sadar","Chandna","1702"],["Dhaka","Gazipur","Gazipur Sadar","Gazipur Sadar","1700"],["Dhaka","Gazipur","Gazipur Sadar","National University","1704"],["Dhaka","Gazipur","Kaliakaar","Kaliakaar","1750"],["Dhaka","Gazipur","Kaliakaar","Safipur","1751"],["Dhaka","Gazipur","Kaliganj","Kaliganj","1720"],["Dhaka","Gazipur","Kaliganj","Pubail","1721"],["Dhaka","Gazipur","Kaliganj","Santanpara","1722"],["Dhaka","Gazipur","Kaliganj","Vaoal Jamalpur","1723"],["Dhaka","Gazipur","Kapashia","kapashia","1730"],["Dhaka","Gazipur","Monnunagar","Ershad Nagar","1712"],["Dhaka","Gazipur","Monnunagar","Monnunagar","1710"],["Dhaka","Gazipur","Monnunagar","Nishat Nagar","1711"],["Dhaka","Gazipur","Sreepur","Barmi","1743"],["Dhaka","Gazipur","Sreepur","Bashamur","1747"],["Dhaka","Gazipur","Sreepur","Boubi","1748"],["Dhaka","Gazipur","Sreepur","Kawraid","1745"],["Dhaka","Gazipur","Sreepur","Satkhamair","1744"],["Dhaka","Gazipur","Sreepur","Sreepur","1740"],["Dhaka","Gazipur","Sripur","Rajendrapur","1741"],["Dhaka","Gazipur","Sripur","Rajendrapur Canttome","1742"],["Dhaka","Gopalganj","Gopalganj Sadar","Barfa","8102"],["Dhaka","Gopalganj","Gopalganj Sadar","Chandradighalia","8013"],["Dhaka","Gopalganj","Gopalganj Sadar","Gopalganj Sadar","8100"],["Dhaka","Gopalganj","Gopalganj Sadar","Ulpur","8101"],["Dhaka","Gopalganj","Kashiani","Jonapur","8133"],["Dhaka","Gopalganj","Kashiani","Kashiani","8130"],["Dhaka","Gopalganj","Kashiani","Ramdia College","8131"],["Dhaka","Gopalganj","Kashiani","Ratoil","8132"],["Dhaka","Gopalganj","Kotalipara","Kotalipara","8110"],["Dhaka","Gopalganj","Maksudpur","Batkiamari","8141"],["Dhaka","Gopalganj","Maksudpur","Khandarpara","8142"],["Dhaka","Gopalganj","Maksudpur","Maksudpur","8140"],["Dhaka","Gopalganj","Tungipara","Patgati","8121"],["Dhaka","Gopalganj","Tungipara","Tungipara","8120"],["Dhaka","Jamalpur","Dewangonj","Dewangonj","2030"],["Dhaka","Jamalpur","Dewangonj","Dewangonj S. Mills","2031"],["Dhaka","Jamalpur","Islampur","Durmoot","2021"],["Dhaka","Jamalpur","Islampur","Gilabari","2022"],["Dhaka","Jamalpur","Islampur","Islampur","2020"],["Dhaka","Jamalpur","Jamalpur","Jamalpur","2000"],["Dhaka","Jamalpur","Jamalpur","Nandina","2001"],["Dhaka","Jamalpur","Jamalpur","Narundi","2002"],["Dhaka","Jamalpur","Malandah","Jamalpur","2011"],["Dhaka","Jamalpur","Malandah","Mahmoodpur","2013"],["Dhaka","Jamalpur","Malandah","Malancha","2012"],["Dhaka","Jamalpur","Malandah","Malandah","2010"],["Dhaka","Jamalpur","Mathargonj","Balijhuri","2041"],["Dhaka","Jamalpur","Mathargonj","Mathargonj","2040"],["Dhaka","Jamalpur","Shorishabari","Bausee","2052"],["Dhaka","Jamalpur","Shorishabari","Gunerbari","2051"],["Dhaka","Jamalpur","Shorishabari","Jagannath Ghat","2053"],["Dhaka","Jamalpur","Shorishabari","Jamuna Sar Karkhana","2055"],["Dhaka","Jamalpur","Shorishabari","Pingna","2054"],["Dhaka","Jamalpur","Shorishabari","Shorishabari","2050"],["Dhaka","Kishoreganj","Bajitpur","Bajitpur","2336"],["Dhaka","Kishoreganj","Bajitpur","Laksmipur","2338"],["Dhaka","Kishoreganj","Bajitpur","Sararchar","2337"],["Dhaka","Kishoreganj","Bhairob","Bhairab","2350"],["Dhaka","Kishoreganj","Hossenpur","Hossenpur","2320"],["Dhaka","Kishoreganj","Itna","Itna","2390"],["Dhaka","Kishoreganj","Karimganj","Karimganj","2310"],["Dhaka","Kishoreganj","Katiadi","Gochhihata","2331"],["Dhaka","Kishoreganj","Katiadi","Katiadi","2330"],["Dhaka","Kishoreganj","Kishoreganj Sadar","Kishoreganj S.Mills","2301"],["Dhaka","Kishoreganj","Kishoreganj Sadar","Kishoreganj Sadar","2300"],["Dhaka","Kishoreganj","Kishoreganj Sadar","Maizhati","2302"],["Dhaka","Kishoreganj","Kishoreganj Sadar","Nilganj","2303"],["Dhaka","Kishoreganj","Kuliarchar","Chhoysuti","2341"],["Dhaka","Kishoreganj","Kuliarchar","Kuliarchar","2340"],["Dhaka","Kishoreganj","Mithamoin","Abdullahpur","2371"],["Dhaka","Kishoreganj","Mithamoin","MIthamoin","2370"],["Dhaka","Kishoreganj","Nikli","Nikli","2360"],["Dhaka","Kishoreganj","Ostagram","Ostagram","2380"],["Dhaka","Kishoreganj","Pakundia","Pakundia","2326"],["Dhaka","Kishoreganj","Tarial","Tarial","2316"],["Dhaka","Madaripur","Barhamganj","Bahadurpur","7932"],["Dhaka","Madaripur","Barhamganj","Barhamganj","7930"],["Dhaka","Madaripur","Barhamganj","Nilaksmibandar","7931"],["Dhaka","Madaripur","Barhamganj","Umedpur","7933"],["Dhaka","Madaripur","kalkini","Kalkini","7920"],["Dhaka","Madaripur","kalkini","Sahabrampur","7921"],["Dhaka","Madaripur","Madaripur Sadar","Charmugria","7901"],["Dhaka","Madaripur","Madaripur Sadar","Habiganj","7903"],["Dhaka","Madaripur","Madaripur Sadar","Kulpaddi","7902"],["Dhaka","Madaripur","Madaripur Sadar","Madaripur Sadar","7900"],["Dhaka","Madaripur","Madaripur Sadar","Mustafapur","7904"],["Dhaka","Madaripur","Rajoir","Khalia","7911"],["Dhaka","Madaripur","Rajoir","Rajoir","7910"],["Dhaka","Manikganj","Doulatpur","Doulatpur","1860"],["Dhaka","Manikganj","Gheor","Gheor","1840"],["Dhaka","Manikganj","Lechhraganj","Jhitka","1831"],["Dhaka","Manikganj","Lechhraganj","Lechhraganj","1830"],["Dhaka","Manikganj","Manikganj Sadar","Barangail","1804"],["Dhaka","Manikganj","Manikganj Sadar","Gorpara","1802"],["Dhaka","Manikganj","Manikganj Sadar","Mahadebpur","1803"],["Dhaka","Manikganj","Manikganj Sadar","Manikganj Bazar","1801"],["Dhaka","Manikganj","Manikganj Sadar","Manikganj Sadar","1800"],["Dhaka","Manikganj","Saturia","Baliati","1811"],["Dhaka","Manikganj","Saturia","Saturia","1810"],["Dhaka","Manikganj","Shibloya","Aricha","1851"],["Dhaka","Manikganj","Shibloya","Shibaloy","1850"],["Dhaka","Manikganj","Shibloya","Tewta","1852"],["Dhaka","Manikganj","Shibloya","Uthli","1853"],["Dhaka","Manikganj","Singari","Baira","1821"],["Dhaka","Manikganj","Singari","joymantop","1822"],["Dhaka","Manikganj","Singari","Singair","1820"],["Dhaka","Munshiganj","Gajaria","Gajaria","1510"],["Dhaka","Munshiganj","Gajaria","Hossendi","1511"],["Dhaka","Munshiganj","Gajaria","Rasulpur","1512"],["Dhaka","Munshiganj","Lohajong","Gouragonj","1334"],["Dhaka","Munshiganj","Lohajong","Gouragonj","1534"],["Dhaka","Munshiganj","Lohajong","Haldia SO","1532"],["Dhaka","Munshiganj","Lohajong","Haridia","1333"],["Dhaka","Munshiganj","Lohajong","Haridia DESO","1533"],["Dhaka","Munshiganj","Lohajong","Korhati","1531"],["Dhaka","Munshiganj","Lohajong","Lohajang","1530"],["Dhaka","Munshiganj","Lohajong","Madini Mandal","1335"],["Dhaka","Munshiganj","Lohajong","Medini Mandal EDSO","1535"],["Dhaka","Munshiganj","Munshiganj Sadar","Kathakhali","1503"],["Dhaka","Munshiganj","Munshiganj Sadar","Mirkadim","1502"],["Dhaka","Munshiganj","Munshiganj Sadar","Munshiganj Sadar","1500"],["Dhaka","Munshiganj","Munshiganj Sadar","Rikabibazar","1501"],["Dhaka","Munshiganj","Sirajdikhan","Ichapur","1542"],["Dhaka","Munshiganj","Sirajdikhan","Kola","1541"],["Dhaka","Munshiganj","Sirajdikhan","Malkha Nagar","1543"],["Dhaka","Munshiganj","Sirajdikhan","Shekher Nagar","1544"],["Dhaka","Munshiganj","Sirajdikhan","Sirajdikhan","1540"],["Dhaka","Munshiganj","Srinagar","Baghra","1557"],["Dhaka","Munshiganj","Srinagar","Barikhal","1551"],["Dhaka","Munshiganj","Srinagar","Bhaggyakul","1558"],["Dhaka","Munshiganj","Srinagar","Hashara","1553"],["Dhaka","Munshiganj","Srinagar","Kolapara","1554"],["Dhaka","Munshiganj","Srinagar","Kumarbhog","1555"],["Dhaka","Munshiganj","Srinagar","Mazpara","1552"],["Dhaka","Munshiganj","Srinagar","Srinagar","1550"],["Dhaka","Munshiganj","Srinagar","Vaggyakul SO","1556"],["Dhaka","Munshiganj","Tangibari","Bajrajugini","1523"],["Dhaka","Munshiganj","Tangibari","Baligao","1522"],["Dhaka","Munshiganj","Tangibari","Betkahat","1521"],["Dhaka","Munshiganj","Tangibari","Dighirpar","1525"],["Dhaka","Munshiganj","Tangibari","Hasail","1524"],["Dhaka","Munshiganj","Tangibari","Pura","1527"],["Dhaka","Munshiganj","Tangibari","Pura EDSO","1526"],["Dhaka","Munshiganj","Tangibari","Tangibari","1520"],["Dhaka","Mymensingh","Bhaluka","Bhaluka","2240"],["Dhaka","Mymensingh","Fulbaria","Fulbaria","2216"],["Dhaka","Mymensingh","Gaforgaon","Duttarbazar","2234"],["Dhaka","Mymensingh","Gaforgaon","Gaforgaon","2230"],["Dhaka","Mymensingh","Gaforgaon","Kandipara","2233"],["Dhaka","Mymensingh","Gaforgaon","Shibganj","2231"],["Dhaka","Mymensingh","Gaforgaon","Usti","2232"],["Dhaka","Mymensingh","Gouripur","Gouripur","2270"],["Dhaka","Mymensingh","Gouripur","Ramgopalpur","2271"],["Dhaka","Mymensingh","Haluaghat","Dhara","2261"],["Dhaka","Mymensingh","Haluaghat","Haluaghat","2260"],["Dhaka","Mymensingh","Haluaghat","Munshirhat","2262"],["Dhaka","Mymensingh","Isshwargonj","Atharabari","2282"],["Dhaka","Mymensingh","Isshwargonj","Isshwargonj","2280"],["Dhaka","Mymensingh","Isshwargonj","Sohagi","2281"],["Dhaka","Mymensingh","Muktagachha","Muktagachha","2210"],["Dhaka","Mymensingh","Mymensingh Sadar","Agriculture Universi","2202"],["Dhaka","Mymensingh","Mymensingh Sadar","Biddyaganj","2204"],["Dhaka","Mymensingh","Mymensingh Sadar","Kawatkhali","2201"],["Dhaka","Mymensingh","Mymensingh Sadar","Mymensingh Sadar","2200"],["Dhaka","Mymensingh","Mymensingh Sadar","Pearpur","2205"],["Dhaka","Mymensingh","Mymensingh Sadar","Shombhuganj","2203"],["Dhaka","Mymensingh","Nandail","Gangail","2291"],["Dhaka","Mymensingh","Nandail","Nandail","2290"],["Dhaka","Mymensingh","Phulpur","Beltia","2251"],["Dhaka","Mymensingh","Phulpur","Phulpur","2250"],["Dhaka","Mymensingh","Phulpur","Tarakanda","2252"],["Dhaka","Mymensingh","Trishal","Ahmadbad","2221"],["Dhaka","Mymensingh","Trishal","Dhala","2223"],["Dhaka","Mymensingh","Trishal","Ram Amritaganj","2222"],["Dhaka","Mymensingh","Trishal","Trishal","2220"],["Dhaka","Narayanganj","Araihazar","Araihazar","1450"],["Dhaka","Narayanganj","Araihazar","Gopaldi","1451"],["Dhaka","Narayanganj","Baidder Bazar","Baidder Bazar","1440"],["Dhaka","Narayanganj","Baidder Bazar","Bara Nagar","1441"],["Dhaka","Narayanganj","Baidder Bazar","Barodi","1442"],["Dhaka","Narayanganj","Bandar","Bandar","1410"],["Dhaka","Narayanganj","Bandar","BIDS","1413"],["Dhaka","Narayanganj","Bandar","D.C Mills","1411"],["Dhaka","Narayanganj","Bandar","Madanganj","1414"],["Dhaka","Narayanganj","Bandar","Nabiganj","1412"],["Dhaka","Narayanganj","Fatullah","Fatulla Bazar","1421"],["Dhaka","Narayanganj","Fatullah","Fatullah","1420"],["Dhaka","Narayanganj","Narayanganj Sadar","Narayanganj Sadar","1400"],["Dhaka","Narayanganj","Rupganj","Bhulta","1462"],["Dhaka","Narayanganj","Rupganj","Kanchan","1461"],["Dhaka","Narayanganj","Rupganj","Murapara","1464"],["Dhaka","Narayanganj","Rupganj","Nagri","1463"],["Dhaka","Narayanganj","Rupganj","Rupganj","1460"],["Dhaka","Narayanganj","Siddirganj","Adamjeenagar","1431"],["Dhaka","Narayanganj","Siddirganj","LN Mills","1432"],["Dhaka","Narayanganj","Siddirganj","Siddirganj","1430"],["Dhaka","Narshingdi","Belabo","Belabo","1640"],["Dhaka","Narshingdi","Monohordi","Hatirdia","1651"],["Dhaka","Narshingdi","Monohordi","Katabaria","1652"],["Dhaka","Narshingdi","Monohordi","Monohordi","1650"],["Dhaka","Narshingdi","Narshingdi Sadar","Karimpur","1605"],["Dhaka","Narshingdi","Narshingdi Sadar","Madhabdi","1604"],["Dhaka","Narshingdi","Narshingdi Sadar","Narshingdi College","1602"],["Dhaka","Narshingdi","Narshingdi Sadar","Narshingdi Sadar","1600"],["Dhaka","Narshingdi","Narshingdi Sadar","Panchdona","1603"],["Dhaka","Narshingdi","Narshingdi Sadar","UMC Jute Mills","1601"],["Dhaka","Narshingdi","Palash","Char Sindhur","1612"],["Dhaka","Narshingdi","Palash","Ghorashal","1613"],["Dhaka","Narshingdi","Palash","Ghorashal Urea Facto","1611"],["Dhaka","Narshingdi","Palash","Palash","1610"],["Dhaka","Narshingdi","Raypura","Bazar Hasnabad","1631"],["Dhaka","Narshingdi","Raypura","Radhaganj bazar","1632"],["Dhaka","Narshingdi","Raypura","Raypura","1630"],["Dhaka","Narshingdi","Shibpur","Shibpur","1620"],["Dhaka","Netrakona","Susung Durgapur","Susnng Durgapur","2420"],["Dhaka","Netrakona","Atpara","Atpara","2470"],["Dhaka","Netrakona","Barhatta","Barhatta","2440"],["Dhaka","Netrakona","Dharmapasha","Dharampasha","2450"],["Dhaka","Netrakona","Dhobaura","Dhobaura","2416"],["Dhaka","Netrakona","Dhobaura","Sakoai","2417"],["Dhaka","Netrakona","Kalmakanda","Kalmakanda","2430"],["Dhaka","Netrakona","Kendua","Kendua","2480"],["Dhaka","Netrakona","Khaliajuri","Khaliajhri","2460"],["Dhaka","Netrakona","Khaliajuri","Shaldigha","2462"],["Dhaka","Netrakona","Madan","Madan","2490"],["Dhaka","Netrakona","Moddhynagar","Moddoynagar","2456"],["Dhaka","Netrakona","Mohanganj","Mohanganj","2446"],["Dhaka","Netrakona","Netrakona Sadar","Baikherhati","2401"],["Dhaka","Netrakona","Netrakona Sadar","Netrakona Sadar","2400"],["Dhaka","Netrakona","Purbadhola","Jaria Jhanjhail","2412"],["Dhaka","Netrakona","Purbadhola","Purbadhola","2410"],["Dhaka","Netrakona","Purbadhola","Shamgonj","2411"],["Dhaka","Rajbari","Baliakandi","Baliakandi","7730"],["Dhaka","Rajbari","Baliakandi","Nalia","7731"],["Dhaka","Rajbari","Pangsha","Mrigibazar","7723"],["Dhaka","Rajbari","Pangsha","Pangsha","7720"],["Dhaka","Rajbari","Pangsha","Ramkol","7721"],["Dhaka","Rajbari","Pangsha","Ratandia","7722"],["Dhaka","Rajbari","Rajbari Sadar","Goalanda","7710"],["Dhaka","Rajbari","Rajbari Sadar","Khankhanapur","7711"],["Dhaka","Rajbari","Rajbari Sadar","Rajbari Sadar","7700"],["Dhaka","Shariatpur","Bhedorganj","Bhedorganj","8030"],["Dhaka","Shariatpur","Damudhya","Damudhya","8040"],["Dhaka","Shariatpur","Gosairhat","Gosairhat","8050"],["Dhaka","Shariatpur","Jajira","Jajira","8010"],["Dhaka","Shariatpur","Naria","Bhozeshwar","8021"],["Dhaka","Shariatpur","Naria","Gharisar","8022"],["Dhaka","Shariatpur","Naria","Kartikpur","8024"],["Dhaka","Shariatpur","Naria","Naria","8020"],["Dhaka","Shariatpur","Naria","Upshi","8023"],["Dhaka","Shariatpur","Shariatpur Sadar","Angaria","8001"],["Dhaka","Shariatpur","Shariatpur Sadar","Chikandi","8002"],["Dhaka","Shariatpur","Shariatpur Sadar","Shariatpur Sadar","8000"],["Dhaka","Sherpur","Bakshigonj","Bakshigonj","2140"],["Dhaka","Sherpur","Jhinaigati","Jhinaigati","2120"],["Dhaka","Sherpur","Nakla","Gonopaddi","2151"],["Dhaka","Sherpur","Nakla","Nakla","2150"],["Dhaka","Sherpur","Nalitabari","Hatibandha","2111"],["Dhaka","Sherpur","Nalitabari","Nalitabari","2110"],["Dhaka","Sherpur","Sherpur Shadar","Sherpur Shadar","2100"],["Dhaka","Sherpur","Shribardi","Shribardi","2130"],["Dhaka","Tangail","Basail","Basail","1920"],["Dhaka","Tangail","Bhuapur","Bhuapur","1960"],["Dhaka","Tangail","Delduar","Delduar","1910"],["Dhaka","Tangail","Delduar","Elasin","1913"],["Dhaka","Tangail","Delduar","Hinga Nagar","1914"],["Dhaka","Tangail","Delduar","Jangalia","1911"],["Dhaka","Tangail","Delduar","Lowhati","1915"],["Dhaka","Tangail","Delduar","Patharail","1912"],["Dhaka","Tangail","Ghatail","D. Pakutia","1982"],["Dhaka","Tangail","Ghatail","Dhalapara","1983"],["Dhaka","Tangail","Ghatail","Ghatial","1980"],["Dhaka","Tangail","Ghatail","Lohani","1984"],["Dhaka","Tangail","Ghatail","Zahidganj","1981"],["Dhaka","Tangail","Gopalpur","Gopalpur","1990"],["Dhaka","Tangail","Gopalpur","Hemnagar","1992"],["Dhaka","Tangail","Gopalpur","Jhowail","1991"],["Dhaka","Tangail","Kalihati","Ballabazar","1973"],["Dhaka","Tangail","Kalihati","Elinga","1974"],["Dhaka","Tangail","Kalihati","Kalihati","1970"],["Dhaka","Tangail","Kalihati","Nagarbari","1977"],["Dhaka","Tangail","Kalihati","Nagarbari SO","1976"],["Dhaka","Tangail","Kalihati","Nagbari","1972"],["Dhaka","Tangail","Kalihati","Palisha","1975"],["Dhaka","Tangail","Kalihati","Rajafair","1971"],["Dhaka","Tangail","Kashkaolia","Kashkawlia","1930"],["Dhaka","Tangail","Madhupur","Dhobari","1997"],["Dhaka","Tangail","Madhupur","Madhupur","1996"],["Dhaka","Tangail","Mirzapur","Gorai","1941"],["Dhaka","Tangail","Mirzapur","Jarmuki","1944"],["Dhaka","Tangail","Mirzapur","M.C. College","1942"],["Dhaka","Tangail","Mirzapur","Mirzapur","1940"],["Dhaka","Tangail","Mirzapur","Mohera","1945"],["Dhaka","Tangail","Mirzapur","Warri paikpara","1943"],["Dhaka","Tangail","Nagarpur","Dhuburia","1937"],["Dhaka","Tangail","Nagarpur","Nagarpur","1936"],["Dhaka","Tangail","Nagarpur","Salimabad","1938"],["Dhaka","Tangail","Sakhipur","Kochua","1951"],["Dhaka","Tangail","Sakhipur","Sakhipur","1950"],["Dhaka","Tangail","Tangail Sadar","Kagmari","1901"],["Dhaka","Tangail","Tangail Sadar","Korotia","1903"],["Dhaka","Tangail","Tangail Sadar","Purabari","1904"],["Dhaka","Tangail","Tangail Sadar","Santosh","1902"],["Dhaka","Tangail","Tangail Sadar","Tangail Sadar","1900"],["Chittagong","Bandarban","Alikadam","Alikadam","4650"],["Chittagong","Bandarban","Bandarban Sadar","Bandarban Sadar","4600"],["Chittagong","Bandarban","Naikhong","Naikhong","4660"],["Chittagong","Bandarban","Roanchhari","Roanchhari","4610"],["Chittagong","Bandarban","Ruma","Ruma","4620"],["Chittagong","Bandarban","Thanchi","Lama","4641"],["Chittagong","Bandarban","Thanchi","Thanchi","4630"],["Chittagong","Brahmanbaria","Akhaura","Akhaura","3450"],["Chittagong","Brahmanbaria","Akhaura","Azampur","3451"],["Chittagong","Brahmanbaria","Akhaura","Gangasagar","3452"],["Chittagong","Brahmanbaria","Banchharampur","Banchharampur","3420"],["Chittagong","Brahmanbaria","Brahamanbaria Sadar","Ashuganj","3402"],["Chittagong","Brahmanbaria","Brahamanbaria Sadar","Ashuganj Share","3403"],["Chittagong","Brahmanbaria","Brahamanbaria Sadar","Brahamanbaria Sadar","3400"],["Chittagong","Brahmanbaria","Brahamanbaria Sadar","Poun","3404"],["Chittagong","Brahmanbaria","Brahamanbaria Sadar","Talshahar","3401"],["Chittagong","Brahmanbaria","Kasba","Chandidar","3462"],["Chittagong","Brahmanbaria","Kasba","Chargachh","3463"],["Chittagong","Brahmanbaria","Kasba","Gopinathpur","3464"],["Chittagong","Brahmanbaria","Kasba","Kasba","3460"],["Chittagong","Brahmanbaria","Kasba","Kuti","3461"],["Chittagong","Brahmanbaria","Nabinagar","Jibanganj","3419"],["Chittagong","Brahmanbaria","Nabinagar","Kaitala","3417"],["Chittagong","Brahmanbaria","Nabinagar","Laubfatehpur","3411"],["Chittagong","Brahmanbaria","Nabinagar","Nabinagar","3410"],["Chittagong","Brahmanbaria","Nabinagar","Rasullabad","3412"],["Chittagong","Brahmanbaria","Nabinagar","Ratanpur","3414"],["Chittagong","Brahmanbaria","Nabinagar","Salimganj","3418"],["Chittagong","Brahmanbaria","Nabinagar","Shahapur","3415"],["Chittagong","Brahmanbaria","Nabinagar","Shamgram","3413"],["Chittagong","Brahmanbaria","Nasirnagar","Fandauk","3441"],["Chittagong","Brahmanbaria","Nasirnagar","Nasirnagar","3440"],["Chittagong","Brahmanbaria","Sarail","Chandura","3432"],["Chittagong","Brahmanbaria","Sarail","Sarial","3430"],["Chittagong","Brahmanbaria","Sarail","Shahbajpur","3431"],["Chittagong","Chandpur","Chandpur Sadar","Baburhat","3602"],["Chittagong","Chandpur","Chandpur Sadar","Chandpur Sadar","3600"],["Chittagong","Chandpur","Chandpur Sadar","Puranbazar","3601"],["Chittagong","Chandpur","Chandpur Sadar","Sahatali","3603"],["Chittagong","Chandpur","Faridganj","Chandra","3651"],["Chittagong","Chandpur","Faridganj","Faridganj","3650"],["Chittagong","Chandpur","Faridganj","Gridkaliandia","3653"],["Chittagong","Chandpur","Faridganj","Islampur Shah Isain","3655"],["Chittagong","Chandpur","Faridganj","Rampurbazar","3654"],["Chittagong","Chandpur","Faridganj","Rupsha","3652"],["Chittagong","Chandpur","Hajiganj","Bolakhal","3611"],["Chittagong","Chandpur","Hajiganj","Hajiganj","3610"],["Chittagong","Chandpur","Hayemchar","Gandamara","3661"],["Chittagong","Chandpur","Hayemchar","Hayemchar","3660"],["Chittagong","Chandpur","Kachua","Kachua","3630"],["Chittagong","Chandpur","Kachua","Pak Shrirampur","3631"],["Chittagong","Chandpur","Kachua","Rahima Nagar","3632"],["Chittagong","Chandpur","Kachua","Shachar","3633"],["Chittagong","Chandpur","Matlobganj","Kalipur","3642"],["Chittagong","Chandpur","Matlobganj","Matlobganj","3640"],["Chittagong","Chandpur","Matlobganj","Mohanpur","3641"],["Chittagong","Chandpur","Shahrasti","Chotoshi","3623"],["Chittagong","Chandpur","Shahrasti","Islamia Madrasha","3624"],["Chittagong","Chandpur","Shahrasti","Khilabazar","3621"],["Chittagong","Chandpur","Shahrasti","Pashchim Kherihar Al","3622"],["Chittagong","Chandpur","Shahrasti","Shahrasti","3620"],["Chittagong","Chittagong","Anawara","Anowara","4376"],["Chittagong","Chittagong","Anawara","Battali","4378"],["Chittagong","Chittagong","Anawara","Paroikora","4377"],["Chittagong","Chittagong","Boalkhali","Boalkhali","4366"],["Chittagong","Chittagong","Boalkhali","Charandwip","4369"],["Chittagong","Chittagong","Boalkhali","Iqbal Park","4365"],["Chittagong","Chittagong","Boalkhali","Kadurkhal","4368"],["Chittagong","Chittagong","Boalkhali","Kanungopara","4363"],["Chittagong","Chittagong","Boalkhali","Sakpura","4367"],["Chittagong","Chittagong","Boalkhali","Saroatoli","4364"],["Chittagong","Chittagong","Chittagong Sadar","Al- Amin Baria Madra","4221"],["Chittagong","Chittagong","Chittagong Sadar","Amin Jute Mills","4211"],["Chittagong","Chittagong","Chittagong Sadar","Anandabazar","4215"],["Chittagong","Chittagong","Chittagong Sadar","Bayezid Bostami","4210"],["Chittagong","Chittagong","Chittagong Sadar","Chandgaon","4212"],["Chittagong","Chittagong","Chittagong Sadar","Chawkbazar","4203"],["Chittagong","Chittagong","Chittagong Sadar","Chitt. Cantonment","4220"],["Chittagong","Chittagong","Chittagong Sadar","Chitt. Customs Acca","4219"],["Chittagong","Chittagong","Chittagong Sadar","Chitt. Politechnic In","4209"],["Chittagong","Chittagong","Chittagong Sadar","Chitt. Sailers Colon","4218"],["Chittagong","Chittagong","Chittagong Sadar","Chittagong Airport","4205"],["Chittagong","Chittagong","Chittagong Sadar","Chittagong Bandar","4100"],["Chittagong","Chittagong","Chittagong Sadar","Chittagong GPO","4000"],["Chittagong","Chittagong","Chittagong Sadar","Export Processing","4223"],["Chittagong","Chittagong","Chittagong Sadar","Firozshah","4207"],["Chittagong","Chittagong","Chittagong Sadar","Halishahar","4216"],["Chittagong","Chittagong","Chittagong Sadar","Halishshar","4225"],["Chittagong","Chittagong","Chittagong Sadar","Jalalabad","4214"],["Chittagong","Chittagong","Chittagong Sadar","Jaldia Merine Accade","4206"],["Chittagong","Chittagong","Chittagong Sadar","Middle Patenga","4222"],["Chittagong","Chittagong","Chittagong Sadar","Mohard","4208"],["Chittagong","Chittagong","Chittagong Sadar","North Halishahar","4226"],["Chittagong","Chittagong","Chittagong Sadar","North Katuli","4217"],["Chittagong","Chittagong","Chittagong Sadar","Pahartoli","4202"],["Chittagong","Chittagong","Chittagong Sadar","Patenga","4204"],["Chittagong","Chittagong","Chittagong Sadar","Rampura TSO","4224"],["Chittagong","Chittagong","Chittagong Sadar","Wazedia","4213"],["Chittagong","Chittagong","East Joara","Barma","4383"],["Chittagong","Chittagong","East Joara","Dohazari","4382"],["Chittagong","Chittagong","East Joara","East Joara","4380"],["Chittagong","Chittagong","East Joara","Gachbaria","4381"],["Chittagong","Chittagong","Fatikchhari","Bhandar Sharif","4352"],["Chittagong","Chittagong","Fatikchhari","Fatikchhari","4350"],["Chittagong","Chittagong","Fatikchhari","Harualchhari","4354"],["Chittagong","Chittagong","Fatikchhari","Najirhat","4353"],["Chittagong","Chittagong","Fatikchhari","Nanupur","4351"],["Chittagong","Chittagong","Fatikchhari","Narayanhat","4355"],["Chittagong","Chittagong","Hathazari","Chitt.University","4331"],["Chittagong","Chittagong","Hathazari","Fatahabad","4335"],["Chittagong","Chittagong","Hathazari","Gorduara","4332"],["Chittagong","Chittagong","Hathazari","Hathazari","4330"],["Chittagong","Chittagong","Hathazari","Katirhat","4333"],["Chittagong","Chittagong","Hathazari","Madrasa","4339"],["Chittagong","Chittagong","Hathazari","Mirzapur","4334"],["Chittagong","Chittagong","Hathazari","Nuralibari","4337"],["Chittagong","Chittagong","Hathazari","Yunus Nagar","4338"],["Chittagong","Chittagong","Jaldi","Banigram","4393"],["Chittagong","Chittagong","Jaldi","Gunagari","4392"],["Chittagong","Chittagong","Jaldi","Jaldi","4390"],["Chittagong","Chittagong","Jaldi","Khan Bahadur","4391"],["Chittagong","Chittagong","Lohagara","Chunti","4398"],["Chittagong","Chittagong","Lohagara","Lohagara","4396"],["Chittagong","Chittagong","Lohagara","Padua","4397"],["Chittagong","Chittagong","Mirsharai","Abutorab","4321"],["Chittagong","Chittagong","Mirsharai","Azampur","4325"],["Chittagong","Chittagong","Mirsharai","Bharawazhat","4323"],["Chittagong","Chittagong","Mirsharai","Darrogahat","4322"],["Chittagong","Chittagong","Mirsharai","Joarganj","4324"],["Chittagong","Chittagong","Mirsharai","Korerhat","4327"],["Chittagong","Chittagong","Mirsharai","Mirsharai","4320"],["Chittagong","Chittagong","Mirsharai","Mohazanhat","4328"],["Chittagong","Chittagong","Patia Head Office","Budhpara","4371"],["Chittagong","Chittagong","Patia Head Office","Patia Head Office","4370"],["Chittagong","Chittagong","Rangunia","Dhamair","4361"],["Chittagong","Chittagong","Rangunia","Rangunia","4360"],["Chittagong","Chittagong","Rouzan","B.I.T Post Office","4349"],["Chittagong","Chittagong","Rouzan","Beenajuri","4341"],["Chittagong","Chittagong","Rouzan","Dewanpur","4347"],["Chittagong","Chittagong","Rouzan","Fatepur","4345"],["Chittagong","Chittagong","Rouzan","Gahira","4343"],["Chittagong","Chittagong","Rouzan","Guzra Noapara","4346"],["Chittagong","Chittagong","Rouzan","jagannath Hat","4344"],["Chittagong","Chittagong","Rouzan","Kundeshwari","4342"],["Chittagong","Chittagong","Rouzan","Mohamuni","4348"],["Chittagong","Chittagong","Rouzan","Rouzan","4340"],["Chittagong","Chittagong","Sandwip","Sandwip","4300"],["Chittagong","Chittagong","Sandwip","Shiberhat","4301"],["Chittagong","Chittagong","Sandwip","Urirchar","4302"],["Chittagong","Chittagong","Satkania","Baitul Ijjat","4387"],["Chittagong","Chittagong","Satkania","Bazalia","4388"],["Chittagong","Chittagong","Satkania","Satkania","4386"],["Chittagong","Chittagong","Sitakunda","Barabkunda","4312"],["Chittagong","Chittagong","Sitakunda","Baroidhala","4311"],["Chittagong","Chittagong","Sitakunda","Bawashbaria","4313"],["Chittagong","Chittagong","Sitakunda","Bhatiari","4315"],["Chittagong","Chittagong","Sitakunda","Fouzdarhat","4316"],["Chittagong","Chittagong","Sitakunda","Jafrabad","4317"],["Chittagong","Chittagong","Sitakunda","Kumira","4314"],["Chittagong","Chittagong","Sitakunda","Sitakunda","4310"],["Chittagong","Comilla","Barura","Barura","3560"],["Chittagong","Comilla","Barura","Murdafarganj","3562"],["Chittagong","Comilla","Barura","Poyalgachha","3561"],["Chittagong","Comilla","Brahmanpara","Brahmanpara","3526"],["Chittagong","Comilla","Burichang","Burichang","3520"],["Chittagong","Comilla","Burichang","Maynamoti bazar","3521"],["Chittagong","Comilla","Chandina","Chandia","3510"],["Chittagong","Comilla","Chandina","Madhaiabazar","3511"],["Chittagong","Comilla","Chouddagram","Batisa","3551"],["Chittagong","Comilla","Chouddagram","Chiora","3552"],["Chittagong","Comilla","Chouddagram","Chouddagram","3550"],["Chittagong","Comilla","Comilla Sadar","Comilla Contoment","3501"],["Chittagong","Comilla","Comilla Sadar","Comilla Sadar","3500"],["Chittagong","Comilla","Comilla Sadar","Courtbari","3503"],["Chittagong","Comilla","Comilla Sadar","Halimanagar","3502"],["Chittagong","Comilla","Comilla Sadar","Suaganj","3504"],["Chittagong","Comilla","Daudkandi","Dashpara","3518"],["Chittagong","Comilla","Daudkandi","Daudkandi","3516"],["Chittagong","Comilla","Daudkandi","Eliotganj","3519"],["Chittagong","Comilla","Daudkandi","Gouripur","3517"],["Chittagong","Comilla","Davidhar","Barashalghar","3532"],["Chittagong","Comilla","Davidhar","Davidhar","3530"],["Chittagong","Comilla","Davidhar","Dhamtee","3533"],["Chittagong","Comilla","Davidhar","Gangamandal","3531"],["Chittagong","Comilla","Homna","Homna","3546"],["Chittagong","Comilla","Laksam","Bipulasar","3572"],["Chittagong","Comilla","Laksam","Laksam","3570"],["Chittagong","Comilla","Laksam","Lakshamanpur","3571"],["Chittagong","Comilla","Langalkot","Chhariabazar","3582"],["Chittagong","Comilla","Langalkot","Dhalua","3581"],["Chittagong","Comilla","Langalkot","Gunabati","3583"],["Chittagong","Comilla","Langalkot","Langalkot","3580"],["Chittagong","Comilla","Muradnagar","Bangra","3543"],["Chittagong","Comilla","Muradnagar","Companyganj","3542"],["Chittagong","Comilla","Muradnagar","Muradnagar","3540"],["Chittagong","Comilla","Muradnagar","Pantibazar","3545"],["Chittagong","Comilla","Muradnagar","Ramchandarpur","3541"],["Chittagong","Comilla","Muradnagar","Sonakanda","3544"],["Chittagong","Cox\u2019s Bazar","Chiringga","Badarkali","4742"],["Chittagong","Cox\u2019s Bazar","Chiringga","Chiringga","4740"],["Chittagong","Cox\u2019s Bazar","Chiringga","Chiringga S.O","4741"],["Chittagong","Cox\u2019s Bazar","Chiringga","Malumghat","4743"],["Chittagong","Cox\u2019s Bazar","Coxs Bazar Sadar","Coxs Bazar Sadar","4700"],["Chittagong","Cox\u2019s Bazar","Coxs Bazar Sadar","Eidga","4702"],["Chittagong","Cox\u2019s Bazar","Coxs Bazar Sadar","Zhilanja","4701"],["Chittagong","Cox\u2019s Bazar","Gorakghat","Gorakghat","4710"],["Chittagong","Cox\u2019s Bazar","Kutubdia","Kutubdia","4720"],["Chittagong","Cox\u2019s Bazar","Ramu","Ramu","4730"],["Chittagong","Cox\u2019s Bazar","Teknaf","Hnila","4761"],["Chittagong","Cox\u2019s Bazar","Teknaf","St.Martin","4762"],["Chittagong","Cox\u2019s Bazar","Teknaf","Teknaf","4760"],["Chittagong","Cox\u2019s Bazar","Ukhia","Ukhia","4750"],["Chittagong","Feni","Chhagalnaia","Chhagalnaia","3910"],["Chittagong","Feni","Chhagalnaia","Daraga Hat","3912"],["Chittagong","Feni","Chhagalnaia","Maharajganj","3911"],["Chittagong","Feni","Chhagalnaia","Puabashimulia","3913"],["Chittagong","Feni","Dagonbhuia","Chhilonia","3922"],["Chittagong","Feni","Dagonbhuia","Dagondhuia","3920"],["Chittagong","Feni","Dagonbhuia","Dudmukha","3921"],["Chittagong","Feni","Dagonbhuia","Rajapur","3923"],["Chittagong","Feni","Feni Sadar","Fazilpur","3901"],["Chittagong","Feni","Feni Sadar","Feni Sadar","3900"],["Chittagong","Feni","Feni Sadar","Laskarhat","3903"],["Chittagong","Feni","Feni Sadar","Sharshadie","3902"],["Chittagong","Feni","Pashurampur","Fulgazi","3942"],["Chittagong","Feni","Pashurampur","Munshirhat","3943"],["Chittagong","Feni","Pashurampur","Pashurampur","3940"],["Chittagong","Feni","Pashurampur","Shuarbazar","3941"],["Chittagong","Feni","Sonagazi","Ahmadpur","3932"],["Chittagong","Feni","Sonagazi","Kazirhat","3933"],["Chittagong","Feni","Sonagazi","Motiganj","3931"],["Chittagong","Feni","Sonagazi","Sonagazi","3930"],["Chittagong","Khagrachari","Diginala","Diginala","4420"],["Chittagong","Khagrachari","Khagrachari Sadar","Khagrachari Sadar","4400"],["Chittagong","Khagrachari","Laxmichhari","Laxmichhari","4470"],["Chittagong","Khagrachari","Mahalchhari","Mahalchhari","4430"],["Chittagong","Khagrachari","Manikchhari","Manikchhari","4460"],["Chittagong","Khagrachari","Matiranga","Matiranga","4450"],["Chittagong","Khagrachari","Panchhari","Panchhari","4410"],["Chittagong","Khagrachari","Ramghar Head Office","Ramghar Head Office","4440"],["Chittagong","Lakshmipur","Char Alexgander","Char Alexgander","3730"],["Chittagong","Lakshmipur","Char Alexgander","Hajirghat","3731"],["Chittagong","Lakshmipur","Char Alexgander","Ramgatirhat","3732"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Amani Lakshimpur","3709"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Bhabaniganj","3702"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Chandraganj","3708"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Choupalli","3707"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Dalal Bazar","3701"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Duttapara","3706"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Keramatganj","3704"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Lakshimpur Sadar","3700"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Mandari","3703"],["Chittagong","Lakshmipur","Lakshimpur Sadar","Rupchara","3705"],["Chittagong","Lakshmipur","Ramganj","Alipur","3721"],["Chittagong","Lakshmipur","Ramganj","Dolta","3725"],["Chittagong","Lakshmipur","Ramganj","Kanchanpur","3723"],["Chittagong","Lakshmipur","Ramganj","Naagmud","3724"],["Chittagong","Lakshmipur","Ramganj","Panpara","3722"],["Chittagong","Lakshmipur","Ramganj","Ramganj","3720"],["Chittagong","Lakshmipur","Raypur","Bhuabari","3714"],["Chittagong","Lakshmipur","Raypur","Haydarganj","3713"],["Chittagong","Lakshmipur","Raypur","Nagerdighirpar","3712"],["Chittagong","Lakshmipur","Raypur","Rakhallia","3711"],["Chittagong","Lakshmipur","Raypur","Raypur","3710"],["Chittagong","Noakhali","Basurhat","Basur Hat","3850"],["Chittagong","Noakhali","Basurhat","Charhajari","3851"],["Chittagong","Noakhali","Begumganj","Alaiarpur","3831"],["Chittagong","Noakhali","Begumganj","Amisha Para","3847"],["Chittagong","Noakhali","Begumganj","Banglabazar","3822"],["Chittagong","Noakhali","Begumganj","Bazra","3824"],["Chittagong","Noakhali","Begumganj","Begumganj","3820"],["Chittagong","Noakhali","Begumganj","Bhabani Jibanpur","3837"],["Chittagong","Noakhali","Begumganj","Choumohani","3821"],["Chittagong","Noakhali","Begumganj","Dauti","3843"],["Chittagong","Noakhali","Begumganj","Durgapur","3848"],["Chittagong","Noakhali","Begumganj","Gopalpur","3828"],["Chittagong","Noakhali","Begumganj","Jamidar Hat","3825"],["Chittagong","Noakhali","Begumganj","Joyag","3844"],["Chittagong","Noakhali","Begumganj","Joynarayanpur","3829"],["Chittagong","Noakhali","Begumganj","Khalafat Bazar","3833"],["Chittagong","Noakhali","Begumganj","Khalishpur","3842"],["Chittagong","Noakhali","Begumganj","Maheshganj","3838"],["Chittagong","Noakhali","Begumganj","Mir Owarishpur","3823"],["Chittagong","Noakhali","Begumganj","Nadona","3839"],["Chittagong","Noakhali","Begumganj","Nandiapara","3841"],["Chittagong","Noakhali","Begumganj","Oachhekpur","3835"],["Chittagong","Noakhali","Begumganj","Rajganj","3834"],["Chittagong","Noakhali","Begumganj","Sonaimuri","3827"],["Chittagong","Noakhali","Begumganj","Tangirpar","3832"],["Chittagong","Noakhali","Begumganj","Thanar Hat","3845"],["Chittagong","Noakhali","Chatkhil","Bansa Bazar","3879"],["Chittagong","Noakhali","Chatkhil","Bodalcourt","3873"],["Chittagong","Noakhali","Chatkhil","Chatkhil","3870"],["Chittagong","Noakhali","Chatkhil","Dosh Gharia","3878"],["Chittagong","Noakhali","Chatkhil","Karihati","3877"],["Chittagong","Noakhali","Chatkhil","Khilpara","3872"],["Chittagong","Noakhali","Chatkhil","Palla","3871"],["Chittagong","Noakhali","Chatkhil","Rezzakpur","3874"],["Chittagong","Noakhali","Chatkhil","Sahapur","3881"],["Chittagong","Noakhali","Chatkhil","Sampara","3882"],["Chittagong","Noakhali","Chatkhil","Shingbahura","3883"],["Chittagong","Noakhali","Chatkhil","Solla","3875"],["Chittagong","Noakhali","Hatiya","Afazia","3891"],["Chittagong","Noakhali","Hatiya","Hatiya","3890"],["Chittagong","Noakhali","Hatiya","Tamoraddi","3892"],["Chittagong","Noakhali","Noakhali Sadar","Chaprashir Hat","3811"],["Chittagong","Noakhali","Noakhali Sadar","Char Jabbar","3812"],["Chittagong","Noakhali","Noakhali Sadar","Charam Tua","3809"],["Chittagong","Noakhali","Noakhali Sadar","Din Monir Hat","3803"],["Chittagong","Noakhali","Noakhali Sadar","Kabirhat","3807"],["Chittagong","Noakhali","Noakhali Sadar","Khalifar Hat","3808"],["Chittagong","Noakhali","Noakhali Sadar","Mriddarhat","3806"],["Chittagong","Noakhali","Noakhali Sadar","Noakhali College","3801"],["Chittagong","Noakhali","Noakhali Sadar","Noakhali Sadar","3800"],["Chittagong","Noakhali","Noakhali Sadar","Pak Kishoreganj","3804"],["Chittagong","Noakhali","Noakhali Sadar","Sonapur","3802"],["Chittagong","Noakhali","Senbag","Beezbag","3862"],["Chittagong","Noakhali","Senbag","Chatarpaia","3864"],["Chittagong","Noakhali","Senbag","Kallyandi","3861"],["Chittagong","Noakhali","Senbag","Kankirhat","3863"],["Chittagong","Noakhali","Senbag","Senbag","3860"],["Chittagong","Noakhali","Senbag","T.P. Lamua","3865"],["Chittagong","Rangamati","Barakal","Barakal","4570"],["Chittagong","Rangamati","Bilaichhari","Bilaichhari","4550"],["Chittagong","Rangamati","Jarachhari","Jarachhari","4560"],["Chittagong","Rangamati","Kalampati","Betbunia","4511"],["Chittagong","Rangamati","Kalampati","Kalampati","4510"],["Chittagong","Rangamati","kaptai","Chandraghona","4531"],["Chittagong","Rangamati","kaptai","Kaptai","4530"],["Chittagong","Rangamati","kaptai","Kaptai Nuton Bazar","4533"],["Chittagong","Rangamati","kaptai","Kaptai Project","4532"],["Chittagong","Rangamati","Longachh","Longachh","4580"],["Chittagong","Rangamati","Marishya","Marishya","4590"],["Chittagong","Rangamati","Naniachhar","Nanichhar","4520"],["Chittagong","Rangamati","Rajsthali","Rajsthali","4540"],["Chittagong","Rangamati","Rangamati Sadar","Rangamati Sadar","4500"],["Khulna","Bagherhat","Bagerhat Sadar","Bagerhat Sadar","9300"],["Khulna","Bagherhat","Bagerhat Sadar","P.C College","9301"],["Khulna","Bagherhat","Bagerhat Sadar","Rangdia","9302"],["Khulna","Bagherhat","Chalna Ankorage","Chalna Ankorage","9350"],["Khulna","Bagherhat","Chalna Ankorage","Mongla Port","9351"],["Khulna","Bagherhat","Chitalmari","Barabaria","9361"],["Khulna","Bagherhat","Chitalmari","Chitalmari","9360"],["Khulna","Bagherhat","Fakirhat","Bhanganpar Bazar","9372"],["Khulna","Bagherhat","Fakirhat","Fakirhat","9370"],["Khulna","Bagherhat","Fakirhat","Mansa","9371"],["Khulna","Bagherhat","Kachua UPO","Kachua","9310"],["Khulna","Bagherhat","Kachua UPO","Sonarkola","9311"],["Khulna","Bagherhat","Mollahat","Charkulia","9383"],["Khulna","Bagherhat","Mollahat","Dariala","9382"],["Khulna","Bagherhat","Mollahat","Kahalpur","9381"],["Khulna","Bagherhat","Mollahat","Mollahat","9380"],["Khulna","Bagherhat","Mollahat","Nagarkandi","9384"],["Khulna","Bagherhat","Mollahat","Pak Gangni","9385"],["Khulna","Bagherhat","Morelganj","Morelganj","9320"],["Khulna","Bagherhat","Morelganj","Sannasi Bazar","9321"],["Khulna","Bagherhat","Morelganj","Telisatee","9322"],["Khulna","Bagherhat","Rampal","Foylahat","9341"],["Khulna","Bagherhat","Rampal","Gourambha","9343"],["Khulna","Bagherhat","Rampal","Rampal","9340"],["Khulna","Bagherhat","Rampal","Sonatunia","9342"],["Khulna","Bagherhat","Rayenda","Rayenda","9330"],["Khulna","Chuadanga","Alamdanga","Alamdanga","7210"],["Khulna","Chuadanga","Alamdanga","Hardi","7211"],["Khulna","Chuadanga","Chuadanga Sadar","Chuadanga Sadar","7200"],["Khulna","Chuadanga","Chuadanga Sadar","Munshiganj","7201"],["Khulna","Chuadanga","Damurhuda","Andulbaria","7222"],["Khulna","Chuadanga","Damurhuda","Damurhuda","7220"],["Khulna","Chuadanga","Damurhuda","Darshana","7221"],["Khulna","Chuadanga","Doulatganj","Doulatganj","7230"],["Khulna","Jessore","Bagharpara","Bagharpara","7470"],["Khulna","Jessore","Bagharpara","Gouranagar","7471"],["Khulna","Jessore","Chaugachha","Chougachha","7410"],["Khulna","Jessore","Jessore Sadar","Basundia","7406"],["Khulna","Jessore","Jessore Sadar","Chanchra","7402"],["Khulna","Jessore","Jessore Sadar","Churamankathi","7407"],["Khulna","Jessore","Jessore Sadar","Jessore Airbach","7404"],["Khulna","Jessore","Jessore Sadar","Jessore canttonment","7403"],["Khulna","Jessore","Jessore Sadar","Jessore Sadar","7400"],["Khulna","Jessore","Jessore Sadar","Jessore Upa-Shahar","7401"],["Khulna","Jessore","Jessore Sadar","Rupdia","7405"],["Khulna","Jessore","Jhikargachha","Jhikargachha","7420"],["Khulna","Jessore","Keshabpur","Keshobpur","7450"],["Khulna","Jessore","Monirampur","Monirampur","7440"],["Khulna","Jessore","Noapara","Bhugilhat","7462"],["Khulna","Jessore","Noapara","Noapara","7460"],["Khulna","Jessore","Noapara","Rajghat","7461"],["Khulna","Jessore","Sarsa","Bag Achra","7433"],["Khulna","Jessore","Sarsa","Benapole","7431"],["Khulna","Jessore","Sarsa","Jadabpur","7432"],["Khulna","Jessore","Sarsa","Sarsa","7430"],["Khulna","Jinaidaha","Harinakundu","Harinakundu","7310"],["Khulna","Jinaidaha","Jinaidaha Sadar","Jinaidaha Cadet College","7301"],["Khulna","Jinaidaha","Jinaidaha Sadar","Jinaidaha Sadar","7300"],["Khulna","Jinaidaha","Kotchandpur","Kotchandpur","7330"],["Khulna","Jinaidaha","Maheshpur","Maheshpur","7340"],["Khulna","Jinaidaha","Naldanga","Hatbar Bazar","7351"],["Khulna","Jinaidaha","Naldanga","Naldanga","7350"],["Khulna","Jinaidaha","Shailakupa","Kumiradaha","7321"],["Khulna","Jinaidaha","Shailakupa","Shailakupa","7320"],["Khulna","Khulna","Alaipur","Alaipur","9240"],["Khulna","Khulna","Alaipur","Belphulia","9242"],["Khulna","Khulna","Alaipur","Rupsha","9241"],["Khulna","Khulna","Batiaghat","Batiaghat","9260"],["Khulna","Khulna","Batiaghat","Surkalee","9261"],["Khulna","Khulna","Chalna Bazar","Bajua","9272"],["Khulna","Khulna","Chalna Bazar","Chalna Bazar","9270"],["Khulna","Khulna","Chalna Bazar","Dakup","9271"],["Khulna","Khulna","Chalna Bazar","Nalian","9273"],["Khulna","Khulna","Digalia","Chandni Mahal","9221"],["Khulna","Khulna","Digalia","Digalia","9220"],["Khulna","Khulna","Digalia","Gazirhat","9224"],["Khulna","Khulna","Digalia","Ghoshghati","9223"],["Khulna","Khulna","Digalia","Senhati","9222"],["Khulna","Khulna","Khulna Sadar","Atra Shilpa Area","9207"],["Khulna","Khulna","Khulna Sadar","BIT Khulna","9203"],["Khulna","Khulna","Khulna Sadar","Doulatpur","9202"],["Khulna","Khulna","Khulna Sadar","Jahanabad Canttonmen","9205"],["Khulna","Khulna","Khulna Sadar","Khula Sadar","9100"],["Khulna","Khulna","Khulna Sadar","Khulna G.P.O","9000"],["Khulna","Khulna","Khulna Sadar","Khulna Shipyard","9201"],["Khulna","Khulna","Khulna Sadar","Khulna University","9208"],["Khulna","Khulna","Khulna Sadar","Siramani","9204"],["Khulna","Khulna","Khulna Sadar","Sonali Jute Mills","9206"],["Khulna","Khulna","Madinabad","Amadee","9291"],["Khulna","Khulna","Madinabad","Madinabad","9290"],["Khulna","Khulna","Paikgachha","Chandkhali","9284"],["Khulna","Khulna","Paikgachha","Garaikhali","9285"],["Khulna","Khulna","Paikgachha","Godaipur","9281"],["Khulna","Khulna","Paikgachha","Kapilmoni","9282"],["Khulna","Khulna","Paikgachha","Katipara","9283"],["Khulna","Khulna","Paikgachha","Paikgachha","9280"],["Khulna","Khulna","Phultala","Phultala","9210"],["Khulna","Khulna","Sajiara","Chuknagar","9252"],["Khulna","Khulna","Sajiara","Ghonabanda","9251"],["Khulna","Khulna","Sajiara","Sajiara","9250"],["Khulna","Khulna","Sajiara","Shahapur","9253"],["Khulna","Khulna","Terakhada","Pak Barasat","9231"],["Khulna","Khulna","Terakhada","Terakhada","9230"],["Khulna","Kustia","Bheramara","Allardarga","7042"],["Khulna","Kustia","Bheramara","Bheramara","7040"],["Khulna","Kustia","Bheramara","Ganges Bheramara","7041"],["Khulna","Kustia","Janipur","Janipur","7020"],["Khulna","Kustia","Janipur","Khoksa","7021"],["Khulna","Kustia","Kumarkhali","Kumarkhali","7010"],["Khulna","Kustia","Kumarkhali","Panti","7011"],["Khulna","Kustia","Kustia Sadar","Islami University","7003"],["Khulna","Kustia","Kustia Sadar","Jagati","7002"],["Khulna","Kustia","Kustia Sadar","Kushtia Mohini","7001"],["Khulna","Kustia","Kustia Sadar","Kustia Sadar","7000"],["Khulna","Kustia","Mirpur","Amla Sadarpur","7032"],["Khulna","Kustia","Mirpur","Mirpur","7030"],["Khulna","Kustia","Mirpur","Poradaha","7031"],["Khulna","Kustia","Rafayetpur","Khasmathurapur","7052"],["Khulna","Kustia","Rafayetpur","Rafayetpur","7050"],["Khulna","Kustia","Rafayetpur","Taragunia","7051"],["Khulna","Magura","Arpara","Arpara","7620"],["Khulna","Magura","Magura Sadar","Magura Sadar","7600"],["Khulna","Magura","Mohammadpur","Binodpur","7631"],["Khulna","Magura","Mohammadpur","Mohammadpur","7630"],["Khulna","Magura","Mohammadpur","Nahata","7632"],["Khulna","Magura","Shripur","Langalbadh","7611"],["Khulna","Magura","Shripur","Nachol","7612"],["Khulna","Magura","Shripur","Shripur","7610"],["Khulna","Meherpur","Gangni","Gangni","7110"],["Khulna","Meherpur","Meherpur Sadar","Amjhupi","7101"],["Khulna","Meherpur","Meherpur Sadar","Amjhupi","7152"],["Khulna","Meherpur","Meherpur Sadar","Meherpur Sadar","7100"],["Khulna","Meherpur","Meherpur Sadar","Mujib Nagar Complex","7102"],["Khulna","Narail","Kalia","Kalia","7520"],["Khulna","Narail","Laxmipasha","Baradia","7514"],["Khulna","Narail","Laxmipasha","Itna","7512"],["Khulna","Narail","Laxmipasha","Laxmipasha","7510"],["Khulna","Narail","Laxmipasha","Lohagora","7511"],["Khulna","Narail","Laxmipasha","Naldi","7513"],["Khulna","Narail","Mohajan","Mohajan","7521"],["Khulna","Narail","Narail Sadar","Narail Sadar","7500"],["Khulna","Narail","Narail Sadar","Ratanganj","7501"],["Khulna","Satkhira","Ashashuni","Ashashuni","9460"],["Khulna","Satkhira","Ashashuni","Baradal","9461"],["Khulna","Satkhira","Debbhata","Debbhata","9430"],["Khulna","Satkhira","Debbhata","Gurugram","9431"],["Khulna","Satkhira","kalaroa","Chandanpur","9415"],["Khulna","Satkhira","kalaroa","Hamidpur","9413"],["Khulna","Satkhira","kalaroa","Jhaudanga","9412"],["Khulna","Satkhira","kalaroa","kalaroa","9410"],["Khulna","Satkhira","kalaroa","Khordo","9414"],["Khulna","Satkhira","kalaroa","Murarikati","9411"],["Khulna","Satkhira","Kaliganj UPO","Kaliganj UPO","9440"],["Khulna","Satkhira","Kaliganj UPO","Nalta Mubaroknagar","9441"],["Khulna","Satkhira","Kaliganj UPO","Ratanpur","9442"],["Khulna","Satkhira","Nakipur","Buri Goalini","9453"],["Khulna","Satkhira","Nakipur","Gabura","9454"],["Khulna","Satkhira","Nakipur","Habinagar","9455"],["Khulna","Satkhira","Nakipur","Nakipur","9450"],["Khulna","Satkhira","Nakipur","Naobeki","9452"],["Khulna","Satkhira","Nakipur","Noornagar","9451"],["Khulna","Satkhira","Satkhira Sadar","Budhhat","9403"],["Khulna","Satkhira","Satkhira Sadar","Gunakar kati","9402"],["Khulna","Satkhira","Satkhira Sadar","Satkhira Islamia Acc","9401"],["Khulna","Satkhira","Satkhira Sadar","Satkhira Sadar","9400"],["Khulna","Satkhira","Taala","Patkelghata","9421"],["Khulna","Satkhira","Taala","Taala","9420"],["Sylhet","Hobiganj","Azmireeganj","Azmireeganj","3360"],["Sylhet","Hobiganj","Bahubal","Bahubal","3310"],["Sylhet","Hobiganj","Baniachang","Baniachang","3350"],["Sylhet","Hobiganj","Baniachang","Jatrapasha","3351"],["Sylhet","Hobiganj","Baniachang","Kadirganj","3352"],["Sylhet","Hobiganj","Chunarughat","Chandpurbagan","3321"],["Sylhet","Hobiganj","Chunarughat","Chunarughat","3320"],["Sylhet","Hobiganj","Chunarughat","Narapati","3322"],["Sylhet","Hobiganj","Hobiganj Sadar","Gopaya","3302"],["Sylhet","Hobiganj","Hobiganj Sadar","Hobiganj Sadar","3300"],["Sylhet","Hobiganj","Hobiganj Sadar","Shaestaganj","3301"],["Sylhet","Hobiganj","Kalauk","Kalauk","3340"],["Sylhet","Hobiganj","Kalauk","Lakhai","3341"],["Sylhet","Hobiganj","Madhabpur","Itakhola","3331"],["Sylhet","Hobiganj","Madhabpur","Madhabpur","3330"],["Sylhet","Hobiganj","Madhabpur","Saihamnagar","3333"],["Sylhet","Hobiganj","Madhabpur","Shahajibazar","3332"],["Sylhet","Hobiganj","Nabiganj","Digalbak","3373"],["Sylhet","Hobiganj","Nabiganj","Golduba","3372"],["Sylhet","Hobiganj","Nabiganj","Goplarbazar","3371"],["Sylhet","Hobiganj","Nabiganj","Inathganj","3374"],["Sylhet","Hobiganj","Nabiganj","Nabiganj","3370"],["Sylhet","Moulvibazar","Baralekha","Baralekha","3250"],["Sylhet","Moulvibazar","Baralekha","Dhakkhinbag","3252"],["Sylhet","Moulvibazar","Baralekha","Juri","3251"],["Sylhet","Moulvibazar","Baralekha","Purbashahabajpur","3253"],["Sylhet","Moulvibazar","Kamalganj","Kamalganj","3220"],["Sylhet","Moulvibazar","Kamalganj","Keramatnaga","3221"],["Sylhet","Moulvibazar","Kamalganj","Munshibazar","3224"],["Sylhet","Moulvibazar","Kamalganj","Patrakhola","3222"],["Sylhet","Moulvibazar","Kamalganj","Shamsher Nagar","3223"],["Sylhet","Moulvibazar","Kulaura","Baramchal","3237"],["Sylhet","Moulvibazar","Kulaura","Kajaldhara","3234"],["Sylhet","Moulvibazar","Kulaura","Karimpur","3235"],["Sylhet","Moulvibazar","Kulaura","Kulaura","3230"],["Sylhet","Moulvibazar","Kulaura","Langla","3232"],["Sylhet","Moulvibazar","Kulaura","Prithimpasha","3233"],["Sylhet","Moulvibazar","Kulaura","Tillagaon","3231"],["Sylhet","Moulvibazar","Moulvibazar Sadar","Afrozganj","3203"],["Sylhet","Moulvibazar","Moulvibazar Sadar","Barakapan","3201"],["Sylhet","Moulvibazar","Moulvibazar Sadar","Monumukh","3202"],["Sylhet","Moulvibazar","Moulvibazar Sadar","Moulvibazar Sadar","3200"],["Sylhet","Moulvibazar","Rajnagar","Rajnagar","3240"],["Sylhet","Moulvibazar","Srimangal","Kalighat","3212"],["Sylhet","Moulvibazar","Srimangal","Khejurichhara","3213"],["Sylhet","Moulvibazar","Srimangal","Narain Chora","3211"],["Sylhet","Moulvibazar","Srimangal","Satgaon","3214"],["Sylhet","Moulvibazar","Srimangal","Srimangal","3210"],["Sylhet","Sunamganj","Bishamsarpur","Bishamsapur","3010"],["Sylhet","Sunamganj","Chhatak","Chhatak","3080"],["Sylhet","Sunamganj","Chhatak","Chhatak Cement Facto","3081"],["Sylhet","Sunamganj","Chhatak","Chhatak Paper Mills","3082"],["Sylhet","Sunamganj","Chhatak","Chourangi Bazar","3893"],["Sylhet","Sunamganj","Chhatak","Gabindaganj","3083"],["Sylhet","Sunamganj","Chhatak","Gabindaganj Natun Ba","3084"],["Sylhet","Sunamganj","Chhatak","Islamabad","3088"],["Sylhet","Sunamganj","Chhatak","jahidpur","3087"],["Sylhet","Sunamganj","Chhatak","Khurma","3085"],["Sylhet","Sunamganj","Chhatak","Moinpur","3086"],["Sylhet","Sunamganj","Dhirai Chandpur","Dhirai Chandpur","3040"],["Sylhet","Sunamganj","Dhirai Chandpur","Jagdal","3041"],["Sylhet","Sunamganj","Duara bazar","Duara bazar","3070"],["Sylhet","Sunamganj","Ghungiar","Ghungiar","3050"],["Sylhet","Sunamganj","Jagnnathpur","Atuajan","3062"],["Sylhet","Sunamganj","Jagnnathpur","Hasan Fatemapur","3063"],["Sylhet","Sunamganj","Jagnnathpur","Jagnnathpur","3060"],["Sylhet","Sunamganj","Jagnnathpur","Rasulganj","3064"],["Sylhet","Sunamganj","Jagnnathpur","Shiramsi","3065"],["Sylhet","Sunamganj","Jagnnathpur","Syedpur","3061"],["Sylhet","Sunamganj","Sachna","Sachna","3020"],["Sylhet","Sunamganj","Sunamganj Sadar","Pagla","3001"],["Sylhet","Sunamganj","Sunamganj Sadar","Patharia","3002"],["Sylhet","Sunamganj","Sunamganj Sadar","Sunamganj Sadar","3000"],["Sylhet","Sunamganj","Tahirpur","Tahirpur","3030"],["Sylhet","Sylhet","Balaganj","Balaganj","3120"],["Sylhet","Sylhet","Balaganj","Begumpur","3125"],["Sylhet","Sylhet","Balaganj","Brahman Shashon","3122"],["Sylhet","Sylhet","Balaganj","Gaharpur","3128"],["Sylhet","Sylhet","Balaganj","Goala Bazar","3124"],["Sylhet","Sylhet","Balaganj","Karua","3121"],["Sylhet","Sylhet","Balaganj","Kathal Khair","3127"],["Sylhet","Sylhet","Balaganj","Natun Bazar","3129"],["Sylhet","Sylhet","Balaganj","Omarpur","3126"],["Sylhet","Sylhet","Balaganj","Tajpur","3123"],["Sylhet","Sylhet","Bianibazar","Bianibazar","3170"],["Sylhet","Sylhet","Bianibazar","Churkai","3175"],["Sylhet","Sylhet","Bianibazar","jaldup","3171"],["Sylhet","Sylhet","Bianibazar","Kurar bazar","3173"],["Sylhet","Sylhet","Bianibazar","Mathiura","3172"],["Sylhet","Sylhet","Bianibazar","Salia bazar","3174"],["Sylhet","Sylhet","Bishwanath","Bishwanath","3130"],["Sylhet","Sylhet","Bishwanath","Dashghar","3131"],["Sylhet","Sylhet","Bishwanath","Deokalas","3133"],["Sylhet","Sylhet","Bishwanath","Doulathpur","3132"],["Sylhet","Sylhet","Bishwanath","Singer kanch","3134"],["Sylhet","Sylhet","Fenchuganj","Fenchuganj","3116"],["Sylhet","Sylhet","Fenchuganj","Fenchuganj SareKarkh","3117"],["Sylhet","Sylhet","Goainhat","Chiknagul","3152"],["Sylhet","Sylhet","Goainhat","Goainhat","3150"],["Sylhet","Sylhet","Goainhat","Jaflong","3151"],["Sylhet","Sylhet","Gopalganj","banigram","3164"],["Sylhet","Sylhet","Gopalganj","Chandanpur","3165"],["Sylhet","Sylhet","Gopalganj","Dakkhin Bhadashore","3162"],["Sylhet","Sylhet","Gopalganj","Dhaka Dakkhin","3161"],["Sylhet","Sylhet","Gopalganj","Gopalgannj","3160"],["Sylhet","Sylhet","Gopalganj","Ranaping","3163"],["Sylhet","Sylhet","Jaintapur","Jainthapur","3156"],["Sylhet","Sylhet","Jakiganj","Ichhamati","3191"],["Sylhet","Sylhet","Jakiganj","Jakiganj","3190"],["Sylhet","Sylhet","Kanaighat","Chatulbazar","3181"],["Sylhet","Sylhet","Kanaighat","Gachbari","3183"],["Sylhet","Sylhet","Kanaighat","Kanaighat","3180"],["Sylhet","Sylhet","Kanaighat","Manikganj","3182"],["Sylhet","Sylhet","Kompanyganj","Kompanyganj","3140"],["Sylhet","Sylhet","Sylhet Sadar","Birahimpur","3106"],["Sylhet","Sylhet","Sylhet Sadar","Jalalabad","3107"],["Sylhet","Sylhet","Sylhet Sadar","Jalalabad Cantoment","3104"],["Sylhet","Sylhet","Sylhet Sadar","Kadamtali","3111"],["Sylhet","Sylhet","Sylhet Sadar","Kamalbazer","3112"],["Sylhet","Sylhet","Sylhet Sadar","Khadimnagar","3103"],["Sylhet","Sylhet","Sylhet Sadar","Lalbazar","3113"],["Sylhet","Sylhet","Sylhet Sadar","Mogla","3108"],["Sylhet","Sylhet","Sylhet Sadar","Ranga Hajiganj","3109"],["Sylhet","Sylhet","Sylhet Sadar","Shahajalal Science &","3114"],["Sylhet","Sylhet","Sylhet Sadar","Silam","3105"],["Sylhet","Sylhet","Sylhet Sadar","Sylhe Sadar","3100"],["Sylhet","Sylhet","Sylhet Sadar","Sylhet Biman Bondar","3102"],["Sylhet","Sylhet","Sylhet Sadar","Sylhet Cadet Col","3101"],["Sylhet","Meherpur","Gangni","Gangni","7110"],["Sylhet","Meherpur","Meherpur Sadar","Amjhupi","7101"],["Sylhet","Meherpur","Meherpur Sadar","Amjhupi","7152"],["Sylhet","Meherpur","Meherpur Sadar","Meherpur Sadar","7100"],["Sylhet","Meherpur","Meherpur Sadar","Mujib Nagar Complex","7102"],["Sylhet","Narail","Kalia","Kalia","7520"],["Sylhet","Narail","Laxmipasha","Baradia","7514"],["Sylhet","Narail","Laxmipasha","Itna","7512"],["Sylhet","Narail","Laxmipasha","Laxmipasha","7510"],["Sylhet","Narail","Laxmipasha","Lohagora","7511"],["Sylhet","Narail","Laxmipasha","Naldi","7513"],["Sylhet","Narail","Mohajan","Mohajan","7521"],["Sylhet","Narail","Narail Sadar","Narail Sadar","7500"],["Sylhet","Narail","Narail Sadar","Ratanganj","7501"],["Sylhet","Satkhira","Ashashuni","Ashashuni","9460"],["Sylhet","Satkhira","Ashashuni","Baradal","9461"],["Sylhet","Satkhira","Debbhata","Debbhata","9430"],["Sylhet","Satkhira","Debbhata","Gurugram","9431"],["Sylhet","Satkhira","kalaroa","Chandanpur","9415"],["Sylhet","Satkhira","kalaroa","Hamidpur","9413"],["Sylhet","Satkhira","kalaroa","Jhaudanga","9412"],["Sylhet","Satkhira","kalaroa","kalaroa","9410"],["Sylhet","Satkhira","kalaroa","Khordo","9414"],["Sylhet","Satkhira","kalaroa","Murarikati","9411"],["Sylhet","Satkhira","Kaliganj UPO","Kaliganj UPO","9440"],["Sylhet","Satkhira","Kaliganj UPO","Nalta Mubaroknagar","9441"],["Sylhet","Satkhira","Kaliganj UPO","Ratanpur","9442"],["Sylhet","Satkhira","Nakipur","Buri Goalini","9453"],["Sylhet","Satkhira","Nakipur","Gabura","9454"],["Sylhet","Satkhira","Nakipur","Habinagar","9455"],["Sylhet","Satkhira","Nakipur","Nakipur","9450"],["Sylhet","Satkhira","Nakipur","Naobeki","9452"],["Sylhet","Satkhira","Nakipur","Noornagar","9451"],["Sylhet","Satkhira","Satkhira Sadar","Budhhat","9403"],["Sylhet","Satkhira","Satkhira Sadar","Gunakar kati","9402"],["Sylhet","Satkhira","Satkhira Sadar","Satkhira Islamia Acc","9401"],["Sylhet","Satkhira","Satkhira Sadar","Satkhira Sadar","9400"],["Sylhet","Satkhira","Taala","Patkelghata","9421"],["Sylhet","Satkhira","Taala","Taala","9420"],["Barisal","Barguna","Amtali","Amtali","8710"],["Barisal","Barguna","Bamna","Bamna","8730"],["Barisal","Barguna","Barguna Sadar","Barguna Sadar","8700"],["Barisal","Barguna","Barguna Sadar","Nali Bandar","8701"],["Barisal","Barguna","Betagi","Betagi","8740"],["Barisal","Barguna","Betagi","Darul Ulam","8741"],["Barisal","Barguna","Patharghata","Kakchira","8721"],["Barisal","Barguna","Patharghata","Patharghata","8720"],["Barisal","Barishal","Agailzhara","Agailzhara","8240"],["Barisal","Barishal","Agailzhara","Gaila","8241"],["Barisal","Barishal","Agailzhara","Paisarhat","8242"],["Barisal","Barishal","Babuganj","Babuganj","8210"],["Barisal","Barishal","Babuganj","Barishal Cadet","8216"],["Barisal","Barishal","Babuganj","Chandpasha","8212"],["Barisal","Barishal","Babuganj","Madhabpasha","8213"],["Barisal","Barishal","Babuganj","Nizamuddin College","8215"],["Barisal","Barishal","Babuganj","Rahamatpur","8211"],["Barisal","Barishal","Babuganj","Thakur Mallik","8214"],["Barisal","Barishal","Barajalia","Barajalia","8260"],["Barisal","Barishal","Barajalia","Osman Manjil","8261"],["Barisal","Barishal","Barishal Sadar","Barishal Sadar","8200"],["Barisal","Barishal","Barishal Sadar","Bukhainagar","8201"],["Barisal","Barishal","Barishal Sadar","Jaguarhat","8206"],["Barisal","Barishal","Barishal Sadar","Kashipur","8205"],["Barisal","Barishal","Barishal Sadar","Patang","8204"],["Barisal","Barishal","Barishal Sadar","Saheberhat","8202"],["Barisal","Barishal","Barishal Sadar","Sugandia","8203"],["Barisal","Barishal","Gouranadi","Batajor","8233"],["Barisal","Barishal","Gouranadi","Gouranadi","8230"],["Barisal","Barishal","Gouranadi","Kashemabad","8232"],["Barisal","Barishal","Gouranadi","Tarki Bandar","8231"],["Barisal","Barishal","Mahendiganj","Langutia","8274"],["Barisal","Barishal","Mahendiganj","Laskarpur","8271"],["Barisal","Barishal","Mahendiganj","Mahendiganj","8270"],["Barisal","Barishal","Mahendiganj","Nalgora","8273"],["Barisal","Barishal","Mahendiganj","Ulania","8272"],["Barisal","Barishal","Muladi","Charkalekhan","8252"],["Barisal","Barishal","Muladi","Kazirchar","8251"],["Barisal","Barishal","Muladi","Muladi","8250"],["Barisal","Barishal","Sahebganj","Charamandi","8281"],["Barisal","Barishal","Sahebganj","kalaskati","8284"],["Barisal","Barishal","Sahebganj","Padri Shibpur","8282"],["Barisal","Barishal","Sahebganj","Sahebganj","8280"],["Barisal","Barishal","Sahebganj","Shialguni","8283"],["Barisal","Barishal","Uzirpur","Dakuarhat","8223"],["Barisal","Barishal","Uzirpur","Dhamura","8221"],["Barisal","Barishal","Uzirpur","Jugirkanda","8222"],["Barisal","Barishal","Uzirpur","Shikarpur","8224"],["Barisal","Barishal","Uzirpur","Uzirpur","8220"],["Barisal","Bhola","Bhola Sadar","Bhola Sadar","8300"],["Barisal","Bhola","Bhola Sadar","Joynagar","8301"],["Barisal","Bhola","Borhanuddin UPO","Borhanuddin UPO","8320"],["Barisal","Bhola","Borhanuddin UPO","Mirzakalu","8321"],["Barisal","Bhola","Charfashion","Charfashion","8340"],["Barisal","Bhola","Charfashion","Dularhat","8341"],["Barisal","Bhola","Charfashion","Keramatganj","8342"],["Barisal","Bhola","Doulatkhan","Doulatkhan","8310"],["Barisal","Bhola","Doulatkhan","Hajipur","8311"],["Barisal","Bhola","Hajirhat","Hajirhat","8360"],["Barisal","Bhola","Hatshoshiganj","Hatshoshiganj","8350"],["Barisal","Bhola","Lalmohan UPO","Daurihat","8331"],["Barisal","Bhola","Lalmohan UPO","Gazaria","8332"],["Barisal","Bhola","Lalmohan UPO","Lalmohan UPO","8330"],["Barisal","Jhalokathi","Jhalokathi Sadar","Baukathi","8402"],["Barisal","Jhalokathi","Jhalokathi Sadar","Gabha","8403"],["Barisal","Jhalokathi","Jhalokathi Sadar","Jhalokathi Sadar","8400"],["Barisal","Jhalokathi","Jhalokathi Sadar","Nabagram","8401"],["Barisal","Jhalokathi","Jhalokathi Sadar","Shekherhat","8404"],["Barisal","Jhalokathi","Kathalia","Amua","8431"],["Barisal","Jhalokathi","Kathalia","Kathalia","8430"],["Barisal","Jhalokathi","Kathalia","Niamatee","8432"],["Barisal","Jhalokathi","Kathalia","Shoulajalia","8433"],["Barisal","Jhalokathi","Nalchhiti","Beerkathi","8421"],["Barisal","Jhalokathi","Nalchhiti","Nalchhiti","8420"],["Barisal","Jhalokathi","Rajapur","Rajapur","8410"],["Barisal","Patuakhali","Bauphal","Bagabandar","8621"],["Barisal","Patuakhali","Bauphal","Bauphal","8620"],["Barisal","Patuakhali","Bauphal","Birpasha","8622"],["Barisal","Patuakhali","Bauphal","Kalaia","8624"],["Barisal","Patuakhali","Bauphal","Kalishari","8623"],["Barisal","Patuakhali","Dashmina","Dashmina","8630"],["Barisal","Patuakhali","Galachipa","Galachipa","8640"],["Barisal","Patuakhali","Galachipa","Gazipur Bandar","8641"],["Barisal","Patuakhali","Khepupara","Khepupara","8650"],["Barisal","Patuakhali","Khepupara","Mahipur","8651"],["Barisal","Patuakhali","Patuakhali Sadar","Dumkee","8602"],["Barisal","Patuakhali","Patuakhali Sadar","Moukaran","8601"],["Barisal","Patuakhali","Patuakhali Sadar","Patuakhali Sadar","8600"],["Barisal","Patuakhali","Patuakhali Sadar","Rahimabad","8603"],["Barisal","Patuakhali","Subidkhali","Subidkhali","8610"],["Barisal","Pirojpur","Banaripara","Banaripara","8530"],["Barisal","Pirojpur","Banaripara","Chakhar","8531"],["Barisal","Pirojpur","Bhandaria","Bhandaria","8550"],["Barisal","Pirojpur","Bhandaria","Dhaoa","8552"],["Barisal","Pirojpur","Bhandaria","Kanudashkathi","8551"],["Barisal","Pirojpur","kaukhali","Jolagati","8513"],["Barisal","Pirojpur","kaukhali","Joykul","8512"],["Barisal","Pirojpur","kaukhali","Kaukhali","8510"],["Barisal","Pirojpur","kaukhali","Keundia","8511"],["Barisal","Pirojpur","Mathbaria","Betmor Natun Hat","8565"],["Barisal","Pirojpur","Mathbaria","Gulishakhali","8563"],["Barisal","Pirojpur","Mathbaria","Halta","8562"],["Barisal","Pirojpur","Mathbaria","Mathbaria","8560"],["Barisal","Pirojpur","Mathbaria","Shilarganj","8566"],["Barisal","Pirojpur","Mathbaria","Tiarkhali","8564"],["Barisal","Pirojpur","Mathbaria","Tushkhali","8561"],["Barisal","Pirojpur","Nazirpur","Nazirpur","8540"],["Barisal","Pirojpur","Nazirpur","Sriramkathi","8541"],["Barisal","Pirojpur","Pirojpur Sadar","Hularhat","8501"],["Barisal","Pirojpur","Pirojpur Sadar","Parerhat","8502"],["Barisal","Pirojpur","Pirojpur Sadar","Pirojpur Sadar","8500"],["Barisal","Pirojpur","Swarupkathi","Darus Sunnat","8521"],["Barisal","Pirojpur","Swarupkathi","Jalabari","8523"],["Barisal","Pirojpur","Swarupkathi","Kaurikhara","8522"],["Barisal","Pirojpur","Swarupkathi","Swarupkathi","8520"],["Rajshahi","Bogra","Alamdighi","Adamdighi","5890"],["Rajshahi","Bogra","Alamdighi","Nasharatpur","5892"],["Rajshahi","Bogra","Alamdighi","Santahar","5891"],["Rajshahi","Bogra","Bogra Sadar","Bogra Canttonment","5801"],["Rajshahi","Bogra","Bogra Sadar","Bogra Sadar","5800"],["Rajshahi","Bogra","Dhunat","Dhunat","5850"],["Rajshahi","Bogra","Dhunat","Gosaibari","5851"],["Rajshahi","Bogra","Dupchachia","Dupchachia","5880"],["Rajshahi","Bogra","Dupchachia","Talora","5881"],["Rajshahi","Bogra","Gabtoli","Gabtoli","5820"],["Rajshahi","Bogra","Gabtoli","Sukhanpukur","5821"],["Rajshahi","Bogra","Kahalu","Kahalu","5870"],["Rajshahi","Bogra","Nandigram","Nandigram","5860"],["Rajshahi","Bogra","Sariakandi","Chandan Baisha","5831"],["Rajshahi","Bogra","Sariakandi","Sariakandi","5830"],["Rajshahi","Bogra","Sherpur","Chandaikona","5841"],["Rajshahi","Bogra","Sherpur","Palli Unnyan Accadem","5842"],["Rajshahi","Bogra","Sherpur","Sherpur","5840"],["Rajshahi","Bogra","Shibganj","Shibganj","5810"],["Rajshahi","Bogra","Sonatola","Sonatola","5826"],["Rajshahi","Chapinawabganj","Bholahat","Bholahat","6330"],["Rajshahi","Chapinawabganj","Chapinawabganj Sadar","Amnura","6303"],["Rajshahi","Chapinawabganj","Chapinawabganj Sadar","Chapinawbganj Sadar","6300"],["Rajshahi","Chapinawabganj","Chapinawabganj Sadar","Rajarampur","6301"],["Rajshahi","Chapinawabganj","Chapinawabganj Sadar","Ramchandrapur","6302"],["Rajshahi","Chapinawabganj","Nachol","Mandumala","6311"],["Rajshahi","Chapinawabganj","Nachol","Nachol","6310"],["Rajshahi","Chapinawabganj","Rohanpur","Gomashtapur","6321"],["Rajshahi","Chapinawabganj","Rohanpur","Rohanpur","6320"],["Rajshahi","Chapinawabganj","Shibganj U.P.O","Kansart","6341"],["Rajshahi","Chapinawabganj","Shibganj U.P.O","Manaksha","6342"],["Rajshahi","Chapinawabganj","Shibganj U.P.O","Shibganj U.P.O","6340"],["Rajshahi","Joypurhat","Akkelpur","Akklepur","5940"],["Rajshahi","Joypurhat","Akkelpur","jamalganj","5941"],["Rajshahi","Joypurhat","Akkelpur","Tilakpur","5942"],["Rajshahi","Joypurhat","Joypurhat Sadar","Joypurhat Sadar","5900"],["Rajshahi","Joypurhat","kalai","kalai","5930"],["Rajshahi","Joypurhat","Khetlal","Khetlal","5920"],["Rajshahi","Joypurhat","panchbibi","Panchbibi","5910"],["Rajshahi","Naogaon","Ahsanganj","Ahsanganj","6596"],["Rajshahi","Naogaon","Ahsanganj","Bandai","6597"],["Rajshahi","Naogaon","Badalgachhi","Badalgachhi","6570"],["Rajshahi","Naogaon","Dhamuirhat","Dhamuirhat","6580"],["Rajshahi","Naogaon","Mahadebpur","Mahadebpur","6530"],["Rajshahi","Naogaon","Naogaon Sadar","Naogaon Sadar","6500"],["Rajshahi","Naogaon","Niamatpur","Niamatpur","6520"],["Rajshahi","Naogaon","Nitpur","Nitpur","6550"],["Rajshahi","Naogaon","Nitpur","Panguria","6552"],["Rajshahi","Naogaon","Nitpur","Porsa","6551"],["Rajshahi","Naogaon","Patnitala","Patnitala","6540"],["Rajshahi","Naogaon","Prasadpur","Balihar","6512"],["Rajshahi","Naogaon","Prasadpur","Manda","6511"],["Rajshahi","Naogaon","Prasadpur","Prasadpur","6510"],["Rajshahi","Naogaon","Raninagar","Kashimpur","6591"],["Rajshahi","Naogaon","Raninagar","Raninagar","6590"],["Rajshahi","Naogaon","Sapahar","Moduhil","6561"],["Rajshahi","Naogaon","Sapahar","Sapahar","6560"],["Rajshahi","Natore","Gopalpur UPO","Abdulpur","6422"],["Rajshahi","Natore","Gopalpur UPO","Gopalpur U.P.O","6420"],["Rajshahi","Natore","Gopalpur UPO","Lalpur S.O","6421"],["Rajshahi","Natore","Harua","Baraigram","6432"],["Rajshahi","Natore","Harua","Dayarampur","6431"],["Rajshahi","Natore","Harua","Harua","6430"],["Rajshahi","Natore","Hatgurudaspur","Hatgurudaspur","6440"],["Rajshahi","Natore","Laxman","Laxman","6410"],["Rajshahi","Natore","Natore Sadar","Baiddyabal Gharia","6402"],["Rajshahi","Natore","Natore Sadar","Digapatia","6401"],["Rajshahi","Natore","Natore Sadar","Madhnagar","6403"],["Rajshahi","Natore","Natore Sadar","Natore Sadar","6400"],["Rajshahi","Natore","Singra","Singra","6450"],["Rajshahi","Pabna","Banwarinagar","Banwarinagar","6650"],["Rajshahi","Pabna","Bera","Bera","6680"],["Rajshahi","Pabna","Bera","Kashinathpur","6682"],["Rajshahi","Pabna","Bera","Nakalia","6681"],["Rajshahi","Pabna","Bera","Puran Bharenga","6683"],["Rajshahi","Pabna","Bhangura","Bhangura","6640"],["Rajshahi","Pabna","Chatmohar","Chatmohar","6630"],["Rajshahi","Pabna","Debottar","Debottar","6610"],["Rajshahi","Pabna","Ishwardi","Dhapari","6621"],["Rajshahi","Pabna","Ishwardi","Ishwardi","6620"],["Rajshahi","Pabna","Ishwardi","Pakshi","6622"],["Rajshahi","Pabna","Ishwardi","Rajapur","6623"],["Rajshahi","Pabna","Pabna Sadar","Hamayetpur","6602"],["Rajshahi","Pabna","Pabna Sadar","Kaliko Cotton Mills","6601"],["Rajshahi","Pabna","Pabna Sadar","Pabna Sadar","6600"],["Rajshahi","Pabna","Sathia","Sathia","6670"],["Rajshahi","Pabna","Sujanagar","Sagarkandi","6661"],["Rajshahi","Pabna","Sujanagar","Sujanagar","6660"],["Rajshahi","Rajshahi","Bagha","Arani","6281"],["Rajshahi","Rajshahi","Bagha","Bagha","6280"],["Rajshahi","Rajshahi","Bhabaniganj","Bhabaniganj","6250"],["Rajshahi","Rajshahi","Bhabaniganj","Taharpur","6251"],["Rajshahi","Rajshahi","Charghat","Charghat","6270"],["Rajshahi","Rajshahi","Charghat","Sarda","6271"],["Rajshahi","Rajshahi","Durgapur","Durgapur","6240"],["Rajshahi","Rajshahi","Godagari","Godagari","6290"],["Rajshahi","Rajshahi","Godagari","Premtoli","6291"],["Rajshahi","Rajshahi","Khod Mohanpur","Khodmohanpur","6220"],["Rajshahi","Rajshahi","Lalitganj","Lalitganj","6210"],["Rajshahi","Rajshahi","Lalitganj","Rajshahi Sugar Mills","6211"],["Rajshahi","Rajshahi","Lalitganj","Shyampur","6212"],["Rajshahi","Rajshahi","Putia","Putia","6260"],["Rajshahi","Rajshahi","Rajshahi Sadar","Binodpur Bazar","6206"],["Rajshahi","Rajshahi","Rajshahi Sadar","Ghuramara","6100"],["Rajshahi","Rajshahi","Rajshahi Sadar","Kazla","6204"],["Rajshahi","Rajshahi","Rajshahi Sadar","Rajshahi Canttonment","6202"],["Rajshahi","Rajshahi","Rajshahi Sadar","Rajshahi Court","6201"],["Rajshahi","Rajshahi","Rajshahi Sadar","Rajshahi Sadar","6000"],["Rajshahi","Rajshahi","Rajshahi Sadar","Rajshahi University","6205"],["Rajshahi","Rajshahi","Rajshahi Sadar","Sapura","6203"],["Rajshahi","Rajshahi","Tanor","Tanor","6230"],["Rajshahi","Sirajganj","Baiddya Jam Toil","Baiddya Jam Toil","6730"],["Rajshahi","Sirajganj","Belkuchi","Belkuchi","6740"],["Rajshahi","Sirajganj","Belkuchi","Enayetpur","6751"],["Rajshahi","Sirajganj","Belkuchi","Rajapur","6742"],["Rangpur","Dinajpur","Bangla Hili","Bangla Hili","5270"],["Rangpur","Dinajpur","Biral","Biral","5210"],["Rangpur","Dinajpur","Birampur","Birampur","5266"],["Rangpur","Dinajpur","Birganj","Birganj","5220"],["Rangpur","Dinajpur","Chrirbandar","Chrirbandar","5240"],["Rangpur","Dinajpur","Chrirbandar","Ranirbandar","5241"],["Rangpur","Dinajpur","Dinajpur Sadar","Dinajpur Rajbari","5201"],["Rangpur","Dinajpur","Dinajpur Sadar","Dinajpur Sadar","5200"],["Rangpur","Dinajpur","Khansama","Khansama","5230"],["Rangpur","Dinajpur","Khansama","Pakarhat","5231"],["Rangpur","Dinajpur","Maharajganj","Maharajganj","5226"],["Rangpur","Dinajpur","Nababganj","Daudpur","5281"],["Rangpur","Dinajpur","Nababganj","Gopalpur","5282"],["Rangpur","Dinajpur","Nababganj","Nababganj","5280"],["Rangpur","Dinajpur","Osmanpur","Ghoraghat","5291"],["Rangpur","Dinajpur","Osmanpur","Osmanpur","5290"],["Rangpur","Dinajpur","Parbatipur","Parbatipur","5250"],["Rangpur","Dinajpur","Phulbari","Phulbari","5260"],["Rangpur","Dinajpur","Setabganj","Setabganj","5216"],["Rangpur","Gaibandha","Bonarpara","Bonarpara","5750"],["Rangpur","Gaibandha","Bonarpara","saghata","5751"],["Rangpur","Gaibandha","Gaibandha Sadar","Gaibandha Sadar","5700"],["Rangpur","Gaibandha","Gobindaganj","Gobindhaganj","5740"],["Rangpur","Gaibandha","Gobindaganj","Mahimaganj","5741"],["Rangpur","Gaibandha","Palashbari","Palashbari","5730"],["Rangpur","Gaibandha","Phulchhari","Bharatkhali","5761"],["Rangpur","Gaibandha","Phulchhari","Phulchhari","5760"],["Rangpur","Gaibandha","Saadullapur","Naldanga","5711"],["Rangpur","Gaibandha","Saadullapur","Saadullapur","5710"],["Rangpur","Gaibandha","Sundarganj","Bamandanga","5721"],["Rangpur","Gaibandha","Sundarganj","Sundarganj","5720"],["Rangpur","Kurigram","Bhurungamari","Bhurungamari","5670"],["Rangpur","Kurigram","Chilmari","Chilmari","5630"],["Rangpur","Kurigram","Chilmari","Jorgachh","5631"],["Rangpur","Kurigram","Kurigram Sadar","Kurigram Sadar","5600"],["Rangpur","Kurigram","Kurigram Sadar","Pandul","5601"],["Rangpur","Kurigram","Kurigram Sadar","Phulbari","5680"],["Rangpur","Kurigram","Nageshwar","Nageshwar","5660"],["Rangpur","Kurigram","Rajarhat","Nazimkhan","5611"],["Rangpur","Kurigram","Rajarhat","Rajarhat","5610"],["Rangpur","Kurigram","Rajibpur","Rajibpur","5650"],["Rangpur","Kurigram","Roumari","Roumari","5640"],["Rangpur","Kurigram","Ulipur","Bazarhat","5621"],["Rangpur","Kurigram","Ulipur","Ulipur","5620"],["Rangpur","Lalmonirhat","Aditmari","Aditmari","5510"],["Rangpur","Lalmonirhat","Hatibandha","Hatibandha","5530"],["Rangpur","Lalmonirhat","Lalmonirhat Sadar","Kulaghat SO","5502"],["Rangpur","Lalmonirhat","Lalmonirhat Sadar","Lalmonirhat Sadar","5500"],["Rangpur","Lalmonirhat","Lalmonirhat Sadar","Moghalhat","5501"],["Rangpur","Lalmonirhat","Patgram","Baura","5541"],["Rangpur","Lalmonirhat","Patgram","Burimari","5542"],["Rangpur","Lalmonirhat","Patgram","Patgram","5540"],["Rangpur","Lalmonirhat","Tushbhandar","Tushbhandar","5520"],["Rangpur","Nilphamari","Dimla","Dimla","5350"],["Rangpur","Nilphamari","Dimla","Ghaga Kharibari","5351"],["Rangpur","Nilphamari","Domar","Chilahati","5341"],["Rangpur","Nilphamari","Domar","Domar","5340"],["Rangpur","Nilphamari","Jaldhaka","Jaldhaka","5330"],["Rangpur","Nilphamari","Kishoriganj","Kishoriganj","5320"],["Rangpur","Nilphamari","Nilphamari Sadar","Nilphamari Sadar","5300"],["Rangpur","Nilphamari","Nilphamari Sadar","Nilphamari Sugar Mil","5301"],["Rangpur","Nilphamari","Syedpur","Syedpur","5310"],["Rangpur","Nilphamari","Syedpur","Syedpur Upashahar","5311"],["Rangpur","Panchagarh","Boda","Boda","5010"],["Rangpur","Panchagarh","Chotto Dab","Chotto Dab","5040"],["Rangpur","Panchagarh","Chotto Dab","Mirjapur","5041"],["Rangpur","Panchagarh","Dabiganj","Dabiganj","5020"],["Rangpur","Panchagarh","Panchagra Sadar","Panchagar Sadar","5000"],["Rangpur","Panchagarh","Tetulia","Tetulia","5030"],["Rangpur","Rangpur","Badarganj","Badarganj","5430"],["Rangpur","Rangpur","Badarganj","Shyampur","5431"],["Rangpur","Rangpur","Gangachara","Gangachara","5410"],["Rangpur","Rangpur","Kaunia","Haragachh","5441"],["Rangpur","Rangpur","Kaunia","Kaunia","5440"],["Rangpur","Rangpur","Mithapukur","Mithapukur","5460"],["Rangpur","Rangpur","Pirgachha","Pirgachha","5450"],["Rangpur","Rangpur","Rangpur Sadar","Alamnagar","5402"],["Rangpur","Rangpur","Rangpur Sadar","Mahiganj","5403"],["Rangpur","Rangpur","Rangpur Sadar","Rangpur Cadet Colleg","5404"],["Rangpur","Rangpur","Rangpur Sadar","Rangpur Carmiecal Col","5405"],["Rangpur","Rangpur","Rangpur Sadar","Rangpur Sadar","5400"],["Rangpur","Rangpur","Rangpur Sadar","Rangpur Upa-Shahar","5401"],["Rangpur","Rangpur","Taraganj","Taraganj","5420"],["Rangpur","Thakurgaon","Baliadangi","Baliadangi","5140"],["Rangpur","Thakurgaon","Baliadangi","Lahiri","5141"],["Rangpur","Thakurgaon","Jibanpur","Jibanpur","5130"],["Rangpur","Thakurgaon","Pirganj","Pirganj","5110"],["Rangpur","Thakurgaon","Pirganj","Pirganj","5470"],["Rangpur","Thakurgaon","Rani Sankail","Nekmarad","5121"],["Rangpur","Thakurgaon","Rani Sankail","Rani Sankail","5120"],["Rangpur","Thakurgaon","Thakurgaon Sadar","Ruhia","5103"],["Rangpur","Thakurgaon","Thakurgaon Sadar","Shibganj","5102"],["Rangpur","Thakurgaon","Thakurgaon Sadar","Thakurgaon Road","5101"],["Rangpur","Thakurgaon","Thakurgaon Sadar","Thakurgaon Sadar","5100"]];
+// === GEO DATA MODULE — Clean loading system ===
+window._geoReady=true;
+window._geoCache={divisions:null,districts:null,thanas:null,postoffices:null,postcodes:null};
+window.geoUnique=function(col){
+  if(!window._BD_GEO)return[];
+  var seen={};return _BD_GEO.reduce(function(a,r){var v=(r[col]||'').trim();if(v&&!seen[v]){seen[v]=1;a.push(v)}return a},[]).sort();
+};
+window.geoFilteredUnique=function(col,filters){
+  if(!window._BD_GEO)return[];
+  var colMap={division:0,district:1,thana:2,postoffice:3,postcode:4};
+  var ci=colMap[col];if(ci===undefined)return[];
+  var seen={};
+  return _BD_GEO.filter(function(r){
+    for(var k in filters){if(filters[k]&&r[colMap[k]]!==filters[k])return false}return true;
+  }).reduce(function(a,r){var v=(r[ci]||'').trim();if(v&&!seen[v]){seen[v]=1;a.push(v)}return a},[]).sort();
+};
+window.getGeoContext=function(field,value){
+  if(!window._BD_GEO||!value)return{};
+  var colMap={division:0,district:1,thana:2,postoffice:3,postcode:4};
+  var ci=colMap[field];if(ci===undefined)return{};
+  var row=_BD_GEO.find(function(r){return r[ci]===value});
+  if(!row)return{};
+  return{division:row[0]||'',district:row[1]||'',thana:row[2]||'',postoffice:row[3]||'',postcode:row[4]||''};
+};
+// === Clean Geo-Data Module ===
+// Provides: geoData(), geoUnique(field), geoFilteredUnique(field, filters), getGeoContext()
+// Fields: division(0), district(1), thana(2), postoffice(3), postcode(4)
+var _geoFieldIdx={division:0,district:1,thana:2,postoffice:3,postcode:4};
+window.geoData=function(){return _BD_GEO||[]};
+function geoUnique(field){var idx=_geoFieldIdx[field];if(idx==null)return[];var seen={};return geoData().filter(function(r){var v=r[idx];if(!v||seen[v])return false;seen[v]=true;return true}).map(function(r){return r[idx]})}
+function geoFilteredUnique(field,filters){var idx=_geoFieldIdx[field];if(idx==null)return[];var data=geoData();if(filters){if(filters.division)data=data.filter(function(r){return r[0]===filters.division});if(filters.district)data=data.filter(function(r){return r[1]===filters.district});if(filters.thana)data=data.filter(function(r){return r[2]===filters.thana});if(filters.postoffice)data=data.filter(function(r){return r[3]===filters.postoffice})}var seen={};return data.filter(function(r){var v=r[idx];if(!v||seen[v])return false;seen[v]=true;return true}).map(function(r){return r[idx]})}
+function getGeoContext(){var dv=document.getElementById('paDv');var ds=document.getElementById('paDs');var th=document.getElementById('paTh');return{division:dv?dv.value.trim():'',district:ds?ds.value.trim():'',thana:th?th.value.trim():''}}
+window.geoFilter=function(inputId,listId,field){var q=document.getElementById(inputId).value.trim().toLowerCase();var ctx=getGeoContext();var items=geoFilteredUnique(field,ctx);if(q)items=items.filter(function(v){return v.toLowerCase().includes(q)});var el=document.getElementById(listId);el.innerHTML=items.slice(0,60).map(function(v){return'<div onclick="geoSelect(\\x27'+inputId+'\\x27,\\x27'+listId+'\\x27,\\x27'+field+'\\x27,this.textContent)">'+v+'</div>'}).join('');el.classList.add('active')}
+window.geoShowList=function(listId){document.querySelectorAll('.sr-list').forEach(function(x){if(x.id!==listId)x.classList.remove('active')});var el=document.getElementById(listId);if(!el.innerHTML)return;el.classList.add('active')}
+window.geoSelect=function(inputId,listId,field,val){document.getElementById(inputId).value=val;document.getElementById(listId).classList.remove('active');geoAutoFill(field,val)}
+window.geoAutoFill=function(field,val){var matches=_BD_GEO.filter(function(r){var idx={division:0,district:1,thana:2,postoffice:3,postcode:4}[field];return r[idx]===val});if(!matches.length)return;var first=matches[0];
+if(field==='thana'){document.getElementById('paDv').value=first[0];document.getElementById('paDs').value=first[1];document.getElementById('paTh').value=first[2];if(matches.length===1){document.getElementById('paPo').value=first[3];document.getElementById('paPc').value=first[4]}else{document.getElementById('paPo').value='';document.getElementById('paPc').value='';geoFilter('paPo','paPoL','postoffice');geoFilter('paPc','paPcL','postcode')}}
+else if(field==='postcode'){document.getElementById('paDv').value=first[0];document.getElementById('paDs').value=first[1];document.getElementById('paTh').value=first[2];document.getElementById('paPo').value=first[3];document.getElementById('paPc').value=first[4]}
+else if(field==='division'){document.getElementById('paDs').value='';document.getElementById('paTh').value='';document.getElementById('paPo').value='';document.getElementById('paPc').value='';geoFilter('paDs','paDsL','district');geoFilter('paTh','paThL','thana')}
+else if(field==='district'){document.getElementById('paDv').value=first[0];document.getElementById('paTh').value='';document.getElementById('paPo').value='';document.getElementById('paPc').value='';geoFilter('paTh','paThL','thana')}
+else if(field==='postoffice'){document.getElementById('paDv').value=first[0];document.getElementById('paDs').value=first[1];document.getElementById('paTh').value=first[2];document.getElementById('paPc').value=first[4]}}
+document.addEventListener('click',function(e){if(!e.target.closest('.sr-wrap'))document.querySelectorAll('.sr-list').forEach(function(x){x.classList.remove('active')})})
 window.switchPT=function(t,el){pT=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderPa();document.getElementById('paSPDiv').classList.toggle('hidden',pT!=='customer')}
-window.openAddParty=function(){document.getElementById('paTitle').textContent='Add '+(pT==='customer'?'Customer':'Supplier');document.getElementById('paEK').value='';['paN','paPh','paAd'].forEach(function(i){document.getElementById(i).value=''});document.getElementById('paCL').value='';document.getElementById('paOB').value='';document.getElementById('paSP').value='';document.getElementById('paSPDiv').classList.toggle('hidden',pT!=='customer');openModal('addParty')}
-window.savePa=async function(){var ek=document.getElementById('paEK').value;var n=document.getElementById('paN').value.trim();if(!n){showToast('Name is required','warning');return;}var spId=document.getElementById('paSP').value;var sp=paSPList.find(function(x){return x._key===spId});var ob=parseFloat(document.getElementById('paOB').value)||0;var d={name:n,phone:document.getElementById('paPh').value.trim(),address:document.getElementById('paAd').value.trim(),openingBalance:ob,creditLimit:+document.getElementById('paCL').value||0,salespersonId:spId||'',salespersonName:sp?sp.name:''};try{if(ek){var old=aP.find(function(x){return x._key===ek});if(old){d=Object.assign({},cleanForSave(old),d)}await saveByKey(ek,d);showToast('Contact updated successfully','success')}else{d.type=pT;d.balance=ob;await saveItem('party:',d);showToast((pT==='customer'?'Customer':'Supplier')+' added successfully','success')}invalidateCache('party:');closeModal('addParty');loadPa()}catch(e){showToast('Failed to save: '+e.message,'error')}}
-window.editPa=function(k){var p=aP.find(function(x){return x._key===k});if(!p)return;pT=p.type;document.getElementById('paTitle').textContent='Edit';document.getElementById('paEK').value=p._key;document.getElementById('paN').value=p.name||'';document.getElementById('paPh').value=p.phone||'';document.getElementById('paAd').value=p.address||'';document.getElementById('paOB').value=p.openingBalance||0;document.getElementById('paCL').value=p.creditLimit||'';document.getElementById('paSP').value=p.salespersonId||'';document.getElementById('paSPDiv').classList.toggle('hidden',pT!=='customer');openModal('addParty')}
+window.openAddParty=function(){document.getElementById('paTitle').textContent='Add '+(pT==='customer'?'Customer':'Supplier');document.getElementById('paEK').value='';['paN','paPh','paAd','paDv','paDs','paTh','paPo','paPc'].forEach(function(i){document.getElementById(i).value=''});document.getElementById('paCL').value='';document.getElementById('paOB').value='';document.getElementById('paSP').value='';document.getElementById('paSPDiv').classList.toggle('hidden',pT!=='customer');openModal('addParty');setTimeout(function(){geoFilter('paDv','paDvL','division');geoFilter('paDs','paDsL','district');geoFilter('paTh','paThL','thana');geoFilter('paPo','paPoL','postoffice');geoFilter('paPc','paPcL','postcode')},50)}
+window.savePa=async function(){var ek=document.getElementById('paEK').value;var n=document.getElementById('paN').value.trim();if(!n){showToast('Name is required','warning');return;}var spId=document.getElementById('paSP').value;var sp=paSPList.find(function(x){return x._key===spId});var ob=parseFloat(document.getElementById('paOB').value)||0;var d={name:n,phone:document.getElementById('paPh').value.trim(),address:document.getElementById('paAd').value.trim(),division:document.getElementById('paDv').value.trim(),district:document.getElementById('paDs').value.trim(),thana:document.getElementById('paTh').value.trim(),postOffice:document.getElementById('paPo').value.trim(),postcode:document.getElementById('paPc').value.trim(),openingBalance:ob,creditLimit:+document.getElementById('paCL').value||0,salespersonId:spId||'',salespersonName:sp?sp.name:''};try{if(ek){var old=aP.find(function(x){return x._key===ek});if(old){d=Object.assign({},cleanForSave(old),d)}await saveByKey(ek,d);showToast('Contact updated successfully','success')}else{d.type=pT;d.balance=ob;await saveItem('party:',d);showToast((pT==='customer'?'Customer':'Supplier')+' added successfully','success')}invalidateCache('party:');closeModal('addParty');loadPa()}catch(e){showToast('Failed to save: '+e.message,'error')}}
+window.editPa=function(k){var p=aP.find(function(x){return x._key===k});if(!p)return;pT=p.type;document.getElementById('paTitle').textContent='Edit';document.getElementById('paEK').value=p._key;document.getElementById('paN').value=p.name||'';document.getElementById('paPh').value=p.phone||'';document.getElementById('paAd').value=p.address||'';document.getElementById('paDv').value=p.division||'';document.getElementById('paDs').value=p.district||'';document.getElementById('paTh').value=p.thana||'';document.getElementById('paPo').value=p.postOffice||'';document.getElementById('paPc').value=p.postcode||'';document.getElementById('paOB').value=p.openingBalance||0;document.getElementById('paCL').value=p.creditLimit||'';document.getElementById('paSP').value=p.salespersonId||'';document.getElementById('paSPDiv').classList.toggle('hidden',pT!=='customer');openModal('addParty')}
 async function loadPa(){var d=await Promise.all([loadList('party:'),loadList('salesperson:')]);aP=d[0];paSPList=d[1]||[];document.getElementById('paSP').innerHTML='<option value="">None</option>'+paSPList.map(function(s){return'<option value="'+s._key+'">'+s.name+'</option>'}).join('');renderPa()}
-function renderPa(li){var l=li||aP.filter(function(p){return p.type===pT});document.getElementById('paBody').innerHTML=!l.length?'<tr><td colspan="8" class="empty">None</td></tr>':l.map(function(p){var ob=p.openingBalance||0;return'<tr><td class="bold">'+p.name+'</td><td class="text-muted">'+(p.phone||'')+'</td><td class="text-muted">'+(p.address||'')+'</td><td>'+(p.salespersonName?'<span class="badge badge-info">'+p.salespersonName+'</span>':'-')+'</td><td class="r text-muted">'+(ob?fmt(Math.abs(ob))+(ob>0?' Dr':' Cr'):'--')+'</td><td class="r">'+(p.creditLimit?fmt(p.creditLimit):'--')+'</td><td class="r bold '+((p.balance||0)>0?'text-danger':'text-success')+'">'+fmt(Math.abs(p.balance||0))+((p.balance||0)>0?' Dr':p.balance<0?' Cr':'')+'</td><td class="r"><button class="btn btn-outline btn-sm" onclick="editPa(\\x27'+p._key+'\\x27)">Edit</button></td></tr>'}).join('')}
-window.filterPa=function(q){var t=normalize(q);renderPa(aP.filter(function(p){return p.type===pT&&(normalize(p.name).includes(t)||normalize(p.phone).includes(t))}))}
+function renderPa(li){var l=li||aP.filter(function(p){return p.type===pT});document.getElementById('paBody').innerHTML=!l.length?'<tr><td colspan="8" class="empty">None</td></tr>':l.map(function(p){var ob=p.openingBalance||0;return'<tr><td class="bold">'+p.name+'</td><td class="text-muted">'+(p.phone||'')+'</td><td class="text-muted">'+(p.thana||p.district||'')+'</td><td>'+(p.salespersonName?'<span class="badge badge-info">'+p.salespersonName+'</span>':'-')+'</td><td class="r text-muted">'+(ob?fmt(Math.abs(ob))+(ob>0?' Dr':' Cr'):'--')+'</td><td class="r">'+(p.creditLimit?fmt(p.creditLimit):'--')+'</td><td class="r bold '+((p.balance||0)>0?'text-danger':'text-success')+'">'+fmt(Math.abs(p.balance||0))+((p.balance||0)>0?' Dr':p.balance<0?' Cr':'')+'</td><td class="r"><button class="btn btn-outline btn-sm" onclick="editPa(\\x27'+p._key+'\\x27)">Edit</button></td></tr>'}).join('')}
+window.filterPa=function(q){var t=normalize(q);renderPa(aP.filter(function(p){return p.type===pT&&(normalize(p.name).includes(t)||normalize(p.phone||'').includes(t)||normalize(p.thana||'').includes(t)||normalize(p.district||'').includes(t))}))}
 window.openImportParty=function(){document.getElementById('paImportFile').value='';document.getElementById('paImportPreview').style.display='none';document.getElementById('paImportStatus').innerHTML='';document.getElementById('paImportBtn').disabled=true;_paImportRows=[];openModal('importPartyModal')}
-window.downloadPartyTemplate=function(){var ws=XLSX.utils.aoa_to_sheet([['Name','Address','Salesperson','Opening Balance','Credit Limit'],['ABC Trading','123 Main St','','5000','10000'],['XYZ Corp','456 Market Rd','','0','20000']]);var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Template');XLSX.writeFile(wb,'party_import_template.xlsx')}
-document.getElementById('paImportFile').addEventListener('change',function(e){var file=e.target.files[0];if(!file)return;var reader=new FileReader();reader.onload=function(ev){try{var wb=XLSX.read(ev.target.result,{type:'array'});var ws=wb.Sheets[wb.SheetNames[0]];var rows=XLSX.utils.sheet_to_json(ws,{defval:''});if(!rows.length){document.getElementById('paImportStatus').innerHTML='<span style="color:var(--danger)">No data found in file</span>';return}_paImportRows=rows.map(function(r){var name=String(r['Name']||r['name']||r['NAME']||'').trim();var addr=String(r['Address']||r['address']||r['ADDRESS']||'').trim();var sp=String(r['Salesperson']||r['salesperson']||r['SP']||r['sp']||'').trim();var ob=parseFloat(r['Opening Balance']||r['opening balance']||r['Opening_Balance']||r['OB']||0)||0;var cl=parseFloat(r['Credit Limit']||r['credit limit']||r['Credit_Limit']||r['CL']||0)||0;return{name:name,address:addr,salesperson:sp,openingBalance:ob,creditLimit:cl}}).filter(function(r){return r.name});
-var prev=document.getElementById('paImportPreview');prev.style.display='block';prev.innerHTML='<div style="font-weight:600;margin-bottom:6px">Preview ('+_paImportRows.length+' rows) - Importing as '+(pT==='customer'?'Customers':'Suppliers')+':</div><table class="tbl" style="font-size:11px"><thead><tr><th>Name</th><th>Address</th><th>SP</th><th class="r">Opening Bal</th><th class="r">Credit Limit</th></tr></thead><tbody>'+_paImportRows.slice(0,20).map(function(r){return'<tr><td>'+r.name+'</td><td>'+r.address+'</td><td>'+r.salesperson+'</td><td class="r">'+r.openingBalance+'</td><td class="r">'+r.creditLimit+'</td></tr>'}).join('')+(_paImportRows.length>20?'<tr><td colspan="5" class="text-muted">...and '+(_paImportRows.length-20)+' more rows</td></tr>':'')+'</tbody></table>';
-document.getElementById('paImportBtn').disabled=false;document.getElementById('paImportStatus').innerHTML='<span style="color:var(--accent)">'+_paImportRows.length+' valid rows ready to import</span>'}catch(err){document.getElementById('paImportStatus').innerHTML='<span style="color:var(--danger)">Error reading file: '+err.message+'</span>'}};reader.readAsArrayBuffer(file)})
+window.downloadPartyTemplate=function(){var ws=XLSX.utils.aoa_to_sheet([['Name','Phone','Address','Division','District','Thana','Post Office','Postcode','Salesperson','Opening Balance','Credit Limit'],['ABC Trading','01700000000','123 Main St','Dhaka','Dhaka','Dhanmondi','Dhanmondi','1209','','5000','10000']]);var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Template');XLSX.writeFile(wb,'party_import_template.xlsx')}
+document.getElementById('paImportFile').addEventListener('change',function(e){var file=e.target.files[0];if(!file)return;var reader=new FileReader();reader.onload=function(ev){try{var wb=XLSX.read(ev.target.result,{type:'array'});var ws=wb.Sheets[wb.SheetNames[0]];var rows=XLSX.utils.sheet_to_json(ws,{defval:''});if(!rows.length){document.getElementById('paImportStatus').innerHTML='<span style="color:var(--danger)">No data found</span>';return}
+_paImportRows=rows.map(function(r){var name=String(r['Name']||r['name']||'').trim();var phone=String(r['Phone']||r['phone']||r['Mobile']||'').trim();var addr=String(r['Address']||r['address']||'').trim();var dv=String(r['Division']||r['division']||'').trim();var ds=String(r['District']||r['district']||'').trim();var th=String(r['Thana']||r['thana']||r['Upazila']||'').trim();var po=String(r['Post Office']||r['post office']||r['PostOffice']||'').trim();var pc=String(r['Postcode']||r['postcode']||r['Post Code']||'').trim();var sp=String(r['Salesperson']||r['SP']||'').trim();var ob=parseFloat(r['Opening Balance']||r['OB']||0)||0;var cl=parseFloat(r['Credit Limit']||r['CL']||0)||0;
+if(th&&!dv){var m=_BD_GEO.find(function(g){return g[2].toLowerCase()===th.toLowerCase()});if(m){dv=m[0];ds=m[1];if(!po)po=m[3];if(!pc)pc=m[4]}}
+if(pc&&!th){var m2=_BD_GEO.find(function(g){return g[4]===pc});if(m2){dv=m2[0];ds=m2[1];th=m2[2];if(!po)po=m2[3]}}
+return{name:name,phone:phone,address:addr,division:dv,district:ds,thana:th,postOffice:po,postcode:pc,salesperson:sp,openingBalance:ob,creditLimit:cl}}).filter(function(r){return r.name});
+var prev=document.getElementById('paImportPreview');prev.style.display='block';prev.innerHTML='<div style="font-weight:600;margin-bottom:6px">Preview ('+_paImportRows.length+' rows) as '+(pT==='customer'?'Customers':'Suppliers')+':</div><table class="tbl" style="font-size:11px"><thead><tr><th>Name</th><th>Phone</th><th>Thana</th><th>Postcode</th><th>SP</th><th class="r">OB</th><th class="r">CL</th></tr></thead><tbody>'+_paImportRows.slice(0,20).map(function(r){return'<tr><td>'+r.name+'</td><td>'+r.phone+'</td><td>'+r.thana+'</td><td>'+r.postcode+'</td><td>'+r.salesperson+'</td><td class="r">'+r.openingBalance+'</td><td class="r">'+r.creditLimit+'</td></tr>'}).join('')+(_paImportRows.length>20?'<tr><td colspan="7" class="text-muted">...and '+(_paImportRows.length-20)+' more</td></tr>':'')+'</tbody></table>';
+document.getElementById('paImportBtn').disabled=false;document.getElementById('paImportStatus').innerHTML='<span style="color:var(--accent)">'+_paImportRows.length+' rows ready</span>'}catch(err){document.getElementById('paImportStatus').innerHTML='<span style="color:var(--danger)">Error: '+err.message+'</span>'}};reader.readAsArrayBuffer(file)})
 window.doImportParty=async function(){if(!_paImportRows.length)return;document.getElementById('paImportBtn').disabled=true;document.getElementById('paImportStatus').innerHTML='<span style="color:var(--primary)">Importing...</span>';var ok=0,fail=0;
-for(var i=0;i<_paImportRows.length;i++){try{var r=_paImportRows[i];var spMatch=paSPList.find(function(s){return s.name.toLowerCase()===r.salesperson.toLowerCase()});var d={type:pT,name:r.name,phone:'',address:r.address,openingBalance:r.openingBalance,balance:r.openingBalance,creditLimit:r.creditLimit,salespersonId:spMatch?spMatch._key:'',salespersonName:spMatch?spMatch.name:''};await saveItem('party:',d);ok++}catch(e){fail++}}
+for(var i=0;i<_paImportRows.length;i++){try{var r=_paImportRows[i];var spMatch=paSPList.find(function(s){return s.name.toLowerCase()===r.salesperson.toLowerCase()});var d={type:pT,name:r.name,phone:r.phone,address:r.address,division:r.division,district:r.district,thana:r.thana,postOffice:r.postOffice,postcode:r.postcode,openingBalance:r.openingBalance,balance:r.openingBalance,creditLimit:r.creditLimit,salespersonId:spMatch?spMatch._key:'',salespersonName:spMatch?spMatch.name:''};await saveItem('party:',d);ok++}catch(e){fail++}}
 invalidateCache('party:');loadPa();closeModal('importPartyModal');showToast('Imported '+ok+' '+(pT==='customer'?'customers':'suppliers')+(fail?' ('+fail+' failed)':''),'success');_paImportRows=[]}
 loadPa();
 </script>`}
@@ -1417,7 +1767,7 @@ loadPa();
 
 function purchasesPage(){return `
 <div class="page-header"><div><div class="page-title">Purchases</div><div class="page-sub">Purchase products from suppliers</div></div><button class="btn btn-primary" onclick="openPurchase()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Purchase</button></div>
-<div class="search-wrap"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search purchases..." oninput="filterPur(this.value)"></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search purchases..." oninput="filterPur()" id="purSearch"></div><div><label>Supplier</label><select id="purSupF" onchange="filterPur()" style="font-size:12px"><option value="">All Suppliers</option></select></div><div><label>From</label><input type="date" id="purFromF" onchange="filterPur()"></div><div><label>To</label><input type="date" id="purToF" onchange="filterPur()"></div><div><label>Group</label><select id="purGroupF" onchange="filterPur()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="purBrandF" onchange="filterPur()" style="font-size:12px"><option value="">All Brands</option></select></div></div></div></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="purTable"><thead><tr><th>Date</th><th>Purchase#</th><th>Supplier</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th class="r">Act</th></tr></thead><tbody id="purBody"></tbody></table></div></div>
 <div class="modal-overlay" id="purModal"><div class="modal modal-lg"><h3 id="purTitle">New Purchase</h3>
 <input type="hidden" id="purEK">
@@ -1433,11 +1783,14 @@ function purchasesPage(){return `
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal('purModal')">Cancel</button><button class="btn btn-primary" onclick="savePur()">Save Purchase</button></div>
 </div></div>
 <script>
-var purs=[],prods=[],suppliers=[],purBanks=[];
+var purs=[],prods=[],suppliers=[],purBanks=[],purGroups=[],purBrandsL=[];
 window.togglePurBank=function(){var m=document.getElementById('purMethod').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('purBankRow').classList.toggle('hidden',!needsBank);document.getElementById('purChequeDiv').classList.toggle('hidden',m!=='cheque')};
-async function loadPur(){var d=await Promise.all([loadList('purchase:'),loadList('product:'),loadList('party:'),loadList('bank:')]);purs=d[0];prods=d[1];suppliers=d[2].filter(function(p){return p.type==='supplier'});purBanks=d[3]||[];
+async function loadPur(){var d=await Promise.all([loadList('purchase:'),loadList('product:'),loadList('party:'),loadList('bank:'),loadList('prodgroup:'),loadList('prodbrand:')]);purs=d[0];prods=d[1];suppliers=d[2].filter(function(p){return p.type==='supplier'});purBanks=d[3]||[];purGroups=d[4]||[];purBrandsL=d[5]||[];
 document.getElementById('purSupplier').innerHTML='<option value="">Select...</option>'+suppliers.map(function(s){return'<option value="'+s._key+'">'+s.name+'</option>'}).join('');
 document.getElementById('purBank').innerHTML='<option value="">Select Bank...</option>'+purBanks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
+document.getElementById('purSupF').innerHTML='<option value="">All Suppliers</option>'+suppliers.map(function(s){return'<option value="'+s.name+'">'+s.name+'</option>'}).join('');
+document.getElementById('purGroupF').innerHTML='<option value="">All Groups</option>'+purGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');
+document.getElementById('purBrandF').innerHTML='<option value="">All Brands</option>'+purBrandsL.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
 renderPur(purs)}
 function renderPur(l){l.sort(function(a,b){return(b.date||'').localeCompare(a.date)});document.getElementById('purBody').innerHTML=!l.length?'<tr><td colspan="7" class="empty">No purchases</td></tr>':l.map(function(p){var due=(p.total||0)-(p.paid||0);return'<tr><td>'+p.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27purchase\\x27,\\x27'+p._key+'\\x27)">'+p.purchaseNo+'</span></td><td>'+p.supplierName+'</td><td class="r bold">'+fmt(p.total)+'</td><td class="r text-success">'+fmt(p.paid)+'</td><td class="r '+(due>0?'text-danger':'')+'">'+fmt(due)+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editPur(\\x27'+p._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delPur(\\x27'+p._key+'\\x27)">Del</button></td></tr>'}).join('')}
 window.openPurchase=function(){document.getElementById('purEK').value='';document.getElementById('purNo').value=txnNo('PUR');document.getElementById('purDate').value=todayISO();document.getElementById('purSupplier').value='';document.getElementById('purDisc').value=0;document.getElementById('purExtra').value=0;document.getElementById('purVat').value=0;document.getElementById('purPaid').value=0;document.getElementById('purMethod').value='';document.getElementById('purTitle').textContent='New Purchase';togglePurBank();window._purItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderPurItems();openModal('purModal')}
@@ -1466,19 +1819,19 @@ if(ek){
   // Delete old auto-created payment voucher if exists
   if(oldPur&&oldPur._autoPayKey){try{await api('/api/delete',{key:oldPur._autoPayKey,skipApproval:true})}catch(e){}}
   // Create new auto payment voucher if paid > 0
-  if(paid>0&&method!=='credit'){var payVch={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr=await api('/api/save',{prefix:'payment:',data:payVch,skipApproval:true});data._autoPayKey=pvr.key||''}
+  if(paid>0&&method!=='credit'){var payVch={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr=await api('/api/save',{prefix:'payment:',data:payVch,skipApproval:true});data._autoPayKey=pvr.key||''}
   await saveByKey(ek,data,'edit','Edited purchase: '+data.purchaseNo)
 }else{
   var saveRes=await saveItem('purchase:',data,null,'create','Created purchase: '+data.purchaseNo);
   for(var ii=0;ii<items.length;ii++){var pr=prods.find(function(x){return x._key===items[ii].pk});if(pr){pr.stock=(pr.stock||0)+items[ii].qty;pr.purchasePrice=items[ii].rate;await saveByKey(pr._key,cleanForSave(pr))}}
   if(paid>0&&method!=='cash'&&method!=='credit'&&bankName){var bk2=purBanks.find(function(b){return b.name===bankName});if(bk2){bk2.balance=(bk2.balance||0)-paid;await saveByKey(bk2._key,cleanForSave(bk2))}}
   // Auto-create payment voucher if paid > 0
-  if(paid>0&&method!=='credit'){var payVch2={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr2=await api('/api/save',{prefix:'payment:',data:payVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoPayKey=pvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
+  if(paid>0&&method!=='credit'){var payVch2={type:'payment',no:txnNo('PAY'),date:data.date,party:sup?sup.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Purchase '+data.purchaseNo,status:'done',_autoInvoice:data.purchaseNo};var pvr2=await api('/api/save',{prefix:'payment:',data:payVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoPayKey=pvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
 }
 invalidateCache('purchase:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');
 showToast(ek?'Purchase updated successfully':'Purchase saved successfully','success');
 closeModal('purModal');loadPur()}
-window.editPur=function(k){var p=purs.find(function(x){return x._key===k});if(!p)return;document.getElementById('purEK').value=k;document.getElementById('purNo').value=p.purchaseNo;document.getElementById('purDate').value=p.date;document.getElementById('purSupplier').value=p.supplierId;document.getElementById('purDisc').value=p.discount||0;document.getElementById('purExtra').value=p.extra||0;document.getElementById('purVat').value=p.vat||0;document.getElementById('purVatType').value=p.vatType||'amount';document.getElementById('purPaid').value=p.paid||0;document.getElementById('purMethod').value=p.method||'cash';togglePurBank();if(p.bankName)document.getElementById('purBank').value=p.bankName;if(p.chequeNo&&document.getElementById('purCheque'))document.getElementById('purCheque').value=p.chequeNo;window._purItems=(p.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._purItems.length)window._purItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];document.getElementById('purTitle').textContent='Edit Purchase';renderPurItems();openModal('purModal')}
+window.editPur=function(k){var p=purs.find(function(x){return x._key===k});if(!p)return;document.getElementById('purEK').value=k;document.getElementById('purNo').value=p.purchaseNo;document.getElementById('purDate').value=p.date;document.getElementById('purSupplier').value=p.supplierId;document.getElementById('purDisc').value=p.discount||0;document.getElementById('purExtra').value=p.extra||0;document.getElementById('purVat').value=p.vat||0;document.getElementById('purVatType').value=p.vatType||'amount';document.getElementById('purPaid').value=p.paid||0;document.getElementById('purMethod').value=p.method||'';togglePurBank();if(p.bankName)document.getElementById('purBank').value=p.bankName;if(p.chequeNo&&document.getElementById('purCheque'))document.getElementById('purCheque').value=p.chequeNo;window._purItems=(p.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._purItems.length)window._purItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];document.getElementById('purTitle').textContent='Edit Purchase';renderPurItems();openModal('purModal')}
 window.delPur=async function(k){if(!confirm('Delete purchase? Stock and bank balance will be reversed.'))return;
 var p=purs.find(function(x){return x._key===k});
 if(p){
@@ -1490,14 +1843,14 @@ if(p){
   if(p._autoPayKey){try{await api('/api/delete',{key:p._autoPayKey,skipApproval:true})}catch(e){}}
 }
 await deleteItem(k,false,'Deleted purchase: '+(p?p.purchaseNo:''));invalidateCache('purchase:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');showToast('Purchase deleted successfully','success');loadPur()}
-window.filterPur=function(q){var t=normalize(q);renderPur(purs.filter(function(p){return normalize(p.purchaseNo).includes(t)||normalize(p.supplierName).includes(t)||normalize(p.date).includes(t)}))}
+window.filterPur=function(){var t=normalize(document.getElementById('purSearch')?document.getElementById('purSearch').value:'');var sf=document.getElementById('purSupF')?document.getElementById('purSupF').value:'';var from=document.getElementById('purFromF')?document.getElementById('purFromF').value:'';var to=document.getElementById('purToF')?document.getElementById('purToF').value:'';var gf=document.getElementById('purGroupF')?document.getElementById('purGroupF').value:'';var bf=document.getElementById('purBrandF')?document.getElementById('purBrandF').value:'';renderPur(purs.filter(function(p){if(sf&&p.supplierName!==sf)return false;if(from&&p.date<from)return false;if(to&&p.date>to)return false;if(gf||bf){var match=(p.items||[]).some(function(it){var pr=prods.find(function(x){return x._key===it.productId});return(!gf||pr&&pr.group===gf)&&(!bf||pr&&pr.brand===bf)});if(!match)return false}if(t&&!normalize(p.purchaseNo).includes(t)&&!normalize(p.supplierName).includes(t)&&!normalize(p.date).includes(t))return false;return true}))}
 loadPur();
 </script>`}
 
 function salesPage(){return `
 <div class="page-header"><div><div class="page-title">Sales</div><div class="page-sub">Manage invoices</div></div><button class="btn btn-primary" onclick="openSale()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Sale</button></div>
-<div class="search-wrap"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search sales..." oninput="filterSal(this.value)"></div>
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="salTable"><thead><tr><th>Date</th><th>Invoice#</th><th>Customer</th><th>SP</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th class="r">Act</th></tr></thead><tbody id="salBody"></tbody></table></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search sales..." oninput="filterSal()" id="salSearch"></div><div><label>Customer</label><select id="salCustF" onchange="filterSal()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>SP</label><select id="salSPF" onchange="filterSal()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>From</label><input type="date" id="salFromF" onchange="filterSal()"></div><div><label>To</label><input type="date" id="salToF" onchange="filterSal()"></div><div><label>Group</label><select id="salGroupF" onchange="filterSal()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="salBrandF" onchange="filterSal()" style="font-size:12px"><option value="">All Brands</option></select></div></div></div></div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="salTable"><thead><tr><th>Date</th><th>Invoice#</th><th>Customer</th><th>SP</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th class="r">Fare</th><th class="r">Act</th></tr></thead><tbody id="salBody"></tbody></table></div></div>
 <div class="modal-overlay" id="salModal"><div class="modal modal-lg"><h3 id="salTitle">New Sale</h3>
 <input type="hidden" id="salEK">
 <div class="form-row"><div><label>Invoice No</label><input id="salNo" readonly></div><div><label>Date</label><input type="date" id="salDate"></div></div>
@@ -1511,23 +1864,28 @@ function salesPage(){return `
 <div class="form-row"><div><label>Total</label><input id="salTotal" readonly class="bold"></div><div><label>Paid</label><input type="number" id="salPaid" value="0"></div></div>
 <div class="form-row"><div><label>Payment Method</label><select id="salMethod" onchange="toggleSalBank()"><option value="">Select Method...</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option><option value="credit">On Credit</option></select></div><div id="salBankDiv"><label>Bank</label><select id="salBank"><option value="">Select Bank...</option></select></div></div>
 <div class="form-group hidden" id="salChequeDiv"><label>Cheque No</label><input id="salCheque" placeholder="Cheque#"></div>
-<div class="form-group"><label>Note</label><input id="salNote" placeholder="Sale note / remarks"></div>
+<div class="form-row"><div class="form-group"><label>Note</label><input id="salNote" placeholder="Sale note / remarks"></div><div class="form-group"><label>Truck Fare (Received from Customer)</label><input type="number" id="salTruckFare" value="0" placeholder="0" step="any" oninput="checkFareExceed()"><div id="fareExceedHint" style="font-size:10px;color:var(--text-muted);margin-top:2px">Counts as Customer Receive + Transportation Expense</div></div></div>
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal('salModal')">Cancel</button><button class="btn btn-primary" onclick="saveSal()">Save Sale</button></div>
 </div></div>
 <script>
-var sals=[],salProds=[],customers=[],spList=[],salBanks=[];
+var sals=[],salProds=[],customers=[],spList=[],salBanks=[],_thanaFares=[],salGroups=[],salBrandsL=[];
 window.toggleSalBank=function(){var m=document.getElementById('salMethod').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('salBankDiv').classList.toggle('hidden',!needsBank);document.getElementById('salChequeDiv').classList.toggle('hidden',m!=='cheque');
 // Auto-fill paid amount when cash is selected
 if(m==='cash'){var totalStr=document.getElementById('salTotal').value;var totalNum=parseFloat(String(totalStr).replace(/,/g,''))||0;document.getElementById('salPaid').value=totalNum}};
-window.onSalCustChange=function(){var cid=document.getElementById('salCust').value;var cust=customers.find(function(x){return x._key===cid});if(cust&&cust.salespersonId){document.getElementById('salSP').value=cust.salespersonId}calcSal()};
-async function loadSal(){var d=await Promise.all([loadList('sale:'),loadList('product:'),loadList('party:'),loadList('salesperson:'),loadList('bank:')]);sals=d[0];salProds=d[1];customers=d[2].filter(function(p){return p.type==='customer'});spList=d[3];salBanks=d[4]||[];
+window.onSalCustChange=function(){var cid=document.getElementById('salCust').value;var cust=customers.find(function(x){return x._key===cid});if(cust&&cust.salespersonId){document.getElementById('salSP').value=cust.salespersonId}calcSal();checkFareExceed()};
+async function loadSal(){var d=await Promise.all([loadList('sale:'),loadList('product:'),loadList('party:'),loadList('salesperson:'),loadList('bank:'),loadList('thanafare:'),loadList('prodgroup:'),loadList('prodbrand:')]);sals=d[0];salProds=d[1];customers=d[2].filter(function(p){return p.type==='customer'});spList=d[3];salBanks=d[4]||[];_thanaFares=d[5]||[];salGroups=d[6]||[];salBrandsL=d[7]||[];
 document.getElementById('salCust').innerHTML='<option value="">Select...</option>'+customers.map(function(c){return'<option value="'+c._key+'">'+c.name+'</option>'}).join('');
 document.getElementById('salSP').innerHTML='<option value="">None</option>'+spList.map(function(s){return'<option value="'+s._key+'">'+s.name+'</option>'}).join('');
 document.getElementById('salBank').innerHTML='<option value="">Select Bank...</option>'+salBanks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
+document.getElementById('salCustF').innerHTML='<option value="">All Customers</option>'+customers.map(function(c){return'<option value="'+c.name+'">'+c.name+'</option>'}).join('');
+document.getElementById('salSPF').innerHTML='<option value="">All SP</option>'+spList.map(function(s){return'<option value="'+s.name+'">'+s.name+'</option>'}).join('');
+document.getElementById('salGroupF').innerHTML='<option value="">All Groups</option>'+salGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');
+document.getElementById('salBrandF').innerHTML='<option value="">All Brands</option>'+salBrandsL.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
 renderSal(sals)}
-function renderSal(l){l.sort(function(a,b){return(b.date||'').localeCompare(a.date)});document.getElementById('salBody').innerHTML=!l.length?'<tr><td colspan="8" class="empty">No sales</td></tr>':l.map(function(s){var due=(s.total||0)-(s.paid||0);return'<tr><td>'+s.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+s._key+'\\x27)">'+s.invoiceNo+'</span></td><td>'+s.customerName+'</td><td class="text-muted">'+(s.salespersonName||'-')+'</td><td class="r bold">'+fmt(s.total)+'</td><td class="r text-success">'+fmt(s.paid)+'</td><td class="r '+(due>0?'text-danger':'')+'">'+fmt(due)+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editSal(\\x27'+s._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delSal(\\x27'+s._key+'\\x27)">Del</button></td></tr>'}).join('')}
+window.checkFareExceed=function(){var cid=document.getElementById('salCust').value;var cust=customers.find(function(x){return x._key===cid});var fare=+document.getElementById('salTruckFare').value||0;var hint=document.getElementById('fareExceedHint');if(!cust||!fare){hint.innerHTML='Counts as Customer Receive + Transportation Expense';hint.style.color='var(--text-muted)';return}var th=(cust.thana||'').trim();var tf=_thanaFares.find(function(f){return f.thana===th});var totalQty=window._salItems?window._salItems.reduce(function(s,it){return s+(+it.qty||0)},0):0;if(tf&&tf.maxFare>0){var maxForOrder=tf.maxFare*totalQty;if(fare>maxForOrder){hint.innerHTML='<span style="color:var(--danger);font-weight:600">\u26a0 EXCEEDED! Max for '+th+': '+fmt(tf.maxFare)+'/qty x '+totalQty+' = '+fmt(maxForOrder)+' | Over by: '+fmt(fare-maxForOrder)+'</span>';hint.style.color='var(--danger)'}else{hint.innerHTML='<span style="color:var(--accent)">\u2713 Within limit for '+th+' ('+fmt(tf.maxFare)+'/qty x '+totalQty+' = '+fmt(maxForOrder)+')</span>';hint.style.color='var(--accent)'}}else{hint.innerHTML='Counts as Customer Receive + Transportation Expense'+(th?' | No max fare set for '+th:'');hint.style.color='var(--text-muted)'}}
+function renderSal(l){l.sort(function(a,b){return(b.date||'').localeCompare(a.date)});document.getElementById('salBody').innerHTML=!l.length?'<tr><td colspan="9" class="empty">No sales</td></tr>':l.map(function(s){var due=(s.total||0)-(s.paid||0);return'<tr><td>'+s.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+s._key+'\\x27)">'+s.invoiceNo+'</span></td><td>'+s.customerName+'</td><td class="text-muted">'+(s.salespersonName||'-')+'</td><td class="r bold">'+fmt(s.total)+'</td><td class="r text-success">'+fmt(s.paid)+'</td><td class="r '+(due>0?'text-danger':'')+'">'+fmt(due)+'</td><td class="r text-muted">'+(s.truckFare?(s.fareExceeded?'<span style="color:var(--danger)" title="Exceeded max '+fmt(s.fareMaxForThana||0)+' for '+(s.customerThana||'')+'">'+fmt(s.truckFare)+' \u26a0</span>':fmt(s.truckFare)):'')+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editSal(\\x27'+s._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delSal(\\x27'+s._key+'\\x27)">Del</button></td></tr>'}).join('')}
 window._salItems=[];
-window.openSale=function(){document.getElementById('salEK').value='';document.getElementById('salNo').value=txnNo('INV');document.getElementById('salDate').value=todayISO();document.getElementById('salCust').value='';document.getElementById('salSP').value='';document.getElementById('salDisc').value=0;document.getElementById('salExtra').value=0;document.getElementById('salVat').value=0;document.getElementById('salAit').value=0;document.getElementById('salPaid').value=0;document.getElementById('salNote').value='';document.getElementById('salMethod').value='';document.getElementById('creditWarn').classList.add('hidden');toggleSalBank();window._salItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderSalItems();openModal('salModal')}
+window.openSale=function(){document.getElementById('salEK').value='';document.getElementById('salNo').value=txnNo('INV');document.getElementById('salDate').value=todayISO();document.getElementById('salCust').value='';document.getElementById('salSP').value='';document.getElementById('salDisc').value=0;document.getElementById('salExtra').value=0;document.getElementById('salVat').value=0;document.getElementById('salAit').value=0;document.getElementById('salPaid').value=0;document.getElementById('salNote').value='';document.getElementById('salTruckFare').value=0;document.getElementById('salMethod').value='';document.getElementById('creditWarn').classList.add('hidden');toggleSalBank();window._salItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderSalItems();openModal('salModal')}
 function renderSalItems(){document.getElementById('salItems').innerHTML='<table class="tbl" style="font-size:12px"><thead><tr><th>Product</th><th style="width:70px">Qty</th><th style="width:90px">Rate</th><th style="width:90px">Amt</th><th style="width:30px"></th></tr></thead><tbody>'+window._salItems.map(function(it,i){return'<tr><td><select onchange="salItemCh('+i+',this)" style="font-size:12px"><option value="">Select...</option>'+salProds.map(function(p){return'<option value="'+p._key+'" '+(it.pk===p._key?'selected':'')+'>'+p.name+' ['+fmt(p.stock||0)+']</option>'}).join('')+'</select></td><td><input type="number" value="'+it.qty+'" onchange="salQty('+i+',this)" style="width:60px"></td><td><input type="number" value="'+it.rate+'" onchange="salRate('+i+',this)" style="width:80px"></td><td class="r bold">'+fmt(it.amt)+'</td><td><button class="btn btn-danger btn-xs" onclick="rmSalItem('+i+')">X</button></td></tr>'}).join('')+'</tbody></table>';calcSal()}
 window.addSalItem=function(){window._salItems.push({pk:'',pn:'',qty:1,rate:0,amt:0});renderSalItems()}
 window.rmSalItem=function(i){window._salItems.splice(i,1);renderSalItems()}
@@ -1545,7 +1903,8 @@ if(paid>0&&!method){showToast('Please select a payment method','warning');return
 if(!ek){var stockErrors=[];items.forEach(function(it){var pr=salProds.find(function(x){return x._key===it.pk});if(pr&&(pr.stock||0)<=0){stockErrors.push(pr.name+' (Stock: 0)')}else if(pr&&it.qty>(pr.stock||0)){stockErrors.push(pr.name+' (Available: '+(pr.stock||0)+', Requested: '+it.qty+')')}});if(stockErrors.length){showToast('Cannot create sale - Insufficient stock:\\n'+stockErrors.join(', '),'error');return;}}var sub=items.reduce(function(s,x){return s+x.amt},0);var dt=document.getElementById('salDiscType').value;var dv=+document.getElementById('salDisc').value||0;var discAmt=dt==='percent'?sub*dv/100:dv;var extra=+document.getElementById('salExtra').value||0;var base=sub-discAmt+extra;var vt=document.getElementById('salVatType').value;var vv=+document.getElementById('salVat').value||0;var vatAmt=vt==='percent'?base*vv/100:vv;var at=document.getElementById('salAitType').value;var av=+document.getElementById('salAit').value||0;var aitAmt=at==='percent'?base*av/100:av;var total=base+vatAmt+aitAmt;
 var cust=customers.find(function(x){return x._key===cid});var spId=document.getElementById('salSP').value;var sp=spList.find(function(x){return x._key===spId});
 var bankName=document.getElementById('salBank').value||'';var chequeNo=document.getElementById('salCheque')?document.getElementById('salCheque').value:'';
-var data={invoiceNo:document.getElementById('salNo').value,date:document.getElementById('salDate').value,customerId:cid,customerName:cust?cust.name:'',salespersonId:spId,salespersonName:sp?sp.name:'',createdBy:window.SESSION?.name||window.SESSION?.username||'Admin',items:items.map(function(x){return{productId:x.pk,productName:x.pn,qty:x.qty,rate:x.rate,amount:x.amt}}),discount:dv,discountType:dt,extra:extra,vat:vv,vatType:vt,ait:av,aitType:at,total:total,paid:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:document.getElementById('salNote').value};
+var truckFare=+document.getElementById('salTruckFare').value||0;var custThana=(cust&&cust.thana)||'';var fareExceeded=false;var fareMaxForThana=0;var totalSaleQty=items.reduce(function(s,x){return s+x.qty},0);if(truckFare>0&&custThana){var tfMatch=_thanaFares.find(function(f){return f.thana===custThana});if(tfMatch&&tfMatch.maxFare>0){fareMaxForThana=tfMatch.maxFare;fareExceeded=truckFare>(tfMatch.maxFare*totalSaleQty)}}
+var data={invoiceNo:document.getElementById('salNo').value,date:document.getElementById('salDate').value,customerId:cid,customerName:cust?cust.name:'',salespersonId:spId,salespersonName:sp?sp.name:'',createdBy:window.SESSION?.name||window.SESSION?.username||'Admin',items:items.map(function(x){return{productId:x.pk,productName:x.pn,qty:x.qty,rate:x.rate,amount:x.amt}}),discount:dv,discountType:dt,extra:extra,vat:vv,vatType:vt,ait:av,aitType:at,vatAmount:vatAmt,aitAmount:aitAmt,total:total,paid:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:document.getElementById('salNote').value,truckFare:truckFare,customerThana:custThana,fareExceeded:fareExceeded,fareMaxForThana:fareMaxForThana};
 if(ek){
   var oldSal=sals.find(function(x){return x._key===ek});
   // Reverse old stock (add back old items)
@@ -1559,19 +1918,39 @@ if(ek){
   // Delete old auto-created receipt voucher if exists
   if(oldSal&&oldSal._autoRcvKey){try{await api('/api/delete',{key:oldSal._autoRcvKey,skipApproval:true})}catch(e){}}
   // Create new auto receipt voucher if paid > 0
-  if(paid>0&&method!=='credit'){var rcvVch={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr=await api('/api/save',{prefix:'payment:',data:rcvVch,skipApproval:true});data._autoRcvKey=rvr.key||''}
+  if(paid>0&&method!=='credit'){var rcvVch={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr=await api('/api/save',{prefix:'payment:',data:rcvVch,skipApproval:true});data._autoRcvKey=rvr.key||''}
+  // Reverse old truck fare vouchers
+  if(oldSal&&oldSal._autoTfRcvKey){try{await api('/api/delete',{key:oldSal._autoTfRcvKey,skipApproval:true})}catch(e){}}
+  if(oldSal&&oldSal._autoTfExpKey){try{await api('/api/delete',{key:oldSal._autoTfExpKey,skipApproval:true})}catch(e){}}
+  // Create new truck fare vouchers if truckFare > 0
+  if(data.truckFare>0){
+    var tfRcv2={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:data.truckFare,method:'cash',bankName:'',chequeNo:'',note:'Truck Fare: '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo,_isTruckFare:true};
+    var tfRcvR2=await api('/api/save',{prefix:'payment:',data:tfRcv2,skipApproval:true});
+    var tfExp2={expenseNo:txnNo('EXP'),date:data.date,headName:'Transportation',subHeadName:'Cement Truck Fare',amount:data.truckFare,method:'cash',bankName:'',chequeNo:'',description:'Truck Fare: '+data.invoiceNo+' ('+data.customerName+')',_autoInvoice:data.invoiceNo,_isTruckFare:true};
+    var tfExpR2=await api('/api/save',{prefix:'expense:',data:tfExp2,skipApproval:true});
+    data._autoTfRcvKey=tfRcvR2.key||'';data._autoTfExpKey=tfExpR2.key||''
+  }
   await saveByKey(ek,data,'edit','Edited sale: '+data.invoiceNo)
 }else{
   var saveRes=await saveItem('sale:',data,null,'create','Created sale: '+data.invoiceNo);
   for(var ii=0;ii<items.length;ii++){var pr=salProds.find(function(x){return x._key===items[ii].pk});if(pr){pr.stock=Math.max(0,(pr.stock||0)-items[ii].qty);await saveByKey(pr._key,cleanForSave(pr))}}
   if(paid>0&&method!=='cash'&&method!=='credit'&&bankName){var bk2=salBanks.find(function(b){return b.name===bankName});if(bk2){bk2.balance=(bk2.balance||0)+paid;await saveByKey(bk2._key,cleanForSave(bk2))}}
   // Auto-create receipt voucher if paid > 0
-  if(paid>0&&method!=='credit'){var rcvVch2={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'*Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr2=await api('/api/save',{prefix:'payment:',data:rcvVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoRcvKey=rvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
+  if(paid>0&&method!=='credit'){var rcvVch2={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:paid,method:method,bankName:bankName,chequeNo:chequeNo,note:'Auto: Sale '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo};var rvr2=await api('/api/save',{prefix:'payment:',data:rcvVch2,skipApproval:true});if(saveRes&&saveRes.key){data._autoRcvKey=rvr2.key||'';await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})}}
+  // Truck Fare: create receipt (customer receive) + expense (Transportation > Cement Truck Fare)
+  if(data.truckFare>0&&saveRes&&saveRes.key){
+    var tfRcv={type:'receipt',no:txnNo('RCV'),date:data.date,party:cust?cust.name:'',amount:data.truckFare,method:'cash',bankName:'',chequeNo:'',note:'Truck Fare: '+data.invoiceNo,status:'done',_autoInvoice:data.invoiceNo,_isTruckFare:true};
+    var tfRcvRes=await api('/api/save',{prefix:'payment:',data:tfRcv,skipApproval:true});
+    var tfExp={expenseNo:txnNo('EXP'),date:data.date,headName:'Transportation',subHeadName:'Cement Truck Fare',amount:data.truckFare,method:'cash',bankName:'',chequeNo:'',description:'Truck Fare: '+data.invoiceNo+' ('+data.customerName+')',_autoInvoice:data.invoiceNo,_isTruckFare:true};
+    var tfExpRes=await api('/api/save',{prefix:'expense:',data:tfExp,skipApproval:true});
+    data._autoTfRcvKey=tfRcvRes.key||'';data._autoTfExpKey=tfExpRes.key||'';
+    await api('/api/save',{key:saveRes.key,data:data,skipApproval:true})
+  }
 }
-invalidateCache('sale:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');
+invalidateCache('sale:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');invalidateCache('expense:');
 showToast(ek?'Sale updated successfully':'Sale created: '+data.invoiceNo,'success');
 closeModal('salModal');loadSal()}
-window.editSal=function(k){var s=sals.find(function(x){return x._key===k});if(!s)return;document.getElementById('salEK').value=k;document.getElementById('salNo').value=s.invoiceNo;document.getElementById('salDate').value=s.date;document.getElementById('salCust').value=s.customerId;document.getElementById('salSP').value=s.salespersonId||'';document.getElementById('salDisc').value=s.discount||0;document.getElementById('salDiscType').value=s.discountType||'amount';document.getElementById('salExtra').value=s.extra||0;document.getElementById('salVat').value=s.vat||0;document.getElementById('salVatType').value=s.vatType||'amount';document.getElementById('salAit').value=s.ait||0;document.getElementById('salAitType').value=s.aitType||'amount';document.getElementById('salPaid').value=s.paid||0;document.getElementById('salMethod').value=s.method||'cash';document.getElementById('salNote').value=s.note||'';document.getElementById('salTitle').textContent='Edit Sale';toggleSalBank();window._salItems=(s.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._salItems.length)window._salItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderSalItems();openModal('salModal')}
+window.editSal=function(k){var s=sals.find(function(x){return x._key===k});if(!s)return;document.getElementById('salEK').value=k;document.getElementById('salNo').value=s.invoiceNo;document.getElementById('salDate').value=s.date;document.getElementById('salCust').value=s.customerId;document.getElementById('salSP').value=s.salespersonId||'';document.getElementById('salDisc').value=s.discount||0;document.getElementById('salDiscType').value=s.discountType||'amount';document.getElementById('salExtra').value=s.extra||0;document.getElementById('salVat').value=s.vat||0;document.getElementById('salVatType').value=s.vatType||'amount';document.getElementById('salAit').value=s.ait||0;document.getElementById('salAitType').value=s.aitType||'amount';document.getElementById('salPaid').value=s.paid||0;document.getElementById('salMethod').value=s.method||'';document.getElementById('salNote').value=s.note||'';document.getElementById('salTruckFare').value=s.truckFare||0;document.getElementById('salTitle').textContent='Edit Sale';toggleSalBank();window._salItems=(s.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._salItems.length)window._salItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderSalItems();openModal('salModal')}
 window.delSal=async function(k){var s=sals.find(function(x){return x._key===k});if(!confirm('Delete sale? Stock, bank balance and auto-voucher will be reversed.'))return;
 if(s){
   // Reverse stock (add back)
@@ -1580,15 +1959,18 @@ if(s){
   if(s.paid>0&&s.method!=='cash'&&s.method!=='credit'&&s.bankName){var bk=salBanks.find(function(b){return b.name===s.bankName});if(bk){bk.balance=(bk.balance||0)-(s.paid||0);await saveByKey(bk._key,cleanForSave(bk))}}
   // Delete auto-created receipt voucher
   if(s._autoRcvKey){try{await api('/api/delete',{key:s._autoRcvKey,skipApproval:true})}catch(e){}}
+  if(s._autoTfRcvKey){try{await api('/api/delete',{key:s._autoTfRcvKey,skipApproval:true})}catch(e){}}
+  if(s._autoTfExpKey){try{await api('/api/delete',{key:s._autoTfExpKey,skipApproval:true})}catch(e){}}
 }
-await deleteItem(k,false,'Deleted sale: '+(s?s.invoiceNo:''));invalidateCache('sale:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');showToast('Sale deleted successfully','success');loadSal()}
-window.filterSal=function(q){var t=normalize(q);renderSal(sals.filter(function(s){return normalize(s.invoiceNo).includes(t)||normalize(s.customerName).includes(t)||normalize(s.date).includes(t)}))}
+await deleteItem(k,false,'Deleted sale: '+(s?s.invoiceNo:''));invalidateCache('sale:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');invalidateCache('expense:');showToast('Sale deleted successfully','success');loadSal()}
+window.filterSal=function(){var t=normalize(document.getElementById('salSearch')?document.getElementById('salSearch').value:'');var cf=document.getElementById('salCustF')?document.getElementById('salCustF').value:'';var sf=document.getElementById('salSPF')?document.getElementById('salSPF').value:'';var from=document.getElementById('salFromF')?document.getElementById('salFromF').value:'';var to=document.getElementById('salToF')?document.getElementById('salToF').value:'';var gf=document.getElementById('salGroupF')?document.getElementById('salGroupF').value:'';var bf=document.getElementById('salBrandF')?document.getElementById('salBrandF').value:'';renderSal(sals.filter(function(s){if(cf&&s.customerName!==cf)return false;if(sf&&s.salespersonName!==sf)return false;if(from&&s.date<from)return false;if(to&&s.date>to)return false;if(gf||bf){var match=(s.items||[]).some(function(it){var pr=salProds.find(function(x){return x._key===it.productId});return(!gf||pr&&pr.group===gf)&&(!bf||pr&&pr.brand===bf)});if(!match)return false}if(t&&!normalize(s.invoiceNo).includes(t)&&!normalize(s.customerName).includes(t)&&!normalize(s.date).includes(t))return false;return true}))}
 loadSal();
 </script>`}
 
 function paymentsPage(){return `
 <div class="page-header"><div><div class="page-title">Accounts & Banking</div><div class="page-sub">Receipts, Payments, Transfers & Bank Accounts</div></div></div>
 <div class="tabs"><button class="tab active" onclick="switchPayTab('receipt',this)">Receipts</button><button class="tab" onclick="switchPayTab('payment',this)">Payments</button><button class="tab" onclick="switchPayTab('transfer',this)">Transfers</button><button class="tab" onclick="switchPayTab('bank',this)">Bank Accounts</button><button class="tab" onclick="switchPayTab('bankledger',this)">Bank Ledger</button></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" id="payFilters" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div><label>Party</label><select id="payPartyF" onchange="renderPayTab()" style="font-size:12px"><option value="">All Parties</option></select></div><div><label>Method</label><select id="payMethodF" onchange="renderPayTab()" style="font-size:12px"><option value="">All Methods</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div><label>From</label><input type="date" id="payFromF" onchange="renderPayTab()"></div><div><label>To</label><input type="date" id="payToF" onchange="renderPayTab()"></div><div><label>Search</label><input id="paySearchF" placeholder="Search..." oninput="renderPayTab()" style="font-size:12px"></div></div></div></div>
 <div id="payTabContent"></div>
 <div class="modal-overlay" id="payModal"><div class="modal"><h3 id="payTitle">New</h3>
 <input type="hidden" id="payEK"><input type="hidden" id="payType">
@@ -1596,7 +1978,7 @@ function paymentsPage(){return `
 <div class="form-group"><label>Party</label><select id="payParty"><option value="">Select...</option></select></div>
 <div id="billSelection" class="hidden" style="margin-bottom:12px;max-height:200px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px"><div class="section-title">Outstanding Bills</div><div id="billList"></div></div>
 <div class="form-group"><label>Amount</label><input type="number" id="payAmt" placeholder="0"></div>
-<div class="form-row"><div><label>Method</label><select id="payMeth" onchange="toggleCheque()"><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div id="bankSelDiv"><label>Bank</label><select id="payBank"><option value="">Select...</option></select></div></div>
+<div class="form-row"><div><label>Method</label><select id="payMeth" onchange="toggleCheque()"><option value="">Select Method...</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div id="bankSelDiv"><label>Bank</label><select id="payBank"><option value="">Select...</option></select></div></div>
 <div class="form-group hidden" id="chequeDiv"><label>Cheque No</label><input id="payCheque" placeholder="Cheque#"></div>
 <div class="form-group"><label>Note</label><input id="payNote" placeholder="Note"></div>
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal('payModal')">Cancel</button><button class="btn btn-primary" onclick="savePay()">Save</button></div>
@@ -1609,7 +1991,10 @@ function paymentsPage(){return `
 </div></div>
 <script>
 var pays=[],payParties=[],banks=[],payTab='receipt',paySales=[],payPurchases=[];
-async function loadPay(){var d=await Promise.all([loadList('payment:'),loadList('party:'),loadList('bank:'),loadList('sale:'),loadList('purchase:'),loadList('expense:')]);pays=d[0];payParties=d[1];banks=d[2];paySales=d[3];payPurchases=d[4];window._blExpenses=d[5]||[];renderPayTab()}
+async function loadPay(){var d=await Promise.all([loadList('payment:'),loadList('party:'),loadList('bank:'),loadList('sale:'),loadList('purchase:'),loadList('expense:')]);pays=d[0];payParties=d[1];banks=d[2];paySales=d[3];payPurchases=d[4];window._blExpenses=d[5]||[];
+var partyNames={};pays.forEach(function(p){if(p.party)partyNames[p.party]=1});
+document.getElementById('payPartyF').innerHTML='<option value="">All Parties</option>'+Object.keys(partyNames).sort().map(function(n){return'<option value="'+n+'">'+n+'</option>'}).join('');
+renderPayTab()}
 window.switchPayTab=function(t,el){payTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderPayTab()}
 function renderPayTab(){var c=document.getElementById('payTabContent');
 if(payTab==='bankledger'){
@@ -1618,15 +2003,20 @@ if(payTab==='bankledger'){
   return}
 if(payTab==='bank'){c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openBankModal()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Bank</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Bank</th><th>Account No</th><th class="r">Balance</th><th class="r">Act</th></tr></thead><tbody>'+(!banks.length?'<tr><td colspan="4" class="empty">No banks</td></tr>':banks.map(function(b){return'<tr><td class="bold">'+b.name+'</td><td>'+(b.accountNo||'')+'</td><td class="r bold">'+fmt(b.balance||b.openingBalance||0)+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editBank(\\x27'+b._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delBank(\\x27'+b._key+'\\x27)">Del</button></td></tr>'}).join(''))+'</tbody></table></div></div>';return}
 if(payTab==='transfer'){var trs=pays.filter(function(p){return p.type==='transfer'});c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openTransfer()"><span class="material-symbols-outlined" style="font-size:16px">swap_horiz</span> New Transfer</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>No</th><th>From</th><th>To</th><th class="r">Amount</th><th class="r">Act</th></tr></thead><tbody>'+(trs.length?trs.sort(function(a,b){return(b.date||'').localeCompare(a.date)}).map(function(t){return'<tr><td>'+t.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27transfer\\x27,\\x27'+t._key+'\\x27)">'+t.no+'</span></td><td>'+t.fromAcc+'</td><td>'+t.toAcc+'</td><td class="r bold">'+fmt(t.amount)+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editTransfer(\\x27'+t._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delTransfer(\\x27'+t._key+'\\x27)">Del</button></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">No transfers</td></tr>')+'</tbody></table></div></div>';return}
-var fl=pays.filter(function(p){return p.type===payTab&&p.status==='done'}).sort(function(a,b){return(b.date||'').localeCompare(a.date)});
+var pf2=document.getElementById('payPartyF')?document.getElementById('payPartyF').value:'';
+var mf2=document.getElementById('payMethodF')?document.getElementById('payMethodF').value:'';
+var fromF2=document.getElementById('payFromF')?document.getElementById('payFromF').value:'';
+var toF2=document.getElementById('payToF')?document.getElementById('payToF').value:'';
+var sq2=normalize(document.getElementById('paySearchF')?document.getElementById('paySearchF').value:'');
+var fl=pays.filter(function(p){return p.type===payTab&&p.status==='done'&&(!pf2||p.party===pf2)&&(!mf2||p.method===mf2)&&(!fromF2||p.date>=fromF2)&&(!toF2||p.date<=toF2)&&(!sq2||normalize(p.no||'').includes(sq2)||normalize(p.party||'').includes(sq2)||normalize(p.note||'').includes(sq2))}).sort(function(a,b){return(b.date||'').localeCompare(a.date)});
 // Mark auto-created vouchers visually
 c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openPayModal(\\x27'+payTab+'\\x27)"><span class="material-symbols-outlined" style="font-size:16px">add</span> New '+(payTab==='receipt'?'Receipt':'Payment')+'</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="payTbl"><thead><tr><th>Date</th><th>No</th><th>Party</th><th>Method</th><th class="r">Amount</th><th>Note</th><th class="r">Act</th></tr></thead><tbody>'+(fl.length?fl.map(function(p){return'<tr><td>'+p.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27'+p.type+'\\x27,\\x27'+p._key+'\\x27)">'+p.no+'</span></td><td>'+p.party+'</td><td>'+methodBadge(p.method)+'</td><td class="r bold">'+fmt(p.amount)+'</td><td class="text-muted">'+(p.note||'')+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editPay(\\x27'+p._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delPay(\\x27'+p._key+'\\x27)">Del</button></td></tr>'}).join(''):'<tr><td colspan="7" class="empty">None</td></tr>')+'</tbody></table></div></div>'}
-window.openPayModal=function(type){document.getElementById('payEK').value='';document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='New '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=txnNo(type==='receipt'?'RCV':'PAY');document.getElementById('payDt').value=todayISO();document.getElementById('payAmt').value='';document.getElementById('payNote').value='';document.getElementById('payMeth').value='cash';document.getElementById('payCheque').value='';document.getElementById('chequeDiv').classList.add('hidden');
+window.openPayModal=function(type){document.getElementById('payEK').value='';document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='New '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=txnNo(type==='receipt'?'RCV':'PAY');document.getElementById('payDt').value=todayISO();document.getElementById('payAmt').value='';document.getElementById('payNote').value='';document.getElementById('payMeth').value='';document.getElementById('payCheque').value='';document.getElementById('chequeDiv').classList.add('hidden');
 var pts=type==='receipt'?payParties.filter(function(p){return p.type==='customer'}):payParties.filter(function(p){return p.type==='supplier'});document.getElementById('payParty').innerHTML='<option value="">Select...</option>'+pts.map(function(p){return'<option value="'+p.name+'">'+p.name+'</option>'}).join('');
 document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
 document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
 document.getElementById('payParty').onchange=function(){showBills(type,this.value)}}
-window.editPay=function(k){var p=pays.find(function(x){return x._key===k});if(!p)return;var type=p.type;document.getElementById('payEK').value=k;document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='Edit '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=p.no||'';document.getElementById('payDt').value=p.date||todayISO();document.getElementById('payAmt').value=p.amount||'';document.getElementById('payNote').value=p.note||'';document.getElementById('payMeth').value=p.method||'cash';document.getElementById('payCheque').value=p.chequeNo||'';document.getElementById('chequeDiv').classList.toggle('hidden',p.method!=='cheque');var needsBank=p.method==='bank_transfer'||p.method==='cheque'||p.method==='credit_card'||p.method==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);
+window.editPay=function(k){var p=pays.find(function(x){return x._key===k});if(!p)return;var type=p.type;document.getElementById('payEK').value=k;document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='Edit '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=p.no||'';document.getElementById('payDt').value=p.date||todayISO();document.getElementById('payAmt').value=p.amount||'';document.getElementById('payNote').value=p.note||'';document.getElementById('payMeth').value=p.method||'';document.getElementById('payCheque').value=p.chequeNo||'';document.getElementById('chequeDiv').classList.toggle('hidden',p.method!=='cheque');var needsBank=p.method==='bank_transfer'||p.method==='cheque'||p.method==='credit_card'||p.method==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);
 var pts=type==='receipt'?payParties.filter(function(x){return x.type==='customer'}):payParties.filter(function(x){return x.type==='supplier'});document.getElementById('payParty').innerHTML='<option value="">Select...</option>'+pts.map(function(x){return'<option value="'+x.name+'">'+x.name+'</option>'}).join('');document.getElementById('payParty').value=p.party||'';
 document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');document.getElementById('payBank').value=p.bankName||'';
 document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
@@ -1636,15 +2026,17 @@ var bills=[];if(type==='receipt'){bills=paySales.filter(function(s){return s.cus
 if(bills.length){div.classList.remove('hidden');list.innerHTML='<table class="tbl" style="font-size:11px"><thead><tr><th>Bill#</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th>Select</th></tr></thead><tbody>'+bills.map(function(b){return'<tr><td>'+b.no+'</td><td class="r">'+fmt(b.total)+'</td><td class="r">'+fmt(b.paid)+'</td><td class="r text-danger">'+fmt(b.due)+'</td><td><input type="checkbox" data-key="'+b.key+'" data-due="'+b.due+'" onchange="calcBillAmt()"></td></tr>'}).join('')+'</tbody></table>'}else{div.classList.add('hidden')}}
 window.calcBillAmt=function(){var total=0;document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){total+=+(c.dataset.due||0)});document.getElementById('payAmt').value=total}
 window.toggleCheque=function(){var m=document.getElementById('payMeth').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);document.getElementById('chequeDiv').classList.toggle('hidden',m!=='cheque')}
-window.savePay=async function(){var ek=document.getElementById('payEK').value;var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}var amt=+document.getElementById('payAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:amt,method:document.getElementById('payMeth').value,bankName:document.getElementById('payBank').value,chequeNo:document.getElementById('payCheque').value,note:document.getElementById('payNote').value,status:'done'};
+window.savePay=async function(){var ek=document.getElementById('payEK').value;var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}var method2=document.getElementById('payMeth').value;if(!method2){showToast('Please select a payment method','warning');return;}var amt=+document.getElementById('payAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:amt,method:document.getElementById('payMeth').value,bankName:document.getElementById('payBank').value,chequeNo:document.getElementById('payCheque').value,note:document.getElementById('payNote').value,status:'done'};
 if(ek){
   // Editing: reverse old bank balance first
   var oldPay=pays.find(function(x){return x._key===ek});
   if(oldPay&&oldPay.method!=='cash'&&oldPay.bankName){var oldBk=banks.find(function(b){return b.name===oldPay.bankName});if(oldBk){if(oldPay.type==='receipt'){oldBk.balance=(oldBk.balance||0)-oldPay.amount}else{oldBk.balance=(oldBk.balance||0)+oldPay.amount}await saveByKey(oldBk._key,cleanForSave(oldBk))}}
+  // Reverse old bill-wise payment effects on sale.paid / purchase.paid
+  if(oldPay&&oldPay.billKeys&&oldPay.billKeys.length){var revRem=oldPay.amount||0;for(var ri=0;ri<oldPay.billKeys.length&&revRem>0;ri++){var rkey=oldPay.billKeys[ri];if(oldPay.type==='receipt'){var rSale=paySales.find(function(x){return x._key===rkey});if(rSale){var ra=Math.min(revRem,rSale.paid||0);rSale.paid=Math.max(0,(rSale.paid||0)-ra);revRem-=ra;await saveByKey(rkey,cleanForSave(rSale))}}else{var rPur=payPurchases.find(function(x){return x._key===rkey});if(rPur){var ra2=Math.min(revRem,rPur.paid||0);rPur.paid=Math.max(0,(rPur.paid||0)-ra2);revRem-=ra2;await saveByKey(rkey,cleanForSave(rPur))}}}}
   await saveByKey(ek,data,'edit','Edit '+(type==='receipt'?'receipt':'payment')+': '+data.no);
   // Apply new bank balance
   if(data.method!=='cash'&&data.bankName){var newBk=banks.find(function(b){return b.name===data.bankName});if(newBk){if(type==='receipt'){newBk.balance=(newBk.balance||0)+amt}else{newBk.balance=(newBk.balance||0)-amt}await saveByKey(newBk._key,cleanForSave(newBk))}}
-  invalidateCache('payment:');invalidateCache('bank:');showToast((type==='receipt'?'Receipt':'Payment')+' updated successfully','success');closeModal('payModal');loadPay();return;
+  invalidateCache('payment:');invalidateCache('bank:');invalidateCache('sale:');invalidateCache('purchase:');showToast((type==='receipt'?'Receipt':'Payment')+' updated successfully','success');closeModal('payModal');loadPay();return;
 }
 var bills=[];document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){bills.push(c.dataset.key)});data.billKeys=bills;
 await saveItem('payment:',data);
@@ -1654,9 +2046,11 @@ if(bills.length){var remaining=amt;for(var i=0;i<bills.length&&remaining>0;i++){
 invalidateCache('payment:');invalidateCache('bank:');invalidateCache('sale:');invalidateCache('purchase:');
 showToast((type==='receipt'?'Receipt':'Payment')+' saved successfully','success');
 closeModal('payModal');loadPay()}
-window.delPay=async function(k){if(!confirm('Delete? This will reverse any bank balance changes.'))return;
+window.delPay=async function(k){if(!confirm('Delete? This will reverse bank balance and bill payment changes.'))return;
 var p=pays.find(function(x){return x._key===k});if(p&&p.method!=='cash'&&p.bankName){var bkObj=banks.find(function(b){return b.name===p.bankName});if(bkObj){if(p.type==='receipt'){bkObj.balance=(bkObj.balance||0)-p.amount}else if(p.type==='payment'){bkObj.balance=(bkObj.balance||0)+p.amount}await saveByKey(bkObj._key,cleanForSave(bkObj))}}
-await deleteItem(k,false);invalidateCache('payment:');invalidateCache('bank:');showToast('Transaction deleted successfully','success');loadPay()}
+// Reverse bill-wise payment effects on sale.paid / purchase.paid
+if(p&&p.billKeys&&p.billKeys.length){var remaining=p.amount||0;for(var bi=0;bi<p.billKeys.length&&remaining>0;bi++){var bkey=p.billKeys[bi];if(p.type==='receipt'){var sale=paySales.find(function(x){return x._key===bkey});if(sale){var revAmt=Math.min(remaining,sale.paid||0);sale.paid=Math.max(0,(sale.paid||0)-revAmt);remaining-=revAmt;await saveByKey(bkey,cleanForSave(sale))}}else{var pur=payPurchases.find(function(x){return x._key===bkey});if(pur){var revAmt2=Math.min(remaining,pur.paid||0);pur.paid=Math.max(0,(pur.paid||0)-revAmt2);remaining-=revAmt2;await saveByKey(bkey,cleanForSave(pur))}}}}
+await deleteItem(k,false);invalidateCache('payment:');invalidateCache('bank:');invalidateCache('sale:');invalidateCache('purchase:');showToast('Transaction deleted successfully','success');loadPay()}
 window._openTransferModal=function(editKey){
 var accs=['Cash'].concat(banks.map(function(b){return b.name}));
 var html='<div class="modal"><h3 id="trfTitle">Fund Transfer</h3><input type="hidden" id="trfEK"><div class="form-row"><div><label>Transfer No</label><input id="trfNo" readonly></div><div><label>Date</label><input type="date" id="trfDt"></div></div><div class="form-row"><div><label>From Account</label><select id="trfFrom">'+accs.map(function(a){return'<option value="'+a+'">'+a+'</option>'}).join('')+'</select></div><div><label>To Account</label><select id="trfTo">'+accs.map(function(a){return'<option value="'+a+'">'+a+'</option>'}).join('')+'</select></div></div><div class="form-group"><label>Amount</label><input type="number" id="trfAmt" placeholder="0"></div><div class="form-group"><label>Note</label><input id="trfNote" placeholder="Transfer note"></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal(\\x27trfModal\\x27)">Cancel</button><button class="btn btn-primary" onclick="saveTransfer()">Transfer</button></div></div>';
@@ -1711,10 +2105,10 @@ window.renderBankLedger=function(){
   paySales.filter(function(s){return s.bankName===bankName&&s.method!=='cash'&&s.method!=='credit'&&(s.paid||0)>0}).forEach(function(s){entries.push({date:s.date,desc:'Sale payment - '+s.customerName,ref:s.invoiceNo||'',debit:s.paid||0,credit:0})});
   // Purchase payments from this bank
   payPurchases.filter(function(p){return p.bankName===bankName&&p.method!=='cash'&&p.method!=='credit'&&(p.paid||0)>0}).forEach(function(p){entries.push({date:p.date,desc:'Purchase payment - '+p.supplierName,ref:p.purchaseNo||'',debit:0,credit:p.paid||0})});
-  // Receipts into bank (exclude auto-created vouchers to avoid double-counting with sale payments above)
-  pays.filter(function(p){return p.type==='receipt'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice}).forEach(function(p){entries.push({date:p.date,desc:'Receipt from '+p.party,ref:p.no||'',debit:p.amount||0,credit:0})});
-  // Payments from bank (exclude auto-created vouchers to avoid double-counting with purchase payments above)
-  pays.filter(function(p){return p.type==='payment'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice}).forEach(function(p){entries.push({date:p.date,desc:'Payment to '+p.party,ref:p.no||'',debit:0,credit:p.amount||0})});
+  // Receipts into bank (exclude auto-created & bill-wise vouchers to avoid double-counting with sale payments above)
+  pays.filter(function(p){return p.type==='receipt'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)}).forEach(function(p){entries.push({date:p.date,desc:'Receipt from '+p.party,ref:p.no||'',debit:p.amount||0,credit:0})});
+  // Payments from bank (exclude auto-created & bill-wise vouchers to avoid double-counting with purchase payments above)
+  pays.filter(function(p){return p.type==='payment'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)}).forEach(function(p){entries.push({date:p.date,desc:'Payment to '+p.party,ref:p.no||'',debit:0,credit:p.amount||0})});
   // Transfers involving this bank
   pays.filter(function(p){return p.type==='transfer'&&p.status==='done'&&(p.fromAcc===bankName||p.toAcc===bankName)}).forEach(function(p){if(p.toAcc===bankName){entries.push({date:p.date,desc:'Transfer from '+p.fromAcc,ref:p.no||'',debit:p.amount||0,credit:0})}if(p.fromAcc===bankName){entries.push({date:p.date,desc:'Transfer to '+p.toAcc,ref:p.no||'',debit:0,credit:p.amount||0})}});
   // Expenses from bank
@@ -1739,7 +2133,7 @@ loadPay();
 function expensesPage(){return `
 <div class="page-header"><div><div class="page-title">Expenses</div><div class="page-sub">Track expenses by head & sub-head</div></div><button class="btn btn-primary" onclick="openExpense()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Expense</button></div>
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px"><button class="btn btn-outline btn-sm" onclick="openHeadModal()">Manage Heads</button><button class="btn btn-outline btn-sm" onclick="openSubHeadModal()">Manage Sub-Heads</button></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>Filter by Head</label><select id="expFilterHead" onchange="renderExp()"><option value="">All Heads</option></select></div><div><label>Date Range</label><div style="display:flex;gap:4px"><input type="date" id="expFrom" onchange="renderExp()"><input type="date" id="expTo" onchange="renderExp()"></div></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div><label>Head</label><select id="expFilterHead" onchange="renderExp()"><option value="">All Heads</option></select></div><div><label>Sub-Head</label><select id="expFilterSub" onchange="renderExp()"><option value="">All Sub-Heads</option></select></div><div><label>Method</label><select id="expFilterMethod" onchange="renderExp()"><option value="">All Methods</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div><label>From</label><input type="date" id="expFrom" onchange="renderExp()"></div><div><label>To</label><input type="date" id="expTo" onchange="renderExp()"></div><div><label>Search</label><input id="expSearch" placeholder="Search..." oninput="renderExp()" style="font-size:12px"></div></div></div>
 <div class="stats" id="expStats"></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="expTable"><thead><tr><th>Date</th><th>No</th><th>Head</th><th>Sub-Head</th><th>Method</th><th class="r">Amount</th><th>Description</th><th class="r">Act</th></tr></thead><tbody id="expBody"></tbody></table></div></div>
 <div class="modal-overlay" id="expModal"><div class="modal"><h3>New Expense</h3>
@@ -1768,10 +2162,11 @@ async function loadExp(){var d=await Promise.all([loadList('expense:'),loadList(
 document.getElementById('expBank').innerHTML='<option value="">Select Bank...</option>'+expBanks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
 var ho='<option value="">All Heads</option>'+expHeads.map(function(h){return'<option value="'+h.name+'">'+h.name+'</option>'}).join('');
 document.getElementById('expFilterHead').innerHTML=ho;
+document.getElementById('expFilterSub').innerHTML='<option value="">All Sub-Heads</option>'+expSubHeads.map(function(s){return'<option value="'+s.name+'">'+s.name+' ('+s.headName+')</option>'}).join('');
 document.getElementById('expHead').innerHTML='<option value="">Select...</option>'+expHeads.map(function(h){return'<option value="'+h.name+'">'+h.name+'</option>'}).join('');
 document.getElementById('shHead').innerHTML='<option value="">Select...</option>'+expHeads.map(function(h){return'<option value="'+h.name+'">'+h.name+'</option>'}).join('');
 renderExp()}
-window.renderExp=function(){var fh=document.getElementById('expFilterHead').value;var from=document.getElementById('expFrom').value;var to=document.getElementById('expTo').value;var fl=exps.filter(function(e){return(!fh||e.headName===fh)&&(!from||e.date>=from)&&(!to||e.date<=to)}).sort(function(a,b){return(b.date||'').localeCompare(a.date)});
+window.renderExp=function(){var fh=document.getElementById('expFilterHead').value;var fs=document.getElementById('expFilterSub')?document.getElementById('expFilterSub').value:'';var fm=document.getElementById('expFilterMethod')?document.getElementById('expFilterMethod').value:'';var from=document.getElementById('expFrom').value;var to=document.getElementById('expTo').value;var sq=normalize(document.getElementById('expSearch')?document.getElementById('expSearch').value:'');var fl=exps.filter(function(e){return(!fh||e.headName===fh)&&(!fs||e.subHeadName===fs)&&(!fm||e.method===fm)&&(!from||e.date>=from)&&(!to||e.date<=to)&&(!sq||normalize(e.expenseNo||'').includes(sq)||normalize(e.headName||'').includes(sq)||normalize(e.subHeadName||'').includes(sq)||normalize(e.description||'').includes(sq))}).sort(function(a,b){return(b.date||'').localeCompare(a.date)});
 var total=fl.reduce(function(s,e){return s+(e.amount||0)},0);var cashT=fl.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);var bankT=fl.filter(function(e){return e.method!=='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 document.getElementById('expStats').innerHTML='<div class="stat"><div class="label">Total Expenses</div><div class="value text-danger">'+fmt(total)+'</div></div><div class="stat"><div class="label">Cash</div><div class="value">'+fmt(cashT)+'</div></div><div class="stat"><div class="label">Bank</div><div class="value">'+fmt(bankT)+'</div></div><div class="stat"><div class="label">Count</div><div class="value">'+fl.length+'</div></div>';
 document.getElementById('expBody').innerHTML=!fl.length?'<tr><td colspan="8" class="empty">No expenses</td></tr>':fl.map(function(e){return'<tr><td>'+e.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27expense\\x27,\\x27'+e._key+'\\x27)">'+(e.expenseNo||'')+'</span></td><td><span class="badge badge-info">'+(e.headName||'')+'</span></td><td>'+(e.subHeadName||'')+'</td><td>'+methodBadge(e.method)+'</td><td class="r bold">'+fmt(e.amount)+'</td><td class="text-muted">'+(e.description||'')+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editExp(\\x27'+e._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delExp(\\x27'+e._key+'\\x27)">Del</button></td></tr>'}).join('')}
@@ -1818,7 +2213,7 @@ document.getElementById('ledPAddr').textContent=p.address||'N/A';
 var entries=[];
 var ob=p.openingBalance||0;
 if(ob!==0){entries.push({date:'--',doc:'Opening Balance',docType:'',docKey:'',type:'Opening',debit:ob>0?ob:0,credit:ob<0?Math.abs(ob):0,_isOB:true})}
-if(p.type==='customer'){ledSales.filter(function(s){return s.customerId===pk}).forEach(function(s){entries.push({date:s.date,doc:s.invoiceNo,docType:'sale',docKey:s._key,type:'Sale',debit:s.total||0,credit:s.paid||0})});ledPayments.filter(function(r){return r.party===p.name&&r.type==='receipt'&&r.status==='done'&&!r._autoInvoice&&!(r.billKeys&&r.billKeys.length)}).forEach(function(r){entries.push({date:r.date,doc:r.no,docType:'receipt',docKey:r._key,type:'Receipt',debit:0,credit:r.amount||0})})}
+if(p.type==='customer'){ledSales.filter(function(s){return s.customerId===pk}).forEach(function(s){entries.push({date:s.date,doc:s.invoiceNo,docType:'sale',docKey:s._key,type:'Sale',debit:s.total||0,credit:s.paid||0});if(s.truckFare>0){entries.push({date:s.date,doc:s.invoiceNo+' (Truck Fare IN)',docType:'sale',docKey:s._key,type:'Truck Fare IN',debit:0,credit:s.truckFare})}});ledPayments.filter(function(r){return r.party===p.name&&r.type==='receipt'&&r.status==='done'&&!r._autoInvoice&&!(r.billKeys&&r.billKeys.length)&&!r._isTruckFare}).forEach(function(r){entries.push({date:r.date,doc:r.no,docType:'receipt',docKey:r._key,type:'Receipt',debit:0,credit:r.amount||0})})}
 else{ledPurchases.filter(function(pr){return pr.supplierId===pk}).forEach(function(pr){entries.push({date:pr.date,doc:pr.purchaseNo,docType:'purchase',docKey:pr._key,type:'Purchase',debit:pr.total||0,credit:pr.paid||0})});ledPayments.filter(function(py){return py.party===p.name&&py.type==='payment'&&py.status==='done'&&!py._autoInvoice&&!(py.billKeys&&py.billKeys.length)}).forEach(function(py){entries.push({date:py.date,doc:py.no,docType:'payment',docKey:py._key,type:'Payment',debit:py.amount||0,credit:0})})}
 if(from)entries=entries.filter(function(e){return e._isOB||e.date>=from});if(to)entries=entries.filter(function(e){return e._isOB||e.date<=to});
 entries.sort(function(a,b){if(a._isOB)return -1;if(b._isOB)return 1;return(a.date||'').localeCompare(b.date)});
@@ -1827,7 +2222,7 @@ var totalDr=entries.reduce(function(s,e){return s+e.debit},0);var totalCr=entrie
 document.getElementById('ledPBalSummary').innerHTML='<div style="font-size:18px;font-weight:800;'+(bal>0?'color:var(--danger)':'color:var(--accent)')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</div><div class="text-muted" style="font-size:11px">'+(p.type==='customer'?(bal>0?'Receivable':'Advance'):(bal>0?'Overpaid':'Payable'))+'</div>';
 document.getElementById('ledStats').innerHTML='<div class="stat"><div class="label">Total Debit</div><div class="value text-danger">'+fmt(totalDr)+'</div></div><div class="stat"><div class="label">Total Credit</div><div class="value text-success">'+fmt(totalCr)+'</div></div><div class="stat"><div class="label">Balance</div><div class="value '+(bal>0?'text-danger':'text-success')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</div></div>';
 // Row color class based on type: led-sale, led-purchase, led-receipt, led-payment
-document.getElementById('ledBody').innerHTML=!entries.length?'<tr><td colspan="6" class="empty">No entries</td></tr>':entries.map(function(e){var rowClass='led-'+e.type.toLowerCase();var badgeClass=e.type==='Sale'?'badge-info':e.type==='Purchase'?'badge-warning':e.type==='Receipt'?'badge-success':e.type==='Opening'?'badge-cash':'badge-cash';return'<tr class="'+rowClass+'"><td>'+e.date+'</td><td>'+(e.docKey?'<span class="doc-link" onclick="previewDoc(\\x27'+e.docType+'\\x27,\\x27'+e.docKey+'\\x27)">'+e.doc+'</span>':e.doc)+'</td><td><span class="badge '+badgeClass+'">'+e.type+'</span></td><td class="r '+(e.debit?'text-danger':'')+'">'+fmt(e.debit)+'</td><td class="r '+(e.credit?'text-success':'')+'">'+fmt(e.credit)+'</td><td class="r bold '+(e.balance>0?'text-danger':'text-success')+'">'+fmt(Math.abs(e.balance))+' '+(e.balance>0?'Dr':'Cr')+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800;border-top:2px solid var(--border-dark)"><td colspan="3">TOTAL ('+entries.length+' entries)</td><td class="r text-danger">'+fmt(totalDr)+'</td><td class="r text-success">'+fmt(totalCr)+'</td><td class="r bold '+(bal>0?'text-danger':'text-success')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</td></tr>'}
+document.getElementById('ledBody').innerHTML=!entries.length?'<tr><td colspan="6" class="empty">No entries</td></tr>':entries.map(function(e){var rowClass='led-'+e.type.toLowerCase();var badgeClass=e.type==='Sale'?'badge-info':e.type==='Purchase'?'badge-warning':e.type==='Receipt'?'badge-success':e.type==='Truck Fare IN'?'badge-success':e.type==='Truck Fare OUT'?'badge-danger':e.type==='Opening'?'badge-cash':'badge-cash';return'<tr class="'+rowClass+'"><td>'+e.date+'</td><td>'+(e.docKey?'<span class="doc-link" onclick="previewDoc(\\x27'+e.docType+'\\x27,\\x27'+e.docKey+'\\x27)">'+e.doc+'</span>':e.doc)+'</td><td><span class="badge '+badgeClass+'">'+e.type+'</span></td><td class="r '+(e.debit?'text-danger':'')+'">'+fmt(e.debit)+'</td><td class="r '+(e.credit?'text-success':'')+'">'+fmt(e.credit)+'</td><td class="r bold '+(e.balance>0?'text-danger':'text-success')+'">'+fmt(Math.abs(e.balance))+' '+(e.balance>0?'Dr':'Cr')+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800;border-top:2px solid var(--border-dark)"><td colspan="3">TOTAL ('+entries.length+' entries)</td><td class="r text-danger">'+fmt(totalDr)+'</td><td class="r text-success">'+fmt(totalCr)+'</td><td class="r bold '+(bal>0?'text-danger':'text-success')+'">'+fmt(Math.abs(bal))+' '+(bal>0?'Dr':'Cr')+'</td></tr>'}
 loadLedger();
 </script>`}
 
@@ -1857,11 +2252,12 @@ function profitLossPage(){return `
 <div class="form-row" style="margin-bottom:14px">
 <div><label>From</label><input type="date" id="plFrom"></div>
 <div><label>To</label><input type="date" id="plTo"></div>
-<div style="display:flex;align-items:end"><button class="btn btn-primary" onclick="renderPL()" style="white-space:nowrap"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View</button></div>
+<div style="display:flex;align-items:end;gap:8px"><button class="btn btn-primary" onclick="renderPL()" style="white-space:nowrap"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View</button><label style="font-size:11px;white-space:nowrap;display:flex;align-items:center;gap:4px;margin:0"><input type="checkbox" id="plExcludeTF" onchange="renderPL()"> Exclude Truck Fare</label></div>
 </div>
 
 <div id="plPrint">
 <div class="stats" id="plStats"></div>
+<div id="plNetBadge" style="margin-bottom:14px"></div>
 <div class="card">
 <table class="tbl" id="plTbl"><tbody id="plBody"></tbody></table>
 </div>
@@ -1953,6 +2349,7 @@ window.renderPL=function(){
 
 var from=document.getElementById('plFrom').value;
 var to=document.getElementById('plTo').value;
+var excludeTF=document.getElementById('plExcludeTF').checked;
 
 var sales=window._plSales.filter(function(s){
   return(!from||s.date>=from)&&(!to||s.date<=to)
@@ -1962,10 +2359,33 @@ var expenses=window._plExpenses.filter(function(e){
   return(!from||e.date>=from)&&(!to||e.date<=to)
 });
 
-// Revenue
-var revenue=sales.reduce(function(s,x){
-  return s+(x.total||0)
+// If excluding truck fare, filter out truck fare expenses
+if(excludeTF){
+  expenses=expenses.filter(function(e){return !e._isTruckFare});
+}
+
+// Revenue = Total - VAT - AIT (VAT/AIT are liabilities, not revenue)
+var totalInvoiced=sales.reduce(function(s,x){ return s+(x.total||0) },0);
+var totalVatCollected=sales.reduce(function(s,x){
+  if(x.vatAmount) return s+x.vatAmount;
+  var vv2=+(x.vat||0);if(!vv2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.vatType==='percent'?base2*vv2/100:vv2);
 },0);
+var totalAitCollected=sales.reduce(function(s,x){
+  if(x.aitAmount) return s+x.aitAmount;
+  var av2=+(x.ait||0);if(!av2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.aitType==='percent'?base2*av2/100:av2);
+},0);
+var revenue=totalInvoiced-totalVatCollected-totalAitCollected;
+
+// Truck fare totals
+var truckFareReceived=sales.reduce(function(s,x){return s+(x.truckFare||0)},0);
 
 // ✅ FIFO COGS
 var stock = buildInventoryFIFO(window._plPurchases);
@@ -1990,17 +2410,34 @@ expenses.forEach(function(e){
 // ================= UI =================
 
 document.getElementById('plStats').innerHTML=
-'<div class="stat"><div class="label">Revenue</div><div class="value text-success">'+fmt(revenue)+'</div></div>'+
-'<div class="stat"><div class="label">COGS</div><div class="value text-warning">'+fmt(cogs)+'</div></div>'+
+'<div class="stat"><div class="label">Revenue (excl. VAT/AIT)</div><div class="value text-success">'+fmt(revenue)+'</div></div>'+
+'<div class="stat"><div class="label">COGS (FIFO)</div><div class="value text-warning">'+fmt(cogs)+'</div></div>'+
 '<div class="stat"><div class="label">Gross Profit</div><div class="value '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</div></div>'+
-'<div class="stat"><div class="label">Net Profit</div><div class="value '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(netProfit)+'</div></div>';
+'<div class="stat"><div class="label">Expenses</div><div class="value text-danger">'+fmt(totalExp)+'</div></div>'+
+(totalVatCollected>0?'<div class="stat"><div class="label">VAT Payable</div><div class="value text-info">'+fmt(totalVatCollected)+'</div></div>':'')+
+(totalAitCollected>0?'<div class="stat"><div class="label">AIT Payable</div><div class="value text-info">'+fmt(totalAitCollected)+'</div></div>':'')+
+'<div class="stat" style="border:2px solid '+(netProfit>=0?'var(--accent)':'var(--danger)')+'"><div class="label">Net '+(netProfit>=0?'Profit':'Loss')+'</div><div class="value '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(Math.abs(netProfit))+'</div></div>';
+
+// Net Profit/Loss Badge
+var badgeHtml='';
+if(netProfit>=0){
+  badgeHtml='<div style="display:inline-flex;align-items:center;gap:8px;padding:10px 20px;background:var(--accent-light);border:2px solid var(--accent);border-radius:10px;font-size:16px;font-weight:800;color:var(--accent)"><span class="material-symbols-outlined" style="font-size:22px">trending_up</span> NET PROFIT: '+fmt(netProfit)+' <span class="badge badge-success" style="font-size:12px;padding:4px 10px">PROFIT</span></div>';
+}else{
+  badgeHtml='<div style="display:inline-flex;align-items:center;gap:8px;padding:10px 20px;background:var(--danger-light);border:2px solid var(--danger);border-radius:10px;font-size:16px;font-weight:800;color:var(--danger)"><span class="material-symbols-outlined" style="font-size:22px">trending_down</span> NET LOSS: '+fmt(Math.abs(netProfit))+' <span class="badge badge-danger" style="font-size:12px;padding:4px 10px">LOSS</span></div>';
+}
+if(excludeTF){badgeHtml+=' <span class="badge badge-warning" style="margin-left:8px;font-size:11px">Truck Fare Excluded</span>';}
+document.getElementById('plNetBadge').innerHTML=badgeHtml;
 
 var rows='';
 
 // Revenue
 rows+='<tr style="background:var(--accent-light)"><td class="bold" colspan="2">Revenue</td></tr>';
-rows+='<tr><td style="padding-left:24px">Sales Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
-rows+='<tr style="background:var(--bg)"><td class="bold">Total Revenue</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+rows+='<tr><td style="padding-left:24px">Product Sales + Extra Charges</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
+if(totalVatCollected>0){rows+='<tr><td style="padding-left:24px;color:var(--info)">VAT/Tax Collected (Liability)</td><td class="r text-info">'+fmt(totalVatCollected)+'</td></tr>';}
+if(totalAitCollected>0){rows+='<tr><td style="padding-left:24px;color:var(--info)">AIT Collected (Liability)</td><td class="r text-info">'+fmt(totalAitCollected)+'</td></tr>';}
+rows+='<tr><td style="padding-left:24px;color:var(--muted);font-size:11px">Total Invoiced (incl. VAT/AIT)</td><td class="r text-muted" style="font-size:11px">'+fmt(totalInvoiced)+'</td></tr>';
+if(!excludeTF&&truckFareReceived>0){rows+='<tr><td style="padding-left:24px;color:var(--muted)">Truck Fare Received (pass-through)</td><td class="r text-muted">'+fmt(truckFareReceived)+'</td></tr>';}
+rows+='<tr style="background:var(--bg)"><td class="bold">Total Revenue (excl. VAT/AIT)</td><td class="r bold">'+fmt(revenue)+'</td></tr>';
 
 // COGS
 rows+='<tr style="background:var(--warning-light)"><td class="bold" colspan="2">Cost of Goods Sold</td></tr>';
@@ -2008,16 +2445,27 @@ rows+='<tr><td style="padding-left:24px">COGS (FIFO Based)</td><td class="r bold
 rows+='<tr style="background:var(--bg)"><td class="bold">Gross Profit</td><td class="r bold '+(grossProfit>=0?'text-success':'text-danger')+'">'+fmt(grossProfit)+'</td></tr>';
 
 // Expenses
-rows+='<tr style="background:var(--danger-light)"><td class="bold" colspan="2">Expenses</td></tr>';
+rows+='<tr style="background:var(--danger-light)"><td class="bold" colspan="2">Expenses'+(excludeTF?' <span class="badge badge-warning" style="font-size:9px">Truck Fare Excluded</span>':'')+'</td></tr>';
 
 Object.keys(expByHead).sort().forEach(function(h){
-  rows+='<tr><td style="padding-left:24px">'+h+'</td><td class="r">'+fmt(expByHead[h])+'</td></tr>';
+  var isTF=(h==='Transportation');
+  rows+='<tr><td style="padding-left:24px'+(isTF&&!excludeTF?';color:var(--info)':'')+'">'+(isTF&&!excludeTF?h+' <span style="font-size:10px;color:var(--muted)">(incl. Truck Fare)</span>':h)+'</td><td class="r">'+fmt(expByHead[h])+'</td></tr>';
 });
 
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Expenses</td><td class="r bold text-danger">'+fmt(totalExp)+'</td></tr>';
 
+// VAT/AIT Payable (Liabilities)
+if(totalVatCollected>0||totalAitCollected>0){
+rows+='<tr style="background:var(--info-light,#ecfeff)"><td class="bold" colspan="2">Tax Liabilities (Payable to Government)</td></tr>';
+if(totalVatCollected>0){rows+='<tr><td style="padding-left:24px">VAT/Tax Payable</td><td class="r bold text-info">'+fmt(totalVatCollected)+'</td></tr>';}
+if(totalAitCollected>0){rows+='<tr><td style="padding-left:24px">AIT Payable</td><td class="r bold text-info">'+fmt(totalAitCollected)+'</td></tr>';}
+rows+='<tr style="background:var(--bg)"><td class="bold">Total Tax Liabilities</td><td class="r bold text-info">'+fmt(totalVatCollected+totalAitCollected)+'</td></tr>';
+}
+
 // Net
-rows+='<tr style="background:var(--primary-light);font-size:15px"><td class="bold">NET PROFIT / (LOSS)</td><td class="r bold '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(netProfit)+'</td></tr>';
+var netLabel=netProfit>=0?'NET PROFIT':'NET LOSS';
+var netBadge=netProfit>=0?' <span class="badge badge-success" style="font-size:10px;padding:2px 8px">Profit</span>':' <span class="badge badge-danger" style="font-size:10px;padding:2px 8px">Loss</span>';
+rows+='<tr style="background:var(--primary-light);font-size:15px"><td class="bold">'+netLabel+netBadge+'</td><td class="r bold '+(netProfit>=0?'text-success':'text-danger')+'">'+fmt(Math.abs(netProfit))+'</td></tr>';
 
 document.getElementById('plBody').innerHTML=rows;
 
@@ -2036,8 +2484,8 @@ async function loadBS(){var d=await Promise.all([loadList('product:'),loadList('
 var inventory=products.reduce(function(s,p){return s+((p.stock||0)*(p.purchasePrice||0))},0);
 var receivables=0;parties.filter(function(p){return p.type==='customer'}).forEach(function(c){var cob=c.openingBalance||0;var cs=sales.filter(function(s){return s.customerId===c._key});var cr=payments.filter(function(p){return p.party===c.name&&p.type==='receipt'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=cs.reduce(function(s,x){return s+(x.total||0)},0)+(cob>0?cob:0);var tr=cs.reduce(function(s,x){return s+(x.paid||0)},0)+cr.reduce(function(s,x){return s+(x.amount||0)},0)+(cob<0?Math.abs(cob):0);receivables+=Math.max(0,td-tr)});
 var bankBal=banks.reduce(function(s,b){return s+(b.balance||b.openingBalance||0)},0);
-var nonAutoReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&!p._autoInvoice}).reduce(function(s,p){return s+(p.amount||0)},0);
-var nonAutoPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&!p._autoInvoice}).reduce(function(s,p){return s+(p.amount||0)},0);
+var nonAutoReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var nonAutoPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cashExpenses=expenses.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 var salePaidCash=sales.filter(function(s){return s.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
 var purPaidCash=purchases.filter(function(p){return p.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
@@ -2046,7 +2494,24 @@ var trfFromCashBS=payments.filter(function(p){return p.type==='transfer'&&p.from
 var cashBal=salePaidCash+nonAutoReceipts-purPaidCash-nonAutoPayouts-cashExpenses+trfToCashBS-trfFromCashBS;
 var totalAssets=inventory+receivables+bankBal+Math.max(0,cashBal);
 var payables=0;parties.filter(function(p){return p.type==='supplier'}).forEach(function(s){var sob=s.openingBalance||0;var sp=purchases.filter(function(p){return p.supplierId===s._key});var py=payments.filter(function(p){return p.party===s.name&&p.type==='payment'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=sp.reduce(function(a,x){return a+(x.total||0)},0)+(sob>0?sob:0);var tp=sp.reduce(function(a,x){return a+(x.paid||0)},0)+py.reduce(function(a,x){return a+(x.amount||0)},0)+(sob<0?Math.abs(sob):0);payables+=Math.max(0,td-tp)});
-var totalLiabilities=payables;
+// Calculate VAT/AIT Payable from all sales
+var vatPayable=sales.reduce(function(s,x){
+  if(x.vatAmount) return s+x.vatAmount;
+  var vv2=+(x.vat||0);if(!vv2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.vatType==='percent'?base2*vv2/100:vv2);
+},0);
+var aitPayable=sales.reduce(function(s,x){
+  if(x.aitAmount) return s+x.aitAmount;
+  var av2=+(x.ait||0);if(!av2)return s;
+  var sub2=(x.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);
+  var disc2=x.discountType==='percent'?sub2*+(x.discount||0)/100:+(x.discount||0);
+  var base2=sub2-disc2+(+(x.extra||0));
+  return s+(x.aitType==='percent'?base2*av2/100:av2);
+},0);
+var totalLiabilities=payables+vatPayable+aitPayable;
 var equity=totalAssets-totalLiabilities;
 var rows='<tr style="background:var(--accent-light)"><td class="bold" colspan="2">ASSETS</td></tr>';
 rows+='<tr><td style="padding-left:24px">Inventory (at cost)</td><td class="r">'+fmt(inventory)+'</td></tr>';
@@ -2056,6 +2521,8 @@ rows+='<tr><td style="padding-left:24px">Cash in Hand</td><td class="r">'+fmt(Ma
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Assets</td><td class="r bold">'+fmt(totalAssets)+'</td></tr>';
 rows+='<tr style="background:var(--danger-light)"><td class="bold" colspan="2">LIABILITIES</td></tr>';
 rows+='<tr><td style="padding-left:24px">Accounts Payable</td><td class="r">'+fmt(payables)+'</td></tr>';
+if(vatPayable>0){rows+='<tr><td style="padding-left:24px">VAT/Tax Payable</td><td class="r">'+fmt(vatPayable)+'</td></tr>';}
+if(aitPayable>0){rows+='<tr><td style="padding-left:24px">AIT Payable</td><td class="r">'+fmt(aitPayable)+'</td></tr>';}
 rows+='<tr style="background:var(--bg)"><td class="bold">Total Liabilities</td><td class="r bold">'+fmt(totalLiabilities)+'</td></tr>';
 rows+='<tr style="background:var(--primary-light)"><td class="bold" colspan="2">EQUITY</td></tr>';
 rows+='<tr><td style="padding-left:24px">Owner Equity</td><td class="r">'+fmt(equity)+'</td></tr>';
@@ -2065,29 +2532,338 @@ loadBS();
 </script>`}
 
 function trialBalancePage(){return `
-<div class="page-header"><div><div class="page-title">Trial Balance</div><div class="page-sub">Debit & Credit summary</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('tbPrint','Trial Balance')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('tbTbl','TrialBalance')">Export XLS</button></div></div>
-<div id="tbPrint"><div class="stats" id="tbStats"></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="tbTbl"><thead><tr><th>Account</th><th class="r">Debit</th><th class="r">Credit</th></tr></thead><tbody id="tbBody"></tbody></table></div></div></div>
+<div class="page-header"><div><div class="page-title">Trial Balance</div><div class="page-sub">Double-Entry Accounting — Debits = Credits</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('tbPrint','Trial Balance')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('tbTbl','TrialBalance')">Export XLS</button></div></div>
+<div id="tbPrint"><div class="stats" id="tbStats"></div>
+<div id="tbValidation" style="display:none;margin-bottom:14px"></div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="tbTbl"><thead><tr><th>Account</th><th>Category</th><th class="r">Debit</th><th class="r">Credit</th></tr></thead><tbody id="tbBody"></tbody></table></div></div></div>
 <script>
-async function loadTB(){var d=await Promise.all([loadList('sale:'),loadList('purchase:'),loadList('payment:'),loadList('expense:'),loadList('product:'),loadList('party:'),loadList('bank:')]);var sales=d[0],purchases=d[1],payments=d[2],expenses=d[3],products=d[4],parties=d[5],banks=d[6];
-var accounts=[];
-var totalSales=sales.reduce(function(s,x){return s+(x.total||0)},0);accounts.push({name:'Sales Revenue',debit:0,credit:totalSales});
-var cogs=0;sales.forEach(function(s){(s.items||[]).forEach(function(it){var pr=products.find(function(p){return p._key===it.productId});cogs+=(pr?pr.purchasePrice||0:0)*it.qty})});accounts.push({name:'Cost of Goods Sold',debit:cogs,credit:0});
-var totalPurchases=purchases.reduce(function(s,x){return s+(x.total||0)},0);accounts.push({name:'Purchases',debit:totalPurchases,credit:0});
-var inventory=products.reduce(function(s,p){return s+((p.stock||0)*(p.purchasePrice||0))},0);accounts.push({name:'Inventory',debit:inventory,credit:0});
-var receivables=0;parties.filter(function(p){return p.type==='customer'}).forEach(function(c){var cob=c.openingBalance||0;var cs=sales.filter(function(s){return s.customerId===c._key});var cr=payments.filter(function(p){return p.party===c.name&&p.type==='receipt'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=cs.reduce(function(s,x){return s+(x.total||0)},0)+(cob>0?cob:0);var tr=cs.reduce(function(s,x){return s+(x.paid||0)},0)+cr.reduce(function(s,x){return s+(x.amount||0)},0)+(cob<0?Math.abs(cob):0);receivables+=Math.max(0,td-tr)});accounts.push({name:'Accounts Receivable',debit:receivables,credit:0});
-var payables=0;parties.filter(function(p){return p.type==='supplier'}).forEach(function(s){var sob=s.openingBalance||0;var sp=purchases.filter(function(p){return p.supplierId===s._key});var py=payments.filter(function(p){return p.party===s.name&&p.type==='payment'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=sp.reduce(function(a,x){return a+(x.total||0)},0)+(sob>0?sob:0);var tp=sp.reduce(function(a,x){return a+(x.paid||0)},0)+py.reduce(function(a,x){return a+(x.amount||0)},0)+(sob<0?Math.abs(sob):0);payables+=Math.max(0,td-tp)});accounts.push({name:'Accounts Payable',debit:0,credit:payables});
-var totalExp=expenses.reduce(function(s,e){return s+(e.amount||0)},0);accounts.push({name:'Expenses',debit:totalExp,credit:0});
-var bankBal=banks.reduce(function(s,b){return s+(b.balance||b.openingBalance||0)},0);accounts.push({name:'Bank Accounts',debit:bankBal,credit:0});
-var totalDr=accounts.reduce(function(s,a){return s+a.debit},0);var totalCr=accounts.reduce(function(s,a){return s+a.credit},0);
-document.getElementById('tbStats').innerHTML='<div class="stat"><div class="label">Total Debit</div><div class="value text-danger">'+fmt(totalDr)+'</div></div><div class="stat"><div class="label">Total Credit</div><div class="value text-success">'+fmt(totalCr)+'</div></div><div class="stat"><div class="label">Difference</div><div class="value '+(Math.abs(totalDr-totalCr)<1?'text-success':'text-danger')+'">'+fmt(Math.abs(totalDr-totalCr))+'</div></div>';
-document.getElementById('tbBody').innerHTML=accounts.map(function(a){return'<tr><td class="bold">'+a.name+'</td><td class="r '+(a.debit?'text-danger':'')+'">'+fmt(a.debit)+'</td><td class="r '+(a.credit?'text-success':'')+'">'+fmt(a.credit)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td>TOTALS</td><td class="r text-danger">'+fmt(totalDr)+'</td><td class="r text-success">'+fmt(totalCr)+'</td></tr>'}
+async function loadTB(){
+  var d = await Promise.all([
+    loadList('sale:'), loadList('purchase:'), loadList('payment:'),
+    loadList('expense:'), loadList('product:'), loadList('party:'), loadList('bank:')
+  ]);
+  var sales = d[0] || [];
+  var purchases = d[1] || [];
+  var payments = d[2] || [];
+  var expenses = d[3] || [];
+  var products = d[4] || [];
+  var parties = d[5] || [];
+  var banks = d[6] || [];
+
+  // Safe number helper
+  var n = function(v) { return Number(v) || 0; };
+
+  // ================================================================
+  // PERIODIC ACCOUNTING METHOD (consistent throughout)
+  // Revenue recognized on sale, Purchases as expense when bought
+  // Closing inventory adjustment via closing stock
+  // ================================================================
+
+  // --- 1. INCOME (Credit: Sales Revenue) ---
+  var totalSalesRevenue = sales.reduce(function(s, x) { return s + n(x.total); }, 0);
+
+  // --- 2. PURCHASES (Debit: periodic expense account) ---
+  var totalPurchases = purchases.reduce(function(s, x) { return s + n(x.total); }, 0);
+
+  // --- 3. CLOSING INVENTORY = sum(stock * purchasePrice) ---
+  var closingInventory = products.reduce(function(s, p) {
+    var stk = Math.max(0, n(p.stock));
+    var price = n(p.purchasePrice);
+    return s + (stk * price);
+  }, 0);
+
+  // --- 4. EXPENSES by head (Debit) ---
+  var totalExpenses = 0;
+  var expByHead = {};
+  expenses.forEach(function(e) {
+    var amt = n(e.amount);
+    totalExpenses += amt;
+    var h = e.headName || 'Uncategorized';
+    expByHead[h] = (expByHead[h] || 0) + amt;
+  });
+
+  // --- 5. ACCOUNTS RECEIVABLE by unique partyId ---
+  var customers = parties.filter(function(p) { return p.type === 'customer'; });
+  var totalReceivable = 0;
+  var custAdvances = 0;
+  customers.forEach(function(c) {
+    var ob = n(c.openingBalance);
+    var cSales = sales.filter(function(s) { return s.customerId === c._key; });
+    var cReceipts = payments.filter(function(p) {
+      return p.party === c.name && p.type === 'receipt' && p.status === 'done'
+             && !p._autoInvoice && !(p.billKeys && p.billKeys.length);
+    });
+    var billed = cSales.reduce(function(s, x) { return s + n(x.total); }, 0);
+    var collected = cSales.reduce(function(s, x) { return s + n(x.paid); }, 0)
+                  + cReceipts.reduce(function(s, x) { return s + n(x.amount); }, 0);
+    // Opening balance: positive = they owe us, negative = advance received
+    var net = ob + billed - collected;
+    if (net > 0) { totalReceivable += net; }
+    else if (net < 0) { custAdvances += Math.abs(net); }
+  });
+
+  // --- 6. ACCOUNTS PAYABLE by unique partyId ---
+  var suppliers = parties.filter(function(p) { return p.type === 'supplier'; });
+  var totalPayable = 0;
+  var supAdvances = 0;
+  suppliers.forEach(function(s) {
+    var ob = n(s.openingBalance);
+    var sPur = purchases.filter(function(p) { return p.supplierId === s._key; });
+    var sPays = payments.filter(function(p) {
+      return p.party === s.name && p.type === 'payment' && p.status === 'done'
+             && !p._autoInvoice && !(p.billKeys && p.billKeys.length);
+    });
+    var owed = sPur.reduce(function(a, x) { return a + n(x.total); }, 0);
+    var paid2 = sPur.reduce(function(a, x) { return a + n(x.paid); }, 0)
+              + sPays.reduce(function(a, x) { return a + n(x.amount); }, 0);
+    // Opening balance: positive = we owe them, negative = advance paid
+    var net = ob + owed - paid2;
+    if (net > 0) { totalPayable += net; }
+    else if (net < 0) { supAdvances += Math.abs(net); }
+  });
+
+  // --- 7. CASH BALANCE = opening + receipts - payments ---
+  // Cash from sale payments at counter
+  var cashFromSales = sales.filter(function(s) { return s.method === 'cash'; })
+    .reduce(function(s, x) { return s + n(x.paid); }, 0);
+  // Cash receipts (manual, non-auto vouchers, exclude bill-wise to avoid double-count with sale.paid)
+  var cashReceipts = payments.filter(function(p) {
+    return p.type === 'receipt' && p.method === 'cash' && p.status === 'done'
+           && (!p._autoInvoice || p._isTruckFare) && !(p.billKeys && p.billKeys.length);
+  }).reduce(function(s, p) { return s + n(p.amount); }, 0);
+  // Cash for purchase payments at counter
+  var cashForPurchases = purchases.filter(function(p) { return p.method === 'cash'; })
+    .reduce(function(s, x) { return s + n(x.paid); }, 0);
+  // Cash payments out (manual, non-auto, exclude bill-wise to avoid double-count with purchase.paid)
+  var cashPaymentsOut = payments.filter(function(p) {
+    return p.type === 'payment' && p.method === 'cash' && p.status === 'done'
+           && (!p._autoInvoice || p._isTruckFare) && !(p.billKeys && p.billKeys.length);
+  }).reduce(function(s, p) { return s + n(p.amount); }, 0);
+  // Cash expenses
+  var cashExpenses = expenses.filter(function(e) { return e.method === 'cash'; })
+    .reduce(function(s, e) { return s + n(e.amount); }, 0);
+  // Transfers involving cash
+  var trfToCash = payments.filter(function(p) {
+    return p.type === 'transfer' && p.toAcc === 'Cash' && p.status === 'done';
+  }).reduce(function(s, p) { return s + n(p.amount); }, 0);
+  var trfFromCash = payments.filter(function(p) {
+    return p.type === 'transfer' && p.fromAcc === 'Cash' && p.status === 'done';
+  }).reduce(function(s, p) { return s + n(p.amount); }, 0);
+
+  var cashBalance = cashFromSales + cashReceipts - cashForPurchases - cashPaymentsOut - cashExpenses + trfToCash - trfFromCash;
+
+  // --- 8. BANK BALANCES (sum of tracked bank balances) ---
+  var bankBalance = banks.reduce(function(s, b) { return s + n(b.balance != null ? b.balance : b.openingBalance); }, 0);
+
+  // --- 9. PROFIT/LOSS (Periodic method) ---
+  // COGS = Purchases - Closing Inventory (periodic)
+  var cogs = Math.max(0, totalPurchases - closingInventory);
+  // Revenue for profit calc excludes VAT/AIT (calculated later, using pre-calc here)
+  var _tbVatP=sales.reduce(function(s,x){
+    if(x.vatAmount)return s+n(x.vatAmount);
+    var vv2=n(x.vat);if(!vv2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);return s+(x.vatType==='percent'?base2*vv2/100:vv2);
+  },0);
+  var _tbAitP=sales.reduce(function(s,x){
+    if(x.aitAmount)return s+n(x.aitAmount);
+    var av2=n(x.ait);if(!av2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);return s+(x.aitType==='percent'?base2*av2/100:av2);
+  },0);
+  var revenueExVat = totalSalesRevenue - _tbVatP - _tbAitP;
+  var grossProfit = revenueExVat - cogs;
+  var netProfit = grossProfit - totalExpenses;
+
+  // ================================================================
+  // BUILD DOUBLE-ENTRY TRIAL BALANCE
+  // Debits: Assets + Expenses | Credits: Liabilities + Equity + Income
+  // ================================================================
+  var accounts = [];
+
+  // --- ASSETS (normal debit balance) ---
+  if (cashBalance !== 0) {
+    accounts.push({name:'Cash in Hand', cat:'Asset',
+      debit: cashBalance > 0 ? cashBalance : 0,
+      credit: cashBalance < 0 ? Math.abs(cashBalance) : 0});
+  }
+  banks.forEach(function(b) {
+    var bal = n(b.balance != null ? b.balance : b.openingBalance);
+    if (bal !== 0) {
+      accounts.push({name:'Bank: ' + (b.name || 'Unknown'), cat:'Asset',
+        debit: bal > 0 ? bal : 0,
+        credit: bal < 0 ? Math.abs(bal) : 0});
+    }
+  });
+  if (totalReceivable > 0) {
+    accounts.push({name:'Accounts Receivable', cat:'Asset', debit:totalReceivable, credit:0});
+  }
+  if (closingInventory > 0) {
+    accounts.push({name:'Closing Inventory', cat:'Asset', debit:closingInventory, credit:0});
+  }
+  if (supAdvances > 0) {
+    accounts.push({name:'Supplier Advances (Prepaid)', cat:'Asset', debit:supAdvances, credit:0});
+  }
+
+  // --- LIABILITIES (normal credit balance) ---
+  if (totalPayable > 0) {
+    accounts.push({name:'Accounts Payable', cat:'Liability', debit:0, credit:totalPayable});
+  }
+  if (custAdvances > 0) {
+    accounts.push({name:'Customer Advances (Unearned)', cat:'Liability', debit:0, credit:custAdvances});
+  }
+  // VAT/AIT Payable (collected from customers, owed to Government)
+  var tbVatPayable=sales.reduce(function(s,x){
+    if(x.vatAmount) return s+n(x.vatAmount);
+    var vv2=n(x.vat);if(!vv2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);
+    return s+(x.vatType==='percent'?base2*vv2/100:vv2);
+  },0);
+  var tbAitPayable=sales.reduce(function(s,x){
+    if(x.aitAmount) return s+n(x.aitAmount);
+    var av2=n(x.ait);if(!av2)return s;
+    var sub2=(x.items||[]).reduce(function(a,i){return a+n(i.amount)},0);
+    var disc2=x.discountType==='percent'?sub2*n(x.discount)/100:n(x.discount);
+    var base2=sub2-disc2+n(x.extra);
+    return s+(x.aitType==='percent'?base2*av2/100:av2);
+  },0);
+  if (tbVatPayable > 0) {
+    accounts.push({name:'VAT/Tax Payable', cat:'Liability', debit:0, credit:tbVatPayable});
+  }
+  if (tbAitPayable > 0) {
+    accounts.push({name:'AIT Payable', cat:'Liability', debit:0, credit:tbAitPayable});
+  }
+
+  // --- INCOME (Credit) - Revenue excludes VAT/AIT ---
+  var salesRevenueExVat = totalSalesRevenue - tbVatPayable - tbAitPayable;
+  if (salesRevenueExVat > 0) {
+    accounts.push({name:'Sales Revenue (excl. VAT/AIT)', cat:'Income', debit:0, credit:salesRevenueExVat});
+  }
+  // Closing inventory is also a credit adjustment in periodic method
+  // (reduces COGS: Dr Closing Inventory, Cr Trading A/c)
+  if (closingInventory > 0) {
+    accounts.push({name:'Closing Stock (Trading Cr)', cat:'Income', debit:0, credit:closingInventory});
+  }
+
+  // --- EXPENSES (Debit) ---
+  if (totalPurchases > 0) {
+    accounts.push({name:'Purchases', cat:'Expense', debit:totalPurchases, credit:0});
+  }
+  var sortedHeads = Object.keys(expByHead).sort();
+  sortedHeads.forEach(function(h) {
+    if (expByHead[h] > 0) {
+      accounts.push({name:'Expense: ' + h, cat:'Expense', debit:expByHead[h], credit:0});
+    }
+  });
+
+  // --- EQUITY: Net Profit/Loss and Opening Balance Equity ---
+  // Compute opening balance equity = sum of all party opening balances net effect
+  var obEquity = 0;
+  parties.forEach(function(p) {
+    var ob = n(p.openingBalance);
+    if (p.type === 'customer') { obEquity += ob; } // positive OB = asset (receivable)
+    else if (p.type === 'supplier') { obEquity -= ob; } // positive OB = liability (payable)
+  });
+  // Bank opening balances
+  var bankOBTotal = banks.reduce(function(s, b) { return s + n(b.openingBalance); }, 0);
+  // Opening equity = bank OBs + customer OBs - supplier OBs  
+  var openingEquity = bankOBTotal + obEquity;
+  if (openingEquity !== 0) {
+    accounts.push({name:'Opening Balance Equity', cat:'Equity',
+      debit: openingEquity < 0 ? Math.abs(openingEquity) : 0,
+      credit: openingEquity > 0 ? openingEquity : 0});
+  }
+
+  // Net profit goes to credit (equity increase), net loss to debit
+  if (netProfit !== 0) {
+    if (netProfit > 0) {
+      accounts.push({name:'Net Profit (Retained Earnings)', cat:'Equity', debit:0, credit:netProfit});
+    } else {
+      accounts.push({name:'Net Loss', cat:'Equity', debit:Math.abs(netProfit), credit:0});
+    }
+  }
+
+  // ================================================================
+  // COMPUTE & VALIDATE TOTALS
+  // ================================================================
+  var totalDr = 0, totalCr = 0;
+  accounts.forEach(function(a) { totalDr += n(a.debit); totalCr += n(a.credit); });
+
+  // Round to 2 decimal places to avoid floating point issues
+  totalDr = Math.round(totalDr * 100) / 100;
+  totalCr = Math.round(totalCr * 100) / 100;
+  var diff = Math.round((totalDr - totalCr) * 100) / 100;
+
+  // Internal validation: if balance is not zero, add suspense account
+  // and display a warning (as required: throw error conceptually)
+  var isBalanced = Math.abs(diff) < 0.01;
+  if (!isBalanced) {
+    // Add Suspense/Adjustment to force balance (transparent to user)
+    if (diff > 0) {
+      accounts.push({name:'Suspense / Rounding Adjustment', cat:'Equity', debit:0, credit:diff});
+      totalCr += diff;
+    } else {
+      accounts.push({name:'Suspense / Rounding Adjustment', cat:'Equity', debit:Math.abs(diff), credit:0});
+      totalDr += Math.abs(diff);
+    }
+    console.error('[Trial Balance] VALIDATION ERROR: Debit-Credit difference of ' + diff + ' detected. Suspense account added.');
+  }
+
+  var finalDiff = Math.round((totalDr - totalCr) * 100) / 100;
+
+  // ================================================================
+  // RENDER STATS
+  // ================================================================
+  document.getElementById('tbStats').innerHTML =
+    '<div class="stat"><div class="label">Total Debit</div><div class="value text-danger">' + fmt(totalDr) + '</div></div>' +
+    '<div class="stat"><div class="label">Total Credit</div><div class="value text-success">' + fmt(totalCr) + '</div></div>' +
+    '<div class="stat" style="border:2px solid ' + (isBalanced ? 'var(--accent)' : 'var(--danger)') + '"><div class="label">Balance</div><div class="value ' + (isBalanced ? 'text-success' : 'text-danger') + '">' + (isBalanced ? 'BALANCED' : 'DIFF: ' + fmt(diff)) + '</div></div>' +
+    '<div class="stat"><div class="label">Gross Profit</div><div class="value ' + (grossProfit >= 0 ? 'text-success' : 'text-danger') + '">' + fmt(grossProfit) + '</div></div>' +
+    '<div class="stat"><div class="label">Net Profit</div><div class="value ' + (netProfit >= 0 ? 'text-success' : 'text-danger') + '">' + fmt(netProfit) + '</div></div>' +
+    '<div class="stat"><div class="label">Cash Balance</div><div class="value">' + fmt(cashBalance) + '</div></div>' +
+    '<div class="stat"><div class="label">Bank Balance</div><div class="value">' + fmt(bankBalance) + '</div></div>';
+
+  // Validation message
+  var valEl = document.getElementById('tbValidation');
+  valEl.style.display = 'block';
+  if (!isBalanced) {
+    valEl.innerHTML = '<div style="padding:12px 16px;background:var(--warning-light,#fff7ed);border:1px solid var(--warning,#f59e0b);border-radius:8px;font-size:12px"><b>Warning:</b> Debit-Credit difference of <b>' + fmt(Math.abs(diff)) + '</b> detected. A Suspense account has been added to balance. This indicates a data inconsistency that should be investigated.</div>';
+  } else {
+    valEl.innerHTML = '<div style="padding:12px 16px;background:var(--accent-light,#ecfdf5);border:1px solid var(--accent,#10b981);border-radius:8px;font-size:12px"><b>Verified:</b> Total Debits = Total Credits. Trial Balance is balanced. Method: Periodic Accounting.</div>';
+  }
+
+  // ================================================================
+  // RENDER TABLE
+  // ================================================================
+  var catOrder = {Asset:1, Liability:2, Income:3, Expense:4, Equity:5};
+  accounts.sort(function(a, b) { return (catOrder[a.cat]||9) - (catOrder[b.cat]||9); });
+
+  var catColors = {Asset:'var(--primary,#4f46e5)', Liability:'var(--danger,#dc2626)', Income:'var(--accent,#10b981)', Expense:'var(--warning,#f59e0b)', Equity:'var(--info,#0891b2)'};
+  var prevCat = '';
+  var rows = '';
+  accounts.forEach(function(a) {
+    if (a.cat !== prevCat) {
+      var catLabel = a.cat === 'Income' ? 'Income' : a.cat + 's';
+      rows += '<tr style="background:var(--bg,#f9fafb)"><td colspan="4" style="font-weight:800;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:' + (catColors[a.cat]||'var(--text)') + ';padding:10px 12px">' + catLabel + '</td></tr>';
+      prevCat = a.cat;
+    }
+    rows += '<tr><td class="bold" style="padding-left:24px">' + a.name + '</td><td><span class="badge" style="background:' + (catColors[a.cat]||'var(--bg)') + '20;color:' + (catColors[a.cat]||'var(--text)') + ';font-size:9px">' + a.cat + '</span></td><td class="r ' + (a.debit ? 'text-danger' : '') + '">' + (a.debit ? fmt(a.debit) : '-') + '</td><td class="r ' + (a.credit ? 'text-success' : '') + '">' + (a.credit ? fmt(a.credit) : '-') + '</td></tr>';
+  });
+  rows += '<tr style="background:var(--bg,#f9fafb);font-weight:800;border-top:3px solid var(--border-dark,#374151)"><td colspan="2">TOTALS</td><td class="r text-danger">' + fmt(totalDr) + '</td><td class="r text-success">' + fmt(totalCr) + '</td></tr>';
+
+  document.getElementById('tbBody').innerHTML = rows;
+}
 loadTB();
 </script>`}
 
 function stockPage(){return `
 <div class="page-header"><div><div class="page-title">Stock & Valuation</div><div class="page-sub">Stock levels, value & alerts</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('stPrint','Stock')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('stTbl','Stock')">Export XLS</button></div></div>
 <div class="tabs"><button class="tab active" onclick="switchStTab('all',this)">All Stock</button><button class="tab" onclick="switchStTab('available',this)">Available</button><button class="tab" onclick="switchStTab('low',this)">Low Stock</button><button class="tab" onclick="switchStTab('out',this)">Out of Stock</button></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>Group</label><select id="stGroupFilter" onchange="renderSt()"><option value="">All Groups</option></select></div><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="stSearch" placeholder="Search product..." oninput="renderSt()"></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div><label>Group</label><select id="stGroupFilter" onchange="renderSt()"><option value="">All Groups</option></select></div><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input id="stSearch" placeholder="Search product..." oninput="renderSt()"></div></div></div>
 <div class="stats" id="stStats"></div>
 <div id="stPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="stTbl"><thead><tr><th>Product</th><th>Group</th><th>SKU</th><th class="r">Stock</th><th class="r">Buy Price</th><th class="r">Sell Price</th><th class="r">Cost Value</th><th class="r">Sale Value</th><th>Status</th></tr></thead><tbody id="stBody"></tbody></table></div></div></div>
 <script>
@@ -2103,9 +2879,9 @@ loadSt();
 </script>`}
 
 function receivablePayablePage(){return `
-<div class="page-header"><div><div class="page-title">Receivable / Payable</div><div class="page-sub">Outstanding balances with DSO & filters</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('rpPrint','Receivable-Payable')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rpTbl','RecPayable')">Export XLS</button></div></div>
-<div class="tabs"><button class="tab active" onclick="switchRP('receivable',this)">Receivables</button><button class="tab" onclick="switchRP('payable',this)">Payables</button></div>
-<div class="card" style="margin-bottom:14px;padding:14px 16px">
+<div class="page-header"><div><div class="page-title">Receivable / Payable</div><div class="page-sub">Outstanding balances, VAT/AIT Ledgers & DSO</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('rpPrint','Receivable-Payable')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rpTbl','RecPayable')">Export XLS</button></div></div>
+<div class="tabs"><button class="tab active" onclick="switchRP('receivable',this)">Receivables</button><button class="tab" onclick="switchRP('payable',this)">Payables</button><button class="tab" onclick="switchRP('vatledger',this)">VAT Ledger</button><button class="tab" onclick="switchRP('aitledger',this)">AIT Ledger</button></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card" style="margin-bottom:14px;padding:14px 16px">
 <div class="rp-filter-grid" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;align-items:end"><style>@media(max-width:768px){.rp-filter-grid{grid-template-columns:1fr 1fr !important}}</style>
 <div><label>Search Party</label><input id="rpSearch" placeholder="Search name/phone..." oninput="renderRP()"></div>
 <div><label>Salesperson</label><select id="rpSP" onchange="renderRP()"><option value="">All Salespersons</option></select></div>
@@ -2121,15 +2897,33 @@ function receivablePayablePage(){return `
 <button class="btn btn-outline btn-xs" onclick="setRPDateRange('all')">All Time</button>
 <div><label style="margin:0;display:inline"><input type="checkbox" id="rpOnlyOutstanding" onchange="renderRP()" checked> Only Outstanding</label></div>
 </div>
-</div>
+</div></div>
 <div class="stats" id="rpStats"></div>
+<div id="rpMainSection">
 <div id="rpPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rpTbl"><thead><tr><th>Party</th><th>Phone</th><th>Salesperson</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Outstanding</th><th class="r">Credit Limit</th><th class="r">DSO</th></tr></thead><tbody id="rpBody"></tbody></table></div></div></div>
+</div>
+<div id="rpVatSection" style="display:none">
+<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="rpVatFrom" onchange="renderVatInRP()"></div><div><label>To</label><input type="date" id="rpVatTo" onchange="renderVatInRP()"></div></div>
+<div class="stats" id="rpVatStats"></div>
+<div id="rpVatPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rpVatTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">VAT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="rpVatBody"></tbody></table></div></div></div>
+</div>
+<div id="rpAitSection" style="display:none">
+<div class="form-row" style="margin-bottom:14px"><div><label>From</label><input type="date" id="rpAitFrom" onchange="renderAitInRP()"></div><div><label>To</label><input type="date" id="rpAitTo" onchange="renderAitInRP()"></div></div>
+<div class="stats" id="rpAitStats"></div>
+<div id="rpAitPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rpAitTbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Sale Total</th><th class="r">AIT Collected</th><th class="r">Running Balance</th></tr></thead><tbody id="rpAitBody"></tbody></table></div></div></div>
+</div>
 <script>
 var rpParties=[],rpSales=[],rpPurchases=[],rpPayments=[],rpTab='receivable',rpSPList=[];
 async function loadRP(){var d=await Promise.all([loadList('party:'),loadList('sale:'),loadList('purchase:'),loadList('payment:'),loadList('salesperson:')]);rpParties=d[0];rpSales=d[1];rpPurchases=d[2];rpPayments=d[3];rpSPList=d[4]||[];
 document.getElementById('rpSP').innerHTML='<option value="">All Salespersons</option>'+rpSPList.map(function(s){return'<option value="'+s.name+'">'+s.name+'</option>'}).join('');
 renderRP()}
-window.switchRP=function(t,el){rpTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderRP()}
+window.switchRP=function(t,el){rpTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');
+var mainSec=document.getElementById('rpMainSection');var filterArea=mainSec.previousElementSibling;var filterToggle=filterArea?filterArea.previousElementSibling:null;
+var vatSec=document.getElementById('rpVatSection');var aitSec=document.getElementById('rpAitSection');var rpStats=document.getElementById('rpStats');
+if(t==='vatledger'){mainSec.style.display='none';vatSec.style.display='';aitSec.style.display='none';if(rpStats)rpStats.style.display='none';document.querySelector('.filter-toggle').style.display='none';document.querySelector('.filter-body').style.display='none';renderVatInRP();return}
+if(t==='aitledger'){mainSec.style.display='none';vatSec.style.display='none';aitSec.style.display='';if(rpStats)rpStats.style.display='none';document.querySelector('.filter-toggle').style.display='none';document.querySelector('.filter-body').style.display='none';renderAitInRP();return}
+mainSec.style.display='';vatSec.style.display='none';aitSec.style.display='none';if(rpStats)rpStats.style.display='';document.querySelector('.filter-toggle').style.display='';document.querySelector('.filter-body').style.display='';
+renderRP()}
 window.setRPDateRange=function(range){var today=new Date();var from='',to=todayISO();
 if(range==='today'){from=to}
 else if(range==='week'){var d=new Date(today);d.setDate(d.getDate()-d.getDay());from=d.toISOString().slice(0,10)}
@@ -2158,6 +2952,32 @@ if((total>0||ob!==0)&&(!onlyOut||out>0)){rows.push({name:p.name,phone:p.phone||'
 rows.sort(function(a,b){return b.out-a.out});
 document.getElementById('rpStats').innerHTML='<div class="stat"><div class="label">Total '+(isRec?'Receivable':'Payable')+'</div><div class="value '+(isRec?'text-info':'text-danger')+'">'+fmt(grandOut)+'</div></div><div class="stat"><div class="label">Parties</div><div class="value">'+rows.length+'</div></div><div class="stat"><div class="label">Total Billed</div><div class="value">'+fmt(grandTotal)+'</div></div><div class="stat"><div class="label">Total Collected</div><div class="value text-success">'+fmt(grandPaid)+'</div></div>';
 document.getElementById('rpBody').innerHTML=!rows.length?'<tr><td colspan="8" class="empty">No outstanding</td></tr>':rows.map(function(r){return'<tr><td class="bold">'+r.name+'</td><td class="text-muted">'+r.phone+'</td><td>'+(r.sp!=='-'?'<span class="badge badge-info">'+r.sp+'</span>':'-')+'</td><td class="r">'+fmt(r.total)+'</td><td class="r text-success">'+fmt(r.paid)+'</td><td class="r bold '+(r.out>0?'text-danger':'')+'">'+fmt(r.out)+'</td><td class="r">'+(r.cl?fmt(r.cl):'--')+'</td><td class="r text-muted">'+r.dso+' days</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="3">TOTAL</td><td class="r">'+fmt(grandTotal)+'</td><td class="r">'+fmt(grandPaid)+'</td><td class="r">'+fmt(grandOut)+'</td><td></td><td></td></tr>'}
+// === VAT LEDGER IN R/P ===
+window.renderVatInRP=function(){var from=document.getElementById('rpVatFrom').value;var to=document.getElementById('rpVatTo').value;
+var sales=rpSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
+sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
+var rows=[];var total=0;var bal=0;
+sales.forEach(function(s){
+  var vatAmt=0;
+  if(s.vatAmount){vatAmt=s.vatAmount}
+  else{var vv=+(s.vat||0);if(vv){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));vatAmt=s.vatType==='percent'?base*vv/100:vv}}
+  if(vatAmt>0){total+=vatAmt;bal+=vatAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,vatAmt:vatAmt,bal:bal,key:s._key})}
+});
+document.getElementById('rpVatStats').innerHTML='<div class="stat"><div class="label">Total VAT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">VAT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with VAT</div><div class="value">'+rows.length+'</div></div>';
+document.getElementById('rpVatBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No VAT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+r.key+'\\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.vatAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'};
+// === AIT LEDGER IN R/P ===
+window.renderAitInRP=function(){var from=document.getElementById('rpAitFrom').value;var to=document.getElementById('rpAitTo').value;
+var sales=rpSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)});
+sales.sort(function(a,b){return(a.date||'').localeCompare(b.date)});
+var rows=[];var total=0;var bal=0;
+sales.forEach(function(s){
+  var aitAmt=0;
+  if(s.aitAmount){aitAmt=s.aitAmount}
+  else{var av=+(s.ait||0);if(av){var sub=(s.items||[]).reduce(function(a,i){return a+(i.amount||0)},0);var disc=s.discountType==='percent'?sub*+(s.discount||0)/100:+(s.discount||0);var base=sub-disc+(+(s.extra||0));aitAmt=s.aitType==='percent'?base*av/100:av}}
+  if(aitAmt>0){total+=aitAmt;bal+=aitAmt;rows.push({date:s.date,inv:s.invoiceNo,cust:s.customerName,saleTotal:s.total,aitAmt:aitAmt,bal:bal,key:s._key})}
+});
+document.getElementById('rpAitStats').innerHTML='<div class="stat"><div class="label">Total AIT Collected</div><div class="value text-info">'+fmt(total)+'</div></div><div class="stat"><div class="label">AIT Payable Balance</div><div class="value text-danger">'+fmt(bal)+'</div></div><div class="stat"><div class="label">Invoices with AIT</div><div class="value">'+rows.length+'</div></div>';
+document.getElementById('rpAitBody').innerHTML=!rows.length?'<tr><td colspan="6" class="empty">No AIT transactions</td></tr>':rows.map(function(r){return'<tr><td>'+r.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,\\x27'+r.key+'\\x27)">'+r.inv+'</span></td><td>'+r.cust+'</td><td class="r">'+fmt(r.saleTotal)+'</td><td class="r bold text-info">'+fmt(r.aitAmt)+'</td><td class="r bold">'+fmt(r.bal)+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">'+fmt(total)+'</td><td class="r">'+fmt(bal)+'</td></tr>'};
 loadRP();
 </script>`}
 
@@ -2173,8 +2993,8 @@ async function loadDay(){var d=await Promise.all([loadList('sale:'),loadList('pu
 window.changeDay=function(dir){var d=new Date(document.getElementById('dayDate').value);d.setDate(d.getDate()+dir);document.getElementById('dayDate').value=d.toISOString().slice(0,10);renderDay()}
 window.renderDay=function(){var dt=document.getElementById('dayDate').value;var ds=daySales.filter(function(s){return s.date===dt});var dp=dayPurchases.filter(function(p){return p.date===dt});var dr=dayPayments.filter(function(p){return p.date===dt&&p.status==='done'});var de=dayExpenses.filter(function(e){return e.date===dt});
 var totalSales=ds.reduce(function(s,x){return s+(x.total||0)},0);var totalPurchases=dp.reduce(function(s,x){return s+(x.total||0)},0);var totalReceipts=dr.filter(function(r){return r.type==='receipt'}).reduce(function(s,x){return s+(x.amount||0)},0);var totalPayments=dr.filter(function(r){return r.type==='payment'}).reduce(function(s,x){return s+(x.amount||0)},0);var totalExpenses=de.reduce(function(s,x){return s+(x.amount||0)},0);
-var dayCashIn=ds.filter(function(s){return s.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&!r._autoInvoice}).reduce(function(s,x){return s+(x.amount||0)},0);
-var dayCashOut=dp.filter(function(p){return p.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&!r._autoInvoice}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method==='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayCashIn=ds.filter(function(s){var m=s.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayCashOut=dp.filter(function(p){var m=p.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method==='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 // Include transfers impact on cash
 var dayTrfToCash=dr.filter(function(r){return r.type==='transfer'&&r.toAcc==='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 var dayTrfFromCash=dr.filter(function(r){return r.type==='transfer'&&r.fromAcc==='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
@@ -2185,29 +3005,29 @@ var allSalesUpTo=daySales.filter(function(s){return s.date<=dt});
 var allPurUpTo=dayPurchases.filter(function(p){return p.date<=dt});
 var allPayUpTo=dayPayments.filter(function(p){return p.date<=dt&&p.status==='done'});
 var allExpUpTo=dayExpenses.filter(function(e){return e.date<=dt});
-var cihSalesCash=allSalesUpTo.filter(function(s){return s.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
-var cihRecCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&!p._autoInvoice}).reduce(function(s,p){return s+(p.amount||0)},0);
-var cihPurCash=allPurUpTo.filter(function(p){return p.method==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
-var cihPayCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='payment'&&!p._autoInvoice}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cihSalesCash=allSalesUpTo.filter(function(s){var m=s.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
+var cihRecCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cihPurCash=allPurUpTo.filter(function(p){var m=p.method||'cash';return m==='cash'}).reduce(function(s,x){return s+(x.paid||0)},0);
+var cihPayCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='payment'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cihExpCash=allExpUpTo.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 var cihTrfTo=allPayUpTo.filter(function(p){return p.type==='transfer'&&p.toAcc==='Cash'}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cihTrfFrom=allPayUpTo.filter(function(p){return p.type==='transfer'&&p.fromAcc==='Cash'}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cashInHand=cihSalesCash+cihRecCash-cihPurCash-cihPayCash-cihExpCash+cihTrfTo-cihTrfFrom;
 
-var dayBankIn=ds.filter(function(s){return s.method!=='cash'&&s.method!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&!r._autoInvoice}).reduce(function(s,x){return s+(x.amount||0)},0);
-var dayBankOut=dp.filter(function(p){return p.method!=='cash'&&p.method!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&!r._autoInvoice}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method!=='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayBankIn=ds.filter(function(s){var m=s.method||'cash';return m!=='cash'&&m!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayBankOut=dp.filter(function(p){var m=p.method||'cash';return m!=='cash'&&m!=='credit'}).reduce(function(s,x){return s+(x.paid||0)},0)+dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method!=='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 document.getElementById('dayStats').innerHTML='<div class="stat"><div class="label">Sales</div><div class="value text-success">'+fmt(totalSales)+'</div></div><div class="stat"><div class="label">Purchases</div><div class="value text-primary">'+fmt(totalPurchases)+'</div></div><div class="stat"><div class="label">Receipts</div><div class="value text-info">'+fmt(totalReceipts)+'</div></div><div class="stat"><div class="label">Payments Out</div><div class="value text-warning">'+fmt(totalPayments)+'</div></div><div class="stat"><div class="label">Expenses</div><div class="value text-danger">'+fmt(totalExpenses)+'</div></div><div class="stat"><div class="label">Cash In</div><div class="value text-success">'+fmt(dayCashIn)+'</div></div><div class="stat"><div class="label">Cash Out</div><div class="value text-danger">'+fmt(dayCashOut)+'</div></div><div class="stat" style="border:2px solid var(--primary)"><div class="label">Cash in Hand</div><div class="value '+(cashInHand>=0?'text-success':'text-danger')+'">'+fmt(cashInHand)+'</div></div><div class="stat"><div class="label">Bank In</div><div class="value text-success">'+fmt(dayBankIn)+'</div></div><div class="stat"><div class="label">Bank Out</div><div class="value text-danger">'+fmt(dayBankOut)+'</div></div>';
 // Separate Cash, Bank & Transfer transactions
-var cashRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&!r._autoInvoice});
-var cashPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&!r._autoInvoice});
-var bankRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&!r._autoInvoice});
-var bankPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&!r._autoInvoice});
+var cashRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
+var cashPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
+var bankRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
+var bankPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
 var transferTxn=dr.filter(function(r){return r.type==='transfer'});
-var cashSales=ds.filter(function(s){return s.method==='cash'});
-var bankSales=ds.filter(function(s){return s.method!=='cash'&&s.method!=='credit'});
+var cashSales=ds.filter(function(s){var m=s.method||'cash';return m==='cash'});
+var bankSales=ds.filter(function(s){var m=s.method||'cash';return m!=='cash'&&m!=='credit'});
 var creditSales=ds.filter(function(s){return s.method==='credit'});
-var cashPurchases=dp.filter(function(p){return p.method==='cash'});
-var bankPurchases=dp.filter(function(p){return p.method!=='cash'&&p.method!=='credit'});
+var cashPurchases=dp.filter(function(p){var m=p.method||'cash';return m==='cash'});
+var bankPurchases=dp.filter(function(p){var m=p.method||'cash';return m!=='cash'&&m!=='credit'});
 var cashExpenses=de.filter(function(e){return e.method==='cash'});
 var bankExpenses=de.filter(function(e){return e.method!=='cash'});
 
@@ -2263,20 +3083,21 @@ function reportsPage(){return `
 <option value="sp-product">SP &times; Product Breakdown</option>
 <option value="customer-outstanding">Customer Outstanding</option>
 </select></div><div><label>From</label><input type="date" id="rptFrom"></div><div><label>To</label><input type="date" id="rptTo"></div></div>
-<div class="form-row" id="rptGroupFilter" style="margin-bottom:14px;display:none"><div><label>Product Group</label><select id="rptGroup"><option value="">All Groups</option></select></div><div><label>Product</label><select id="rptProduct"><option value="">All Products</option></select></div></div>
+<div class="form-row" id="rptGroupFilter" style="margin-bottom:14px;display:none"><div><label>Product Group</label><select id="rptGroup"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="rptBrand"><option value="">All Brands</option></select></div><div><label>Product</label><select id="rptProduct"><option value="">All Products</option></select></div></div>
 <div class="no-print" style="margin-bottom:12px;display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary" onclick="loadReport()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button><button class="btn btn-outline btn-sm" onclick="printContent('rptPrint','Report')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rptTbl','Report')">Export XLS</button></div>
 <div id="rptPlaceholder" class="rpt-placeholder"><span class="material-symbols-outlined">assessment</span><p>Select report type, date range, and click <b>View Report</b></p></div>
 <div id="rptPrint" class="hidden"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="rptTbl" style="border-collapse:collapse"><thead id="rptHead"></thead><tbody id="rptBody"></tbody></table></div></div></div>
 <script>
-var rptSales=[],rptPurchases=[],rptProducts=[],rptParties=[],rptPayments=[],rptSP=[],rptGroups=[];
-async function loadRptData(){var d=await Promise.all([loadList('sale:'),loadList('purchase:'),loadList('product:'),loadList('party:'),loadList('payment:'),loadList('salesperson:'),loadList('prodgroup:')]);rptSales=d[0];rptPurchases=d[1];rptProducts=d[2];rptParties=d[3];rptPayments=d[4];rptSP=d[5];rptGroups=d[6]||[];
+var rptSales=[],rptPurchases=[],rptProducts=[],rptParties=[],rptPayments=[],rptSP=[],rptGroups=[],rptBrands=[];
+async function loadRptData(){var d=await Promise.all([loadList('sale:'),loadList('purchase:'),loadList('product:'),loadList('party:'),loadList('payment:'),loadList('salesperson:'),loadList('prodgroup:'),loadList('prodbrand:')]);rptSales=d[0];rptPurchases=d[1];rptProducts=d[2];rptParties=d[3];rptPayments=d[4];rptSP=d[5];rptGroups=d[6]||[];rptBrands=d[7]||[];
 document.getElementById('rptGroup').innerHTML='<option value="">All Groups</option>'+rptGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');
+document.getElementById('rptBrand').innerHTML='<option value="">All Brands</option>'+rptBrands.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
 document.getElementById('rptProduct').innerHTML='<option value="">All Products</option>'+rptProducts.map(function(p){return'<option value="'+p._key+'">'+p.name+'</option>'}).join('');}
 window.toggleRptFilters=function(){var type=document.getElementById('rptType').value;var showGroup=['product-sales','product-purchases','date-sales','gross-profit','customer-invoice-detail','customer-sales'].includes(type);document.getElementById('rptGroupFilter').style.display=showGroup?'grid':'none'}
 window.loadReport=function(){var type=document.getElementById('rptType').value;var from=document.getElementById('rptFrom').value;var to=document.getElementById('rptTo').value;
-var groupFilter=document.getElementById('rptGroup').value;var productFilter=document.getElementById('rptProduct').value;
-function matchesItemFilter(items){if(!groupFilter&&!productFilter)return true;return(items||[]).some(function(it){if(productFilter&&it.productId===productFilter)return true;if(groupFilter){var pr=rptProducts.find(function(p){return p._key===it.productId});if(pr&&pr.group===groupFilter)return true}return!productFilter&&!groupFilter})}
-function filterItems(items){if(!groupFilter&&!productFilter)return items;return(items||[]).filter(function(it){if(productFilter)return it.productId===productFilter;if(groupFilter){var pr=rptProducts.find(function(p){return p._key===it.productId});return pr&&pr.group===groupFilter}return true})}
+var groupFilter=document.getElementById('rptGroup').value;var brandFilter=document.getElementById('rptBrand').value;var productFilter=document.getElementById('rptProduct').value;
+function matchesItemFilter(items){if(!groupFilter&&!brandFilter&&!productFilter)return true;return(items||[]).some(function(it){if(productFilter&&it.productId===productFilter)return true;if(productFilter)return false;var pr=rptProducts.find(function(p){return p._key===it.productId});if(groupFilter&&!(pr&&pr.group===groupFilter))return false;if(brandFilter&&!(pr&&pr.brand===brandFilter))return false;return true})}
+function filterItems(items){if(!groupFilter&&!brandFilter&&!productFilter)return items;return(items||[]).filter(function(it){if(productFilter)return it.productId===productFilter;var pr=rptProducts.find(function(p){return p._key===it.productId});if(groupFilter&&!(pr&&pr.group===groupFilter))return false;if(brandFilter&&!(pr&&pr.brand===brandFilter))return false;return true})}
 var sales=rptSales.filter(function(s){return(!from||s.date>=from)&&(!to||s.date<=to)&&matchesItemFilter(s.items)});
 var purchases=rptPurchases.filter(function(p){return(!from||p.date>=from)&&(!to||p.date<=to)&&matchesItemFilter(p.items)});
 var head='',body='';
@@ -2430,13 +3251,53 @@ loadSP();
 function ordersPage(){return `
 <div class="page-header"><div><div class="page-title">Orders</div><div class="page-sub">SP portal orders - approve, deny, convert</div></div></div>
 <div class="tabs"><button class="tab active" onclick="switchOrdTab('pending',this)">Pending</button><button class="tab" onclick="switchOrdTab('approved',this)">Approved</button><button class="tab" onclick="switchOrdTab('denied',this)">Denied</button><button class="tab" onclick="switchOrdTab('converted',this)">Converted</button><button class="tab" onclick="switchOrdTab('all',this)">All</button></div>
-<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th>SP</th><th class="r">Total</th><th>Status</th><th class="r">Act</th></tr></thead><tbody id="ordBody"></tbody></table></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px;flex-wrap:wrap"><div><label>Group</label><select id="ordGroupF" onchange="renderOrd()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="ordBrandF" onchange="renderOrd()" style="font-size:12px"><option value="">All Brands</option></select></div><div><label>Product</label><select id="ordProdF" onchange="renderOrd()" style="font-size:12px"><option value="">All Products</option></select></div><div><label>Salesperson</label><select id="ordSPF" onchange="renderOrd()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>Customer</label><select id="ordCustF" onchange="renderOrd()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>Search</label><input id="ordSearch" placeholder="Search..." oninput="renderOrd()" style="font-size:12px"></div></div></div></div>
+<div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th>SP</th><th>Product Name</th><th class="r">Quantity</th><th class="r">Total</th><th>Status</th><th class="r">Act</th></tr></thead><tbody id="ordBody"></tbody></table></div></div>
+<div class="modal-overlay" id="ordDetailModal"><div class="modal" style="max-width:650px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0" id="ordDetailTitle">Order Details</h3><div style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('ordDetailPrint','Order Details')">Print</button><button class="btn btn-outline btn-sm" onclick="closeModal('ordDetailModal')">Close</button></div></div>
+<div id="ordDetailPrint">
+<div id="ordDetailContent"></div>
+</div>
+<div id="ordDetailActions" style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"></div>
+</div></div>
 <script>
-var ords=[],ordTab='pending';
-async function loadOrd(){ords=await loadList('order:');renderOrd()}
+var ords=[],ordTab='pending',ordProds=[],ordGroups=[],ordBrands=[];
+async function loadOrd(){var d=await Promise.all([loadList('order:'),loadList('product:'),loadList('prodgroup:'),loadList('prodbrand:')]);ords=d[0];ordProds=d[1];ordGroups=d[2]||[];ordBrands=d[3]||[];
+document.getElementById('ordGroupF').innerHTML='<option value="">All Groups</option>'+ordGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');
+document.getElementById('ordBrandF').innerHTML='<option value="">All Brands</option>'+ordBrands.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
+document.getElementById('ordProdF').innerHTML='<option value="">All Products</option>'+ordProds.map(function(p){return'<option value="'+p._key+'">'+p.name+'</option>'}).join('');
+var spNames={};var custNames={};ords.forEach(function(o){if(o.spName)spNames[o.spName]=1;if(o.customerName)custNames[o.customerName]=1});
+document.getElementById('ordSPF').innerHTML='<option value="">All SP</option>'+Object.keys(spNames).sort().map(function(n){return'<option value="'+n+'">'+n+'</option>'}).join('');
+document.getElementById('ordCustF').innerHTML='<option value="">All Customers</option>'+Object.keys(custNames).sort().map(function(n){return'<option value="'+n+'">'+n+'</option>'}).join('');
+renderOrd()}
 window.switchOrdTab=function(t,el){ordTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderOrd()}
-function renderOrd(){var fl=ordTab==='all'?ords:ords.filter(function(o){return o.status===ordTab});fl.sort(function(a,b){return(b.date||'').localeCompare(a.date)});
-document.getElementById('ordBody').innerHTML=!fl.length?'<tr><td colspan="7" class="empty">No orders</td></tr>':fl.map(function(o){var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';var acts='';if(o.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="approveOrd(\\x27'+o._key+'\\x27)">Approve</button> <button class="btn btn-danger btn-xs" onclick="denyOrd(\\x27'+o._key+'\\x27)">Deny</button>'}if(o.status==='approved'){acts='<button class="btn btn-primary btn-xs" onclick="convertOrd(\\x27'+o._key+'\\x27)">Convert to Invoice</button>'}return'<tr><td>'+o.date+'</td><td class="bold">'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="text-muted">'+(o.spName||'')+'</td><td class="r bold">'+fmt(o.total)+'</td><td><span class="badge '+statusBadge+'">'+o.status+'</span></td><td class="r">'+acts+'</td></tr>'}).join('')}
+window.viewOrd=function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;
+var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';
+var html='<div style="display:flex;justify-content:space-between;margin-bottom:14px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Order Number</div><div style="font-size:16px;font-weight:800">'+o.orderNo+'</div></div><div style="text-align:right"><span class="badge '+statusBadge+'" style="font-size:11px;padding:4px 10px">'+o.status+'</span></div></div>';
+html+='<div class="form-row" style="margin-bottom:12px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Date</div><div style="font-weight:600">'+o.date+'</div></div><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Customer</div><div style="font-weight:600">'+o.customerName+'</div></div></div>';
+html+='<div class="form-row" style="margin-bottom:14px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Salesperson</div><div style="font-weight:600">'+(o.spName||'-')+'</div></div>'+(o.convertedInvoice?'<div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Converted Invoice</div><div style="font-weight:600;color:var(--primary)"><span class="doc-link" onclick="previewDoc(\\x27sale\\x27,findSaleKeyByInvoice(\\x27'+o.convertedInvoice+'\\x27));event.stopPropagation()" style="cursor:pointer;text-decoration:underline">'+o.convertedInvoice+'</span></div></div>':'')+'</div>';
+html+='<div style="font-size:12px;font-weight:700;margin-bottom:6px;text-transform:uppercase;color:var(--muted)">Items</div>';
+html+='<table class="tbl" style="font-size:12px"><thead><tr style="background:var(--bg)"><th>#</th><th>Product</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amount</th></tr></thead><tbody>';
+(o.items||[]).forEach(function(it,i){html+='<tr><td>'+(i+1)+'</td><td class="bold">'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r bold">'+fmt(it.amount||it.qty*it.rate)+'</td></tr>'});
+html+='<tr style="background:var(--bg);font-weight:800"><td colspan="4" class="r">Total</td><td class="r" style="font-size:14px">'+fmt(o.total)+'</td></tr></tbody></table>';
+document.getElementById('ordDetailContent').innerHTML=html;
+var acts='';if(o.status==='pending'){acts='<button class="btn btn-success" onclick="approveOrd(\\x27'+o._key+'\\x27);closeModal(\\x27ordDetailModal\\x27)">Approve</button> <button class="btn btn-danger" onclick="denyOrd(\\x27'+o._key+'\\x27);closeModal(\\x27ordDetailModal\\x27)">Deny</button>'}
+if(o.status==='approved'){acts='<button class="btn btn-primary" onclick="convertOrd(\\x27'+o._key+'\\x27);closeModal(\\x27ordDetailModal\\x27)">Convert to Invoice</button>'}
+document.getElementById('ordDetailActions').innerHTML=acts;
+openModal('ordDetailModal')}
+function renderOrd(){var fl=ordTab==='all'?ords:ords.filter(function(o){return o.status===ordTab});
+var gf=document.getElementById('ordGroupF')?document.getElementById('ordGroupF').value:'';
+var bf=document.getElementById('ordBrandF')?document.getElementById('ordBrandF').value:'';
+var pf=document.getElementById('ordProdF')?document.getElementById('ordProdF').value:'';
+var sf=document.getElementById('ordSPF')?document.getElementById('ordSPF').value:'';
+var cf=document.getElementById('ordCustF')?document.getElementById('ordCustF').value:'';
+var sq=(document.getElementById('ordSearch')?document.getElementById('ordSearch').value:'').trim().toLowerCase();
+if(gf||bf||pf)fl=fl.filter(function(o){return(o.items||[]).some(function(it){var pr=ordProds.find(function(p){return p._key===it.productKey||p._key===it.productId});if(pf&&(it.productKey===pf||it.productId===pf))return true;if(pf)return false;var gMatch=!gf||(pr&&pr.group===gf);var bMatch=!bf||(pr&&pr.brand===bf);return gMatch&&bMatch})});
+if(sf)fl=fl.filter(function(o){return o.spName===sf});
+if(cf)fl=fl.filter(function(o){return o.customerName===cf});
+if(sq)fl=fl.filter(function(o){return(o.orderNo||'').toLowerCase().includes(sq)||(o.customerName||'').toLowerCase().includes(sq)||(o.spName||'').toLowerCase().includes(sq)||(o.items||[]).some(function(it){return(it.productName||'').toLowerCase().includes(sq)})});
+fl.sort(function(a,b){return(b.date||'').localeCompare(a.date)});
+document.getElementById('ordBody').innerHTML=!fl.length?'<tr><td colspan="9" class="empty">No orders</td></tr>':fl.map(function(o){var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';var acts='';if(o.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="event.stopPropagation();approveOrd(\\x27'+o._key+'\\x27)">Approve</button> <button class="btn btn-danger btn-xs" onclick="event.stopPropagation();denyOrd(\\x27'+o._key+'\\x27)">Deny</button>'}if(o.status==='approved'){acts='<button class="btn btn-primary btn-xs" onclick="event.stopPropagation();convertOrd(\\x27'+o._key+'\\x27)">Convert to Invoice</button>'}var prodNames=(o.items||[]).map(function(it){return it.productName}).join(', ');var totalQty=(o.items||[]).reduce(function(s,it){return s+(it.qty||0)},0);return'<tr style="cursor:pointer" onclick="viewOrd(\\x27'+o._key+'\\x27)"><td>'+o.date+'</td><td class="bold" style="color:var(--primary)">'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="text-muted">'+(o.spName||'')+'</td><td class="text-muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+prodNames+'">'+prodNames+'</td><td class="r bold">'+totalQty+'</td><td class="r bold">'+fmt(o.total)+'</td><td><span class="badge '+statusBadge+'">'+o.status+'</span></td><td class="r">'+acts+'</td></tr>'}).join('')}
 window.approveOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='approved';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order approved','success');loadOrd()}
 window.denyOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='denied';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order denied','info');loadOrd()}
 window.convertOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;if(!confirm('Convert to sales invoice? Stock will be deducted.'))return;
@@ -2450,6 +3311,7 @@ var saleData={invoiceNo:txnNo('INV'),date:todayISO(),customerId:o.customerId||''
 await saveItem('sale:',saleData);
 for(var ii2=0;ii2<items.length;ii2++){var pr2=prods.find(function(x){return x._key===items[ii2].productId});if(pr2){pr2.stock=Math.max(0,(pr2.stock||0)-items[ii2].qty);var c=Object.assign({},pr2);delete c._key;await saveByKey(pr2._key,c)}}
 o.status='converted';o.convertedInvoice=saleData.invoiceNo;await saveByKey(k,cleanForSave(o));invalidateCache('order:');invalidateCache('sale:');invalidateCache('product:');showToast('Invoice created: '+saleData.invoiceNo+'. Stock deducted.','success');loadOrd()}
+window.findSaleKeyByInvoice=function(inv){return inv};
 loadOrd();
 </script>`}
 
@@ -2491,11 +3353,9 @@ function adminPage(){return `
 <div class="card"><div class="section-title">License Info</div><div id="licInfo">Loading...</div></div>
 <div class="card"><div class="section-title">Export All Data</div><p class="text-muted" style="margin-bottom:8px;font-size:11px">Download complete backup as JSON</p><button class="btn btn-primary" onclick="exportAll()">Export</button></div>
 <div class="card"><div class="section-title">Import Data</div><p class="text-muted" style="margin-bottom:8px;font-size:11px">Restore from JSON backup</p><input type="file" id="importFile" accept=".json" style="margin-bottom:8px"><button class="btn btn-warning" onclick="importAll()">Import</button></div>
-<div class="card" id="kvBrowserCard" style="display:none"><div class="section-title">KV Browser</div>
-<div style="display:flex;gap:4px;margin-bottom:8px"><input id="kvPrefix" placeholder="Prefix (e.g. product:)"><button class="btn btn-outline btn-sm" onclick="browseKV()">Browse</button></div><div id="kvResults" style="max-height:300px;overflow:auto;font-size:11px"></div></div>
-<div class="card" id="purgeDataCard" style="display:none"><div class="section-title">Purge Data</div><p class="text-muted" style="margin-bottom:8px;font-size:11px">Delete all data of a type</p>
-<select id="purgeType" style="margin-bottom:8px"><option value="product:">Products</option><option value="party:">Parties</option><option value="purchase:">Purchases</option><option value="sale:">Sales</option><option value="payment:">Payments</option><option value="expense:">Expenses</option><option value="order:">Orders</option></select><button class="btn btn-danger" onclick="purgeData()">Purge</button></div>
-<div class="card"><div class="section-title">Developer Tools</div><p class="text-muted" style="margin-bottom:8px;font-size:11px">Toggle visibility of KV Browser and Purge Data tools</p><div style="display:flex;gap:8px;align-items:center"><label style="display:inline;margin:0"><input type="checkbox" id="devToolsToggle" onchange="toggleDevTools()"> Show KV Browser & Purge Data</label></div></div>
+
+
+
 </div>
 <script>
 (async function(){try{var li=await(await fetch('/api/license-info')).json();document.getElementById('licInfo').innerHTML='<div><b>Expiry:</b> '+li.expiry+'</div><div><b>Days Left:</b> '+li.days+'</div><div><b>Status:</b> <span class="badge '+(li.status==='Active'?'badge-success':'badge-danger')+'">'+li.status+'</span></div>'}catch(e){document.getElementById('licInfo').textContent='Error loading'}})();
@@ -2506,14 +3366,12 @@ window.browseKV=async function(){var prefix=document.getElementById('kvPrefix').
 window.viewKV=async function(k){try{var d=await api('/api/kv-get',{key:k});alert(JSON.stringify(d.value?JSON.parse(d.value):null,null,2))}catch(e){alert(e.message)}}
 window.deleteKV=async function(k){if(!confirm('Delete '+k+'?'))return;try{await api('/api/kv-delete',{key:k});browseKV()}catch(e){alert(e.message)}}
 window.purgeData=async function(){var prefix=document.getElementById('purgeType').value;if(!confirm('Delete ALL '+prefix+' data? This cannot be undone!'))return;try{var keys=await api('/api/kv-keys',{prefix:prefix});for(var i=0;i<keys.length;i++){await api('/api/kv-delete',{key:keys[i]})}alert('Purged '+keys.length+' records')}catch(e){alert(e.message)}}
-window.toggleDevTools=async function(){var on=document.getElementById('devToolsToggle').checked;document.getElementById('kvBrowserCard').style.display=on?'block':'none';document.getElementById('purgeDataCard').style.display=on?'block':'none';try{await api('/api/save',{key:'ADMIN_DEV_TOOLS',data:{enabled:on},skipApproval:true})}catch(e){}}
-// Check KV for dev tools setting
-(async function(){try{var d=await api('/api/get',{key:'ADMIN_DEV_TOOLS'});if(d&&d.enabled){document.getElementById('devToolsToggle').checked=true;document.getElementById('kvBrowserCard').style.display='block';document.getElementById('purgeDataCard').style.display='block'}}catch(e){}})();
+
 </script>`}
 
 function modLogPage(){return `
 <div class="page-header"><div><div class="page-title">Modification Log</div><div class="page-sub">All edit, delete & create operations</div></div><div class="no-print" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('mlPrint','Modification Log')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('mlTbl','ModLog')">Export XLS</button></div></div>
-<div class="form-row" style="margin-bottom:14px"><div><label>Action</label><select id="mlAction" onchange="renderML()"><option value="">All Actions</option><option value="create">Create</option><option value="edit">Edit</option><option value="delete">Delete</option></select></div><div><label>Search</label><input id="mlSearch" placeholder="Search detail..." oninput="renderML()"></div><div><label>From</label><input type="date" id="mlFrom" onchange="renderML()"></div><div><label>To</label><input type="date" id="mlTo" onchange="renderML()"></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div><label>Action</label><select id="mlAction" onchange="renderML()"><option value="">All Actions</option><option value="create">Create</option><option value="edit">Edit</option><option value="delete">Delete</option></select></div><div><label>Search</label><input id="mlSearch" placeholder="Search detail..." oninput="renderML()"></div><div><label>From</label><input type="date" id="mlFrom" onchange="renderML()"></div><div><label>To</label><input type="date" id="mlTo" onchange="renderML()"></div></div></div>
 <div id="mlPrint"><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="mlTbl"><thead><tr><th>Timestamp</th><th>User</th><th>Action</th><th>Detail</th><th>Key</th></tr></thead><tbody id="mlBody"></tbody></table></div></div></div>
 <script>
 var mlLogs=[];

@@ -9,5 +9,13 @@
       "binding": "DATA_STORE",
       "id": "placeholder-production-id"
     }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bizmanager-db",
+      "database_id": "placeholder-d1-database-id",
+      "migrations_dir": "d1"
+    }
   ]
 }
