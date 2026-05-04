@@ -90,11 +90,12 @@ const FIELD_MAP: Record<string, Record<string, string>> = {
     bankName: 'bank_name', chequeNo: 'cheque_no', fromAcc: 'from_acc', toAcc: 'to_acc',
     autoInvoice: 'auto_invoice', isTruckFare: 'is_truck_fare',
     billKeys: 'bill_keys', extraData: 'extra_data',
-    _autoInvoice: 'auto_invoice',
+    _autoInvoice: 'auto_invoice', _isTruckFare: 'is_truck_fare',
   },
   expenses: {
     expenseNo: 'expense_no', headName: 'head_name', subHeadName: 'sub_head_name',
-    bankName: 'bank_name', isTruckFare: 'is_truck_fare', extraData: 'extra_data',
+    bankName: 'bank_name', isTruckFare: 'is_truck_fare',
+    _isTruckFare: 'is_truck_fare', extraData: 'extra_data',
   },
   orders: {
     orderNo: 'order_no', customerId: 'customer_id', customerName: 'customer_name',
@@ -315,14 +316,27 @@ function rowToKvFormat(table: string, row: Record<string, unknown>, prefix: stri
   return result;
 }
 
-/** Convert item rows to KV-compatible format */
-function itemRowsToKvFormat(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+/** Build a reverse map for item tables: snake_case D1 column → camelCase KV field */
+function buildItemReverseMap(itemTable: string): Record<string, string> {
+  const fm = ITEM_FIELD_MAP[itemTable] || {};
+  const rev: Record<string, string> = {};
+  for (const [camel, snake] of Object.entries(fm)) {
+    rev[snake] = camel;
+  }
+  return rev;
+}
+
+/** Convert item rows to KV-compatible format (with proper camelCase field names) */
+function itemRowsToKvFormat(rows: Record<string, unknown>[], itemTable?: string): Record<string, unknown>[] {
+  const reverseMap = itemTable ? buildItemReverseMap(itemTable) : {};
   return rows.map(row => {
     const result: Record<string, unknown> = {};
     for (const [col, val] of Object.entries(row)) {
       if (col === 'id' || col === 'extra_data') continue;
       if (col === 'sale_id' || col === 'purchase_id' || col === 'order_id') continue;
-      result[col] = val;
+      // Reverse-map snake_case column back to camelCase field name
+      const fieldName = reverseMap[col] || col;
+      result[fieldName] = val;
     }
     // Merge extra_data fields
     if (row['extra_data'] && typeof row['extra_data'] === 'string' && row['extra_data'] !== '{}') {
@@ -373,7 +387,7 @@ export async function dbList(db: D1Database, prefix: string): Promise<Record<str
       const id = key.replace(prefix, '');
       const childRows = itemsByParent[id] || [];
       if (childRows.length > 0) {
-        (item as any).items = itemRowsToKvFormat(childRows);
+        (item as any).items = itemRowsToKvFormat(childRows, itemTable);
       }
     }
   }
@@ -408,7 +422,7 @@ export async function dbGet(db: D1Database, key: string): Promise<Record<string,
     const itemStmt = db.prepare(`SELECT * FROM ${itemTable} WHERE ${fkCol} = ?`).bind(id);
     const { results: itemResults } = await itemStmt.all<Record<string, unknown>>();
     if (itemResults.length > 0) {
-      (result as any).items = itemRowsToKvFormat(itemResults);
+      (result as any).items = itemRowsToKvFormat(itemResults, itemTable);
     }
   }
 
