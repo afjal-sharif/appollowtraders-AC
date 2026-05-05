@@ -135,6 +135,10 @@ CREATE TABLE IF NOT EXISTS sales (
   note TEXT DEFAULT '',
   customer_thana TEXT DEFAULT '',
   created_by TEXT DEFAULT '',
+  cash_amount REAL DEFAULT 0,
+  bank_amount REAL DEFAULT 0,
+  bank_method TEXT DEFAULT '',
+  cheque_no TEXT DEFAULT '',
   extra_data TEXT DEFAULT '{}',
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
@@ -181,6 +185,10 @@ CREATE TABLE IF NOT EXISTS purchases (
   total REAL DEFAULT 0,
   paid REAL DEFAULT 0,
   note TEXT DEFAULT '',
+  cash_amount REAL DEFAULT 0,
+  bank_amount REAL DEFAULT 0,
+  bank_method TEXT DEFAULT '',
+  cheque_no TEXT DEFAULT '',
   extra_data TEXT DEFAULT '{}',
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
