@@ -159,6 +159,17 @@ const ITEM_FIELD_MAP: Record<string, Record<string, string>> = {
 
 // --------------- Column Schema (for insert/update) ---------------
 
+// Tables that do NOT have an updated_at column
+const TABLES_WITHOUT_UPDATED_AT = new Set([
+  'exp_heads', 'exp_subheads', 'mod_logs', 'approvals', 'credit_limits', 'cb',
+  'sale_items', 'purchase_items', 'order_items',
+]);
+
+// Table-specific ORDER BY column (defaults to created_at)
+const TABLE_ORDER_COLUMN: Record<string, string> = {
+  mod_logs: 'timestamp',
+};
+
 // Returns the known columns for a table (excluding auto-generated ones)
 function getTableColumns(table: string): string[] {
   const schemas: Record<string, string[]> = {
@@ -360,7 +371,8 @@ export async function dbList(db: D1Database, prefix: string): Promise<Record<str
   const table = PREFIX_TABLE_MAP[prefix];
   if (!table) return [];
 
-  const stmt = db.prepare(`SELECT * FROM ${table} ORDER BY created_at DESC`);
+  const orderCol = TABLE_ORDER_COLUMN[table] || 'created_at';
+  const stmt = db.prepare(`SELECT * FROM ${table} ORDER BY ${orderCol} DESC`);
   const { results } = await stmt.all<Record<string, unknown>>();
 
   const items = results.map(row => rowToKvFormat(table, row, prefix));
@@ -459,9 +471,17 @@ export async function dbSave(
   const now = new Date().toISOString();
   const cols = kvDataToColumns(table, data);
   cols['id'] = id;
-  cols['updated_at'] = now;
+  // Only set updated_at for tables that have this column
+  if (!TABLES_WITHOUT_UPDATED_AT.has(table)) {
+    cols['updated_at'] = now;
+  }
   if (!existingKey) {
-    cols['created_at'] = now;
+    // Set created_at only for tables that have it (mod_logs uses timestamp instead)
+    if (table === 'mod_logs') {
+      if (!cols['timestamp']) cols['timestamp'] = now;
+    } else {
+      cols['created_at'] = now;
+    }
   }
 
   // Build UPSERT statement
@@ -658,7 +678,8 @@ export async function dbListKeys(db: D1Database, prefix: string, limit = 100): P
   const table = PREFIX_TABLE_MAP[prefix];
   if (!table) return [];
 
-  const { results } = await db.prepare(`SELECT id FROM ${table} ORDER BY created_at DESC LIMIT ?`).bind(limit).all<{ id: string }>();
+  const orderCol = TABLE_ORDER_COLUMN[table] || 'created_at';
+  const { results } = await db.prepare(`SELECT id FROM ${table} ORDER BY ${orderCol} DESC LIMIT ?`).bind(limit).all<{ id: string }>();
   return results.map(r => prefix + r.id);
 }
 
