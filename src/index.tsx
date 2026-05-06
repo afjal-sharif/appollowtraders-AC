@@ -1,7 +1,6 @@
 import { Hono } from 'hono'
 import { dbList, dbGet, dbSave, dbDelete, dbWriteLog, dbCreateApproval, dbProcessApproval, dbExportAll, dbImportAll, dbListKeys, PREFIX_TABLE_MAP } from './db'
 import { cachedDbList, cacheInvalidate, cacheInvalidateAll, getRelatedPrefixes, kvGetLicense, kvSetLicense, kvGetPin, kvSetPin, kvGetCompanySettings, kvSetCompanySettings } from './kv-cache'
-import { LocalD1, LocalKV } from './local-dev-mock'
 
 // ============================================================
 // BizManager v3.0 — Apollow Traders — Cloudflare Worker + Hono
@@ -11,26 +10,6 @@ import { LocalD1, LocalKV } from './local-dev-mock'
 
 type Bindings = { DATA_STORE: KVNamespace; DB: D1Database }
 const app = new Hono<{ Bindings: Bindings }>()
-
-// Local Dev Mock Initialization
-const isLocal = true; // Force local dev in AI Studio
-let mockDB: any = null;
-let mockKV: any = null;
-
-if (isLocal) {
-  mockDB = new LocalD1('local.db', 'd1/schema.sql');
-  mockKV = new LocalKV();
-}
-
-app.use('*', async (c, next) => {
-  if (!c.env || !c.env.DB) {
-    (c.env as any) = {
-      DB: mockDB,
-      DATA_STORE: mockKV
-    };
-  }
-  await next();
-});
 
 let CURRENT_PIN = "1234";
 const MASTER_KEY = "4321";
@@ -440,7 +419,7 @@ window.tfSelectThana=function(th,ds,dv){th=th.replace(/\\s*\\(.*\\)/,'');documen
 document.addEventListener('click',function(e){if(!e.target.closest('.sr-wrap'))document.querySelectorAll('.sr-list').forEach(function(x){x.classList.remove('active')})})
 window.editTF=function(k){var t=_tfList.find(function(x){return x._key===k});if(!t)return;document.getElementById('tfTitle').textContent='Edit Thana Fare';document.getElementById('tfEK').value=k;document.getElementById('tfTh').value=t.thana||'';document.getElementById('tfDs').value=t.district||'';document.getElementById('tfDv').value=t.division||'';document.getElementById('tfMax').value=t.maxFare||'';openModal('tfModal')}
 window.saveTF=async function(){var ek=document.getElementById('tfEK').value;var th=document.getElementById('tfTh').value.trim();var ds=document.getElementById('tfDs').value.trim();var dv=document.getElementById('tfDv').value.trim();var mx=+document.getElementById('tfMax').value||0;
-if(!th){showToast('Please select a thana','warning');return}if(mx<0){showToast('Please enter a valid max fare','warning');return}
+if(!th){showToast('Please select a thana','warning');return}if(mx<=0){showToast('Please enter a valid max fare','warning');return}
 var dup=_tfList.find(function(x){return x.thana===th&&(!ek||x._key!==ek)});if(dup){showToast('Thana "'+th+'" already has a fare configured','warning');return}
 var data={thana:th,district:ds,division:dv,maxFare:mx};
 try{if(ek){await saveByKey(ek,data,'edit','Updated thana fare: '+th)}else{await saveItem('thanafare:',data,null,'create','Added thana fare: '+th)}invalidateCache('thanafare:');closeModal('tfModal');loadTF();showToast(ek?'Thana fare updated':'Thana fare added','success')}catch(e){showToast('Failed: '+e.message,'error')}}
@@ -1360,7 +1339,7 @@ ${getCSS()}
 <div id="reportsSection" class="hidden">
 <div class="card" style="margin-bottom:14px">
 <h3 style="font-size:15px;margin-bottom:10px"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle;color:var(--primary)">bar_chart</span> My Sales Reports</h3>
-<div class="sp-rpt-controls"><div style="flex:1;min-width:150px"><label>Report</label><select id="spRptType"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option><option value="brand-customer">Brand-wise Customer Sales</option><option value="date-sales">Date-wise Sales</option><option value="customer-outstanding">Customer Outstanding</option></select></div><div style="min-width:120px"><label>From</label><input type="date" id="spRptFrom"></div><div style="min-width:120px"><label>To</label><input type="date" id="spRptTo"></div></div>
+<div class="sp-rpt-controls"><div style="flex:1;min-width:150px"><label>Report</label><select id="spRptType"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option><option value="date-sales">Date-wise Sales</option><option value="customer-outstanding">Customer Outstanding</option></select></div><div style="min-width:120px"><label>From</label><input type="date" id="spRptFrom"></div><div style="min-width:120px"><label>To</label><input type="date" id="spRptTo"></div></div>
 <div class="sp-rpt-actions" style="margin-top:8px"><button class="btn btn-primary" onclick="renderSPReport()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button><button class="btn btn-outline" onclick="exportXLS('spRptTbl','SP_Report')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">download</span> Export</button></div>
 </div>
 <div id="spRptPlaceholder" class="rpt-placeholder"><span class="material-symbols-outlined">assessment</span><p>Select report type and date range, then click <b>View Report</b></p></div>
@@ -1522,17 +1501,6 @@ window.renderSPReport=function(){
     rows.sort(function(a,b){return a.cust.localeCompare(b.cust)||a.prod.localeCompare(b.prod);});
     var tQ4=0,tA4=0;var idx5=1;body=rows.map(function(r){tQ4+=r.qty;tA4+=r.amt;return\'<tr><td>\'+idx5++ +\'</td><td class="bold">\'+r.cust+\'</td><td class="text-muted">\'+r.phone+\'</td><td>\'+r.prod+\'</td><td class="r">\'+r.qty+\'</td><td class="r">\'+fmt(r.rate)+\'</td><td class="r bold">\'+fmt(r.amt)+\'</td></tr>\';}).join(\'\');
     foot=\'<tr style="background:var(--bg);font-weight:800"><td colspan="4">TOTAL</td><td class="r">\'+tQ4+\'</td><td></td><td class="r">\'+fmt(tA4)+\'</td></tr>\';
-  }else if(type===\'brand-customer\'){
-    head=\'<tr><th>Brand</th><th>Customer</th><th class="r">Qty</th><th class="r">Revenue</th><th class="r">Avg Rate</th></tr>\';
-    var byBC={};filtered.forEach(function(s){(s.items||[]).forEach(function(it){var pr=spP.find(function(p){return p._key===(it.productKey||it.productId)});var br=pr?pr.brand||\'No Brand\':\'No Brand\';var k=br+\'||\'+s.customerName;if(!byBC[k])byBC[k]={brand:br,cust:s.customerName,qty:0,rev:0};byBC[k].qty+=it.qty;byBC[k].rev+=it.amount||it.qty*it.rate;});});
-    var bGroups={};Object.values(byBC).forEach(function(r){if(!bGroups[r.brand])bGroups[r.brand]={rows:[],tQ:0,tR:0};bGroups[r.brand].rows.push(r);bGroups[r.brand].tQ+=r.qty;bGroups[r.brand].tR+=r.rev;});
-    var gQBC=0,gRBC=0;
-    body=Object.entries(bGroups).sort(function(a,b){return b[1].tR-a[1].tR}).map(function(e){var br=e[0],bg=e[1];gQBC+=bg.tQ;gRBC+=bg.tR;
-    var h=\'<tr style="background:rgba(79,70,229,.04);font-weight:700"><td colspan="5">\'+br+\'</td></tr>\';
-    bg.rows.sort(function(a,b){return b.rev-a.rev}).forEach(function(r){h+=\'<tr><td></td><td>\'+r.cust+\'</td><td class="r">\'+r.qty+\'</td><td class="r bold">\'+fmt(r.rev)+\'</td><td class="r text-muted">\'+fmt(r.qty?r.rev/r.qty:0)+\'</td></tr>\'});
-    h+=\'<tr style="background:rgba(79,70,229,.04);font-weight:700"><td colspan="2" class="r">Total</td><td class="r">\'+bg.tQ+\'</td><td class="r">\'+fmt(bg.tR)+\'</td><td></td></tr>\';
-    return h;}).join(\'\');
-    foot=\'<tr style="background:var(--bg);font-weight:800"><td colspan="2">GRAND TOTAL</td><td class="r">\'+gQBC+\'</td><td class="r">\'+fmt(gRBC)+\'</td><td></td></tr>\';
   }
   else if(type===\'date-sales\'){
     head=\'<tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th></tr>\';
@@ -2020,7 +1988,7 @@ document.getElementById('salCashAmt').value=sCashAmt;document.getElementById('sa
 document.getElementById('salMethod').value=s.bankMethod||s.method||'bank_transfer';
 var creditChk=document.getElementById('salCreditChk');if(creditChk)creditChk.checked=(s.method==='credit');
 document.getElementById('salBankDiv').classList.toggle('hidden',sBankAmt<=0);document.getElementById('salCreditDiv').classList.toggle('hidden',sCashAmt>0||sBankAmt>0);
-toggleSalBank();if(s.bankName)document.getElementById('salBank').value=s.bankName;if(s.chequeNo&&document.getElementById('salCheque'))document.getElementById('salCheque').value=s.chequeNo;window._salItems=(s.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._salItems.length)window._salItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderSalItems();checkFareExceed();openModal('salModal')}
+toggleSalBank();if(s.bankName)document.getElementById('salBank').value=s.bankName;if(s.chequeNo&&document.getElementById('salCheque'))document.getElementById('salCheque').value=s.chequeNo;window._salItems=(s.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._salItems.length)window._salItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderSalItems();openModal('salModal')}
 window.delSal=async function(k){var s=sals.find(function(x){return x._key===k});if(!confirm('Delete sale? Stock, bank balance and auto-voucher will be reversed.'))return;
 if(s){
   // Reverse stock (add back)
@@ -2047,14 +2015,10 @@ function paymentsPage(){return `
 <div class="modal-overlay" id="payModal"><div class="modal"><h3 id="payTitle">New</h3>
 <input type="hidden" id="payEK"><input type="hidden" id="payType">
 <div class="form-row"><div><label>Voucher No</label><input id="payNo" readonly></div><div><label>Date</label><input type="date" id="payDt"></div></div>
-<div class="form-group"><label>Party</label><div class="sr-wrap"><input id="payPartySearch" placeholder="Type to search party..." oninput="payFilterParties()" onfocus="payShowPartyList()" autocomplete="off" style="width:100%"><input type="hidden" id="payParty"><div class="sr-list" id="payPartyList" style="max-height:200px"></div></div></div>
+<div class="form-group"><label>Party</label><select id="payParty"><option value="">Select...</option></select></div>
 <div id="billSelection" class="hidden" style="margin-bottom:12px;max-height:200px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px"><div class="section-title">Outstanding Bills</div><div id="billList"></div></div>
-<div class="form-row">
-  <div><label>Cash Amount</label><input type="number" id="payCashAmt" placeholder="0" oninput="calcPayTotal()"></div>
-  <div><label>Bank Amount</label><input type="number" id="payBankAmt" placeholder="0" oninput="calcPayTotal()"></div>
-</div>
-<div class="form-group"><label>Total Amount</label><input type="number" id="payAmt" placeholder="0" readonly style="background:var(--bg)"></div>
-<div class="form-row"><div><label>Bank Method</label><select id="payMeth" onchange="toggleCheque()"><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div id="bankSelDiv"><label>Bank</label><select id="payBank"><option value="">Select...</option></select></div></div>
+<div class="form-group"><label>Amount</label><input type="number" id="payAmt" placeholder="0"></div>
+<div class="form-row"><div><label>Method</label><select id="payMeth" onchange="toggleCheque()"><option value="">Select Method...</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div id="bankSelDiv"><label>Bank</label><select id="payBank"><option value="">Select...</option></select></div></div>
 <div class="form-group hidden" id="chequeDiv"><label>Cheque No</label><input id="payCheque" placeholder="Cheque#"></div>
 <div class="form-group"><label>Note</label><input id="payNote" placeholder="Note"></div>
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal('payModal')">Cancel</button><button class="btn btn-primary" onclick="savePay()">Save</button></div>
@@ -2087,43 +2051,38 @@ var sq2=normalize(document.getElementById('paySearchF')?document.getElementById(
 var fl=pays.filter(function(p){return p.type===payTab&&p.status==='done'&&(!pf2||p.party===pf2)&&(!mf2||p.method===mf2)&&(!fromF2||p.date>=fromF2)&&(!toF2||p.date<=toF2)&&(!sq2||normalize(p.no||'').includes(sq2)||normalize(p.party||'').includes(sq2)||normalize(p.note||'').includes(sq2))}).sort(function(a,b){return(b.date||'').localeCompare(a.date)});
 // Mark auto-created vouchers visually
 c.innerHTML='<div style="margin:12px 0"><button class="btn btn-primary" onclick="openPayModal(\\x27'+payTab+'\\x27)"><span class="material-symbols-outlined" style="font-size:16px">add</span> New '+(payTab==='receipt'?'Receipt':'Payment')+'</button></div><div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="payTbl"><thead><tr><th>Date</th><th>No</th><th>Party</th><th>Method</th><th class="r">Amount</th><th>Note</th><th class="r">Act</th></tr></thead><tbody>'+(fl.length?fl.map(function(p){return'<tr><td>'+p.date+'</td><td><span class="doc-link" onclick="previewDoc(\\x27'+p.type+'\\x27,\\x27'+p._key+'\\x27)">'+p.no+'</span></td><td>'+p.party+'</td><td>'+methodBadge(p.method)+'</td><td class="r bold">'+fmt(p.amount)+'</td><td class="text-muted">'+(p.note||'')+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editPay(\\x27'+p._key+'\\x27)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delPay(\\x27'+p._key+'\\x27)">Del</button></td></tr>'}).join(''):'<tr><td colspan="7" class="empty">None</td></tr>')+'</tbody></table></div></div>'}
-window.openPayModal=function(type){document.getElementById('payEK').value='';document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='New '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=txnNo(type==='receipt'?'RCV':'PAY');document.getElementById('payDt').value=todayISO();document.getElementById('payAmt').value='';document.getElementById('payCashAmt').value='';document.getElementById('payBankAmt').value='';document.getElementById('payNote').value='';document.getElementById('payMeth').value='bank_transfer';document.getElementById('payCheque').value='';document.getElementById('chequeDiv').classList.add('hidden');document.getElementById('bankSelDiv').classList.add('hidden');
-document.getElementById('payPartySearch').value='';document.getElementById('payParty').value='';document.getElementById('payPartyList').innerHTML='';
+window.openPayModal=function(type){document.getElementById('payEK').value='';document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='New '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=txnNo(type==='receipt'?'RCV':'PAY');document.getElementById('payDt').value=todayISO();document.getElementById('payAmt').value='';document.getElementById('payNote').value='';document.getElementById('payMeth').value='';document.getElementById('payCheque').value='';document.getElementById('chequeDiv').classList.add('hidden');document.getElementById('bankSelDiv').classList.add('hidden');
+var pts=type==='receipt'?payParties.filter(function(p){return p.type==='customer'}):payParties.filter(function(p){return p.type==='supplier'});document.getElementById('payParty').innerHTML='<option value="">Select...</option>'+pts.map(function(p){return'<option value="'+p.name+'">'+p.name+'</option>'}).join('');
 document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
-document.getElementById('billSelection').classList.add('hidden');openModal('payModal');}
-window.payFilterParties=function(){var q=document.getElementById('payPartySearch').value.toLowerCase();var type=document.getElementById('payType').value;var pts=type==='receipt'?payParties.filter(function(x){return x.type==='customer'}):payParties.filter(function(x){return x.type==='supplier'});var fl=pts.filter(function(p){return(p.name||'').toLowerCase().includes(q)||(p.phone||'').includes(q)});var el=document.getElementById('payPartyList');el.innerHTML=fl.slice(0,20).map(function(p){return'<div onclick="paySelectParty(\\x27'+p.name.replace(/'/g,'')+'\\x27)">'+p.name+'</div>'}).join('');el.classList.add('active')}
-window.payShowPartyList=function(){if(!document.getElementById('payPartyList').innerHTML)payFilterParties();document.getElementById('payPartyList').classList.add('active')}
-window.paySelectParty=function(name){document.getElementById('payPartySearch').value=name;document.getElementById('payParty').value=name;document.getElementById('payPartyList').classList.remove('active');showBills(document.getElementById('payType').value,name)}
-window.calcPayTotal=function(){var c=+document.getElementById('payCashAmt').value||0;var b=+document.getElementById('payBankAmt').value||0;document.getElementById('payAmt').value=c+b;document.getElementById('bankSelDiv').classList.toggle('hidden',b<=0)}
-window.editPay=function(k){var p=pays.find(function(x){return x._key===k});if(!p)return;var type=p.type;document.getElementById('payEK').value=k;document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='Edit '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=p.no||'';document.getElementById('payDt').value=p.date||todayISO();
-document.getElementById('payCashAmt').value=p.cashAmount||0;document.getElementById('payBankAmt').value=p.bankAmount||0;document.getElementById('payAmt').value=p.amount||0;
-document.getElementById('payNote').value=p.note||'';document.getElementById('payMeth').value=p.method||'bank_transfer';document.getElementById('payCheque').value=p.chequeNo||'';document.getElementById('chequeDiv').classList.toggle('hidden',p.method!=='cheque');
-document.getElementById('bankSelDiv').classList.toggle('hidden',!(p.bankAmount>0));
-document.getElementById('payPartySearch').value=p.party||'';document.getElementById('payParty').value=p.party||'';
+document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
+document.getElementById('payParty').onchange=function(){showBills(type,this.value)}}
+window.editPay=function(k){var p=pays.find(function(x){return x._key===k});if(!p)return;var type=p.type;document.getElementById('payEK').value=k;document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='Edit '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=p.no||'';document.getElementById('payDt').value=p.date||todayISO();document.getElementById('payAmt').value=p.amount||'';document.getElementById('payNote').value=p.note||'';document.getElementById('payMeth').value=p.method||'';document.getElementById('payCheque').value=p.chequeNo||'';document.getElementById('chequeDiv').classList.toggle('hidden',p.method!=='cheque');var needsBank=p.method==='bank_transfer'||p.method==='cheque'||p.method==='credit_card'||p.method==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);
+var pts=type==='receipt'?payParties.filter(function(x){return x.type==='customer'}):payParties.filter(function(x){return x.type==='supplier'});document.getElementById('payParty').innerHTML='<option value="">Select...</option>'+pts.map(function(x){return'<option value="'+x.name+'">'+x.name+'</option>'}).join('');document.getElementById('payParty').value=p.party||'';
 document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');document.getElementById('payBank').value=p.bankName||'';
-document.getElementById('billSelection').classList.add('hidden');openModal('payModal');}
+document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
+document.getElementById('payParty').onchange=function(){showBills(type,this.value)}}
 window.showBills=function(type,party){var div=document.getElementById('billSelection');var list=document.getElementById('billList');if(!party){div.classList.add('hidden');return}
 var bills=[];if(type==='receipt'){bills=paySales.filter(function(s){return s.customerName===party&&(s.total||0)-(s.paid||0)>0}).map(function(s){return{no:s.invoiceNo,total:s.total,paid:s.paid,due:(s.total||0)-(s.paid||0),key:s._key}})}else{bills=payPurchases.filter(function(p){return p.supplierName===party&&(p.total||0)-(p.paid||0)>0}).map(function(p){return{no:p.purchaseNo,total:p.total,paid:p.paid,due:(p.total||0)-(p.paid||0),key:p._key}})}
 if(bills.length){div.classList.remove('hidden');list.innerHTML='<table class="tbl" style="font-size:11px"><thead><tr><th>Bill#</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th>Select</th></tr></thead><tbody>'+bills.map(function(b){return'<tr><td>'+b.no+'</td><td class="r">'+fmt(b.total)+'</td><td class="r">'+fmt(b.paid)+'</td><td class="r text-danger">'+fmt(b.due)+'</td><td><input type="checkbox" data-key="'+b.key+'" data-due="'+b.due+'" onchange="calcBillAmt()"></td></tr>'}).join('')+'</tbody></table>'}else{div.classList.add('hidden')}}
-window.calcBillAmt=function(){var total=0;document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){total+=+(c.dataset.due||0)});document.getElementById('payCashAmt').value=total;document.getElementById('payBankAmt').value=0;calcPayTotal();}
+window.calcBillAmt=function(){var total=0;document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){total+=+(c.dataset.due||0)});document.getElementById('payAmt').value=total}
 window.toggleCheque=function(){var m=document.getElementById('payMeth').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);document.getElementById('chequeDiv').classList.toggle('hidden',m!=='cheque')}
-window.savePay=async function(){var ek=document.getElementById('payEK').value;var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}
-var cashAmt=+document.getElementById('payCashAmt').value||0;var bankAmt=+document.getElementById('payBankAmt').value||0;var totalAmt=cashAmt+bankAmt;if(totalAmt<=0){showToast('Please enter amount','warning');return;}
-var payMeth=document.getElementById('payMeth').value;var bankName=bankAmt>0?document.getElementById('payBank').value:'';if(bankAmt>0&&!bankName){showToast('Please select a bank','warning');return;}
-var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:totalAmt,cashAmount:cashAmt,bankAmount:bankAmt,method:payMeth,bankName:bankName,chequeNo:payMeth==='cheque'?document.getElementById('payCheque').value:'',note:document.getElementById('payNote').value,status:'done'};
+window.savePay=async function(){var ek=document.getElementById('payEK').value;var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}var method2=document.getElementById('payMeth').value;if(!method2){showToast('Please select a payment method','warning');return;}var amt=+document.getElementById('payAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var payMeth=document.getElementById('payMeth').value;var needsBankPay=payMeth==='bank_transfer'||payMeth==='cheque'||payMeth==='credit_card'||payMeth==='mobile_payment';var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:amt,method:payMeth,bankName:needsBankPay?document.getElementById('payBank').value:'',chequeNo:payMeth==='cheque'?document.getElementById('payCheque').value:'',note:document.getElementById('payNote').value,status:'done'};
 if(ek){
+  // Editing: reverse old bank balance first
   var oldPay=pays.find(function(x){return x._key===ek});
-  if(oldPay&&oldPay.bankAmount>0&&oldPay.bankName){var oldBk=banks.find(function(b){return b.name===oldPay.bankName});if(oldBk){if(oldPay.type==='receipt'){oldBk.balance=(oldBk.balance||0)-oldPay.bankAmount}else{oldBk.balance=(oldBk.balance||0)+oldPay.bankAmount}await saveByKey(oldBk._key,cleanForSave(oldBk))}}
-  else if(oldPay&&oldPay.method!=='cash'&&oldPay.bankName){var oldBk2=banks.find(function(b){return b.name===oldPay.bankName});if(oldBk2){if(oldPay.type==='receipt'){oldBk2.balance=(oldBk2.balance||0)-oldPay.amount}else{oldBk2.balance=(oldBk2.balance||0)+oldPay.amount}await saveByKey(oldBk2._key,cleanForSave(oldBk2))}}
+  if(oldPay&&oldPay.method!=='cash'&&oldPay.bankName){var oldBk=banks.find(function(b){return b.name===oldPay.bankName});if(oldBk){if(oldPay.type==='receipt'){oldBk.balance=(oldBk.balance||0)-oldPay.amount}else{oldBk.balance=(oldBk.balance||0)+oldPay.amount}await saveByKey(oldBk._key,cleanForSave(oldBk))}}
+  // Reverse old bill-wise payment effects on sale.paid / purchase.paid
   if(oldPay&&oldPay.billKeys&&oldPay.billKeys.length){var revRem=oldPay.amount||0;for(var ri=0;ri<oldPay.billKeys.length&&revRem>0;ri++){var rkey=oldPay.billKeys[ri];if(oldPay.type==='receipt'){var rSale=paySales.find(function(x){return x._key===rkey});if(rSale){var ra=Math.min(revRem,rSale.paid||0);rSale.paid=Math.max(0,(rSale.paid||0)-ra);revRem-=ra;await saveByKey(rkey,cleanForSave(rSale))}}else{var rPur=payPurchases.find(function(x){return x._key===rkey});if(rPur){var ra2=Math.min(revRem,rPur.paid||0);rPur.paid=Math.max(0,(rPur.paid||0)-ra2);revRem-=ra2;await saveByKey(rkey,cleanForSave(rPur))}}}}
   await saveByKey(ek,data,'edit','Edit '+(type==='receipt'?'receipt':'payment')+': '+data.no);
-  if(bankAmt>0&&bankName){var newBk=banks.find(function(b){return b.name===bankName});if(newBk){if(type==='receipt'){newBk.balance=(newBk.balance||0)+bankAmt}else{newBk.balance=(newBk.balance||0)-bankAmt}await saveByKey(newBk._key,cleanForSave(newBk))}}
+  // Apply new bank balance
+  if(data.method!=='cash'&&data.bankName){var newBk=banks.find(function(b){return b.name===data.bankName});if(newBk){if(type==='receipt'){newBk.balance=(newBk.balance||0)+amt}else{newBk.balance=(newBk.balance||0)-amt}await saveByKey(newBk._key,cleanForSave(newBk))}}
   invalidateCache('payment:');invalidateCache('bank:');invalidateCache('sale:');invalidateCache('purchase:');showToast((type==='receipt'?'Receipt':'Payment')+' updated successfully','success');closeModal('payModal');loadPay();return;
 }
 var bills=[];document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){bills.push(c.dataset.key)});data.billKeys=bills;
 await saveItem('payment:',data);
-if(bankAmt>0&&bankName){var bkObj=banks.find(function(b){return b.name===bankName});if(bkObj){if(type==='receipt'){bkObj.balance=(bkObj.balance||0)+bankAmt}else{bkObj.balance=(bkObj.balance||0)-bankAmt}await saveByKey(bkObj._key,cleanForSave(bkObj))}}
-if(bills.length){var remaining=totalAmt;for(var i=0;i<bills.length&&remaining>0;i++){var bk=bills[i];if(type==='receipt'){var sale=paySales.find(function(x){return x._key===bk});if(sale){var due=(sale.total||0)-(sale.paid||0);var apply=Math.min(remaining,due);sale.paid=(sale.paid||0)+apply;remaining-=apply;await saveByKey(bk,cleanForSave(sale))}}else{var pur=payPurchases.find(function(x){return x._key===bk});if(pur){var due2=(pur.total||0)-(pur.paid||0);var apply2=Math.min(remaining,due2);pur.paid=(pur.paid||0)+apply2;remaining-=apply2;await saveByKey(bk,cleanForSave(pur))}}}}
+var method=data.method;var bankName=data.bankName;
+if(method!=='cash'&&bankName){var bkObj=banks.find(function(b){return b.name===bankName});if(bkObj){if(type==='receipt'){bkObj.balance=(bkObj.balance||0)+amt}else{bkObj.balance=(bkObj.balance||0)-amt}await saveByKey(bkObj._key,cleanForSave(bkObj))}}
+if(bills.length){var remaining=amt;for(var i=0;i<bills.length&&remaining>0;i++){var bk=bills[i];if(type==='receipt'){var sale=paySales.find(function(x){return x._key===bk});if(sale){var due=(sale.total||0)-(sale.paid||0);var apply=Math.min(remaining,due);sale.paid=(sale.paid||0)+apply;remaining-=apply;await saveByKey(bk,cleanForSave(sale))}}else{var pur=payPurchases.find(function(x){return x._key===bk});if(pur){var due2=(pur.total||0)-(pur.paid||0);var apply2=Math.min(remaining,due2);pur.paid=(pur.paid||0)+apply2;remaining-=apply2;await saveByKey(bk,cleanForSave(pur))}}}}
 invalidateCache('payment:');invalidateCache('bank:');invalidateCache('sale:');invalidateCache('purchase:');
 showToast((type==='receipt'?'Receipt':'Payment')+' saved successfully','success');
 closeModal('payModal');loadPay()}
