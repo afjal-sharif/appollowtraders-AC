@@ -1602,8 +1602,8 @@ var customers=parties.filter(function(p){return p.type==='customer'});var suppli
 var receivables=0;customers.forEach(function(c){var cob=c.openingBalance||0;var cs=sales.filter(function(s){return s.customerId===c._key});var cr=payments.filter(function(p){return(p.party===c.name)&&p.type==='receipt'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=cs.reduce(function(s,x){return s+(x.total||0)},0)+(cob>0?cob:0);var tr=cs.reduce(function(s,x){return s+(x.paid||0)},0)+cr.reduce(function(s,x){return s+(x.amount||0)},0)+(cob<0?Math.abs(cob):0);receivables+=Math.max(0,td-tr)});
 var payables=0;suppliers.forEach(function(s){var sob=s.openingBalance||0;var sp=purchases.filter(function(p){return p.supplierId===s._key});var py=payments.filter(function(p){return p.party===s.name&&p.type==='payment'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=sp.reduce(function(a,x){return a+(x.total||0)},0)+(sob>0?sob:0);var tp=sp.reduce(function(a,x){return a+(x.paid||0)},0)+py.reduce(function(a,x){return a+(x.amount||0)},0)+(sob<0?Math.abs(sob):0);payables+=Math.max(0,td-tp)});
 var bankBal=banks.reduce(function(s,b){return s+(b.balance||b.openingBalance||0)},0);
-var cashReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
-var cashPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cashReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cashPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cashExpenses2=expenses.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 var salePaidCash=sales.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'){return s+(x.paid||0)}return s},0);
 var purPaidCash=purchases.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'){return s+(x.paid||0)}return s},0);
@@ -2190,9 +2190,9 @@ window.renderBankLedger=function(){
   // Purchase payments from this bank
   payPurchases.filter(function(p){return p.bankName===bankName&&(p.method==='split'?(p.bankAmount||0)>0:(p.method!=='cash'&&p.method!=='credit'&&(p.paid||0)>0))}).forEach(function(p){var bAmt=p.method==='split'?(p.bankAmount||0):(p.paid||0);entries.push({date:p.date,desc:'Purchase payment - '+p.supplierName,ref:p.purchaseNo||'',debit:0,credit:bAmt})});
   // Receipts into bank (exclude auto-created vouchers; include invoice-wise as they are real bank transactions)
-  pays.filter(function(p){return p.type==='receipt'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice}).forEach(function(p){entries.push({date:p.date,desc:'Receipt from '+p.party+(p.billKeys&&p.billKeys.length?' (Inv)':''),ref:p.no||'',debit:p.amount||0,credit:0})});
+  pays.filter(function(p){return p.type==='receipt'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)}).forEach(function(p){entries.push({date:p.date,desc:'Receipt from '+p.party+(p.billKeys&&p.billKeys.length?' (Inv)':''),ref:p.no||'',debit:p.amount||0,credit:0})});
   // Payments from bank (exclude auto-created vouchers; include invoice-wise as they are real bank transactions)
-  pays.filter(function(p){return p.type==='payment'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice}).forEach(function(p){entries.push({date:p.date,desc:'Payment to '+p.party+(p.billKeys&&p.billKeys.length?' (Inv)':''),ref:p.no||'',debit:0,credit:p.amount||0})});
+  pays.filter(function(p){return p.type==='payment'&&p.bankName===bankName&&p.method!=='cash'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)}).forEach(function(p){entries.push({date:p.date,desc:'Payment to '+p.party+(p.billKeys&&p.billKeys.length?' (Inv)':''),ref:p.no||'',debit:0,credit:p.amount||0})});
   // Transfers involving this bank
   pays.filter(function(p){return p.type==='transfer'&&p.status==='done'&&(p.fromAcc===bankName||p.toAcc===bankName)}).forEach(function(p){if(p.toAcc===bankName){entries.push({date:p.date,desc:'Transfer from '+p.fromAcc,ref:p.no||'',debit:p.amount||0,credit:0})}if(p.fromAcc===bankName){entries.push({date:p.date,desc:'Transfer to '+p.toAcc,ref:p.no||'',debit:0,credit:p.amount||0})}});
   // Expenses from bank
@@ -2573,8 +2573,8 @@ async function loadBS(){var d=await Promise.all([loadList('product:'),loadList('
 var inventory=products.reduce(function(s,p){return s+((p.stock||0)*(p.purchasePrice||0))},0);
 var receivables=0;parties.filter(function(p){return p.type==='customer'}).forEach(function(c){var cob=c.openingBalance||0;var cs=sales.filter(function(s){return s.customerId===c._key});var cr=payments.filter(function(p){return p.party===c.name&&p.type==='receipt'&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)});var td=cs.reduce(function(s,x){return s+(x.total||0)},0)+(cob>0?cob:0);var tr=cs.reduce(function(s,x){return s+(x.paid||0)},0)+cr.reduce(function(s,x){return s+(x.amount||0)},0)+(cob<0?Math.abs(cob):0);receivables+=Math.max(0,td-tr)});
 var bankBal=banks.reduce(function(s,b){return s+(b.balance||b.openingBalance||0)},0);
-var nonAutoReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
-var nonAutoPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var nonAutoReceipts=payments.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var nonAutoPayouts=payments.filter(function(p){return p.method==='cash'&&p.type==='payment'&&p.status==='done'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cashExpenses=expenses.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 var salePaidCash=sales.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'){return s+(x.paid||0)}return s},0);
 var purPaidCash=purchases.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'){return s+(x.paid||0)}return s},0);
@@ -2717,14 +2717,14 @@ async function loadTB(){
   // Cash receipts (manual, non-auto vouchers — include invoice-wise as they are real cash transactions)
   var cashReceipts = payments.filter(function(p) {
     return p.type === 'receipt' && p.method === 'cash' && p.status === 'done'
-           && (!p._autoInvoice || p._isTruckFare);
+           && (!p._autoInvoice || p._isTruckFare) && !(p.billKeys && p.billKeys.length);
   }).reduce(function(s, p) { return s + n(p.amount); }, 0);
   // Cash for purchase payments at counter
   var cashForPurchases = purchases.reduce(function(s, x) { if(x.method === 'split') return s + n(x.cashAmount); else if(x.method === 'cash') return s + n(x.paid); return s; }, 0);
   // Cash payments out (manual, non-auto — include invoice-wise as they are real cash transactions)
   var cashPaymentsOut = payments.filter(function(p) {
     return p.type === 'payment' && p.method === 'cash' && p.status === 'done'
-           && (!p._autoInvoice || p._isTruckFare);
+           && (!p._autoInvoice || p._isTruckFare) && !(p.billKeys && p.billKeys.length);
   }).reduce(function(s, p) { return s + n(p.amount); }, 0);
   // Cash expenses
   var cashExpenses = expenses.filter(function(e) { return e.method === 'cash'; })
@@ -3079,9 +3079,9 @@ var daySales=[],dayPurchases=[],dayPayments=[],dayExpenses=[];
 async function loadDay(){var d=await Promise.all([loadList('sale:'),loadList('purchase:'),loadList('payment:'),loadList('expense:')]);daySales=d[0];dayPurchases=d[1];dayPayments=d[2];dayExpenses=d[3];document.getElementById('dayDate').value=todayISO();renderDay()}
 window.changeDay=function(dir){var d=new Date(document.getElementById('dayDate').value);d.setDate(d.getDate()+dir);document.getElementById('dayDate').value=d.toISOString().slice(0,10);renderDay()}
 window.renderDay=function(){var dt=document.getElementById('dayDate').value;var ds=daySales.filter(function(s){return s.date===dt});var dp=dayPurchases.filter(function(p){return p.date===dt});var dr=dayPayments.filter(function(p){return p.date===dt&&p.status==='done'});var de=dayExpenses.filter(function(e){return e.date===dt});
-var totalSales=ds.reduce(function(s,x){return s+(x.total||0)},0);var totalPurchases=dp.reduce(function(s,x){return s+(x.total||0)},0);var totalReceipts=dr.filter(function(r){return r.type==='receipt'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);var totalPayments=dr.filter(function(r){return r.type==='payment'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);var totalExpenses=de.reduce(function(s,x){return s+(x.amount||0)},0);
-var dayCashIn=ds.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);
-var dayCashOut=dp.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method==='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
+var totalSales=ds.reduce(function(s,x){return s+(x.total||0)},0);var totalPurchases=dp.reduce(function(s,x){return s+(x.total||0)},0);var totalReceipts=dr.filter(function(r){return r.type==='receipt'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0);var totalPayments=dr.filter(function(r){return r.type==='payment'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0);var totalExpenses=de.reduce(function(s,x){return s+(x.amount||0)},0);
+var dayCashIn=ds.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayCashOut=dp.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method==='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 // Include transfers impact on cash
 var dayTrfToCash=dr.filter(function(r){return r.type==='transfer'&&r.toAcc==='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 var dayTrfFromCash=dr.filter(function(r){return r.type==='transfer'&&r.fromAcc==='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
@@ -3093,16 +3093,16 @@ var allPurUpTo=dayPurchases.filter(function(p){return p.date<=dt});
 var allPayUpTo=dayPayments.filter(function(p){return p.date<=dt&&p.status==='done'});
 var allExpUpTo=dayExpenses.filter(function(e){return e.date<=dt});
 var cihSalesCash=allSalesUpTo.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0);
-var cihRecCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cihRecCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='receipt'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cihPurCash=allPurUpTo.reduce(function(s,x){if(x.method==='split'){return s+(x.cashAmount||0)}else if(x.method==='cash'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0);
-var cihPayCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='payment'&&(!p._autoInvoice||p._isTruckFare)}).reduce(function(s,p){return s+(p.amount||0)},0);
+var cihPayCash=allPayUpTo.filter(function(p){return p.method==='cash'&&p.type==='payment'&&(!p._autoInvoice||p._isTruckFare)&&!(p.billKeys&&p.billKeys.length)}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cihExpCash=allExpUpTo.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 var cihTrfTo=allPayUpTo.filter(function(p){return p.type==='transfer'&&p.toAcc==='Cash'}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cihTrfFrom=allPayUpTo.filter(function(p){return p.type==='transfer'&&p.fromAcc==='Cash'}).reduce(function(s,p){return s+(p.amount||0)},0);
 var cashInHand=cihSalesCash+cihRecCash-cihPurCash-cihPayCash-cihExpCash+cihTrfTo-cihTrfFrom;
 
-var dayBankIn=ds.reduce(function(s,x){if(x.method==='split'){return s+(x.bankAmount||0)}else if(x.method&&x.method!=='cash'&&x.method!=='credit'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0);
-var dayBankOut=dp.reduce(function(s,x){if(x.method==='split'){return s+(x.bankAmount||0)}else if(x.method&&x.method!=='cash'&&x.method!=='credit'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method&&e.method!=='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayBankIn=ds.reduce(function(s,x){if(x.method==='split'){return s+(x.bankAmount||0)}else if(x.method&&x.method!=='cash'&&x.method!=='credit'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0);
+var dayBankOut=dp.reduce(function(s,x){if(x.method==='split'){return s+(x.bankAmount||0)}else if(x.method&&x.method!=='cash'&&x.method!=='credit'&&(x.paid||0)>0){return s+(x.paid||0)}return s},0)+dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)}).reduce(function(s,x){return s+(x.amount||0)},0)+de.filter(function(e){return e.method&&e.method!=='cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 // Include transfers impact on bank (mirror of cash transfers)
 var dayTrfToBank=dr.filter(function(r){return r.type==='transfer'&&r.fromAcc==='Cash'&&r.toAcc&&r.toAcc!=='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
 var dayTrfFromBank=dr.filter(function(r){return r.type==='transfer'&&r.toAcc==='Cash'&&r.fromAcc&&r.fromAcc!=='Cash'}).reduce(function(s,x){return s+(x.amount||0)},0);
@@ -3110,10 +3110,10 @@ dayBankIn+=dayTrfToBank;
 dayBankOut+=dayTrfFromBank;
 document.getElementById('dayStats').innerHTML='<div class="stat"><div class="label">Sales</div><div class="value text-success">'+fmt(totalSales)+'</div></div><div class="stat"><div class="label">Purchases</div><div class="value text-primary">'+fmt(totalPurchases)+'</div></div><div class="stat"><div class="label">Receipts</div><div class="value text-info">'+fmt(totalReceipts)+'</div></div><div class="stat"><div class="label">Payments Out</div><div class="value text-warning">'+fmt(totalPayments)+'</div></div><div class="stat"><div class="label">Expenses</div><div class="value text-danger">'+fmt(totalExpenses)+'</div></div><div class="stat"><div class="label">Cash In</div><div class="value text-success">'+fmt(dayCashIn)+'</div></div><div class="stat"><div class="label">Cash Out</div><div class="value text-danger">'+fmt(dayCashOut)+'</div></div><div class="stat" style="border:2px solid var(--primary)"><div class="label">Cash in Hand</div><div class="value '+(cashInHand>=0?'text-success':'text-danger')+'">'+fmt(cashInHand)+'</div></div><div class="stat"><div class="label">Bank In</div><div class="value text-success">'+fmt(dayBankIn)+'</div></div><div class="stat"><div class="label">Bank Out</div><div class="value text-danger">'+fmt(dayBankOut)+'</div></div>';
 // Separate Cash, Bank & Transfer transactions
-var cashRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)});
-var cashPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)});
-var bankRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)});
-var bankPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)});
+var cashRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
+var cashPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method==='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
+var bankRecTxn=dr.filter(function(r){return r.type==='receipt'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
+var bankPayTxn=dr.filter(function(r){return r.type==='payment'&&r.method!=='cash'&&(!r._autoInvoice||r._isTruckFare)&&!(r.billKeys&&r.billKeys.length)});
 var transferTxn=dr.filter(function(r){return r.type==='transfer'});
 var cashSales=ds.filter(function(s){return (s.method==='cash'||s.method==='split')&&(s.cashAmount>0||(s.method==='cash'&&(s.paid||0)>0))});
 var bankSales=ds.filter(function(s){return (s.method==='split'&&(s.bankAmount||0)>0)||(s.method&&s.method!=='cash'&&s.method!=='credit'&&s.method!=='split'&&(s.paid||0)>0)});
