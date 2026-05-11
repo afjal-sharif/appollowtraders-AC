@@ -1,5 +1,9 @@
+/// <reference types="@cloudflare/workers-types" />
 import { Hono } from 'hono'
-import { dbList, dbGet, dbSave, dbDelete, dbWriteLog, dbCreateApproval, dbProcessApproval, dbExportAll, dbImportAll, dbListKeys, PREFIX_TABLE_MAP } from './db'
+import { compress } from 'hono/compress'
+import { secureHeaders } from 'hono/secure-headers'
+import { getSignedCookie, setSignedCookie, deleteCookie } from 'hono/cookie'
+import { D1Database, dbList, dbGet, dbSave, dbDelete, dbWriteLog, dbCreateApproval, dbProcessApproval, dbExportAll, dbImportAll, dbListKeys, PREFIX_TABLE_MAP } from './db'
 import { cachedDbList, cacheInvalidate, cacheInvalidateAll, getRelatedPrefixes, kvGetLicense, kvSetLicense, kvGetPin, kvSetPin, kvGetCompanySettings, kvSetCompanySettings } from './kv-cache'
 
 // ============================================================
@@ -8,13 +12,17 @@ import { cachedDbList, cacheInvalidate, cacheInvalidateAll, getRelatedPrefixes, 
 // D1 Database (primary) + KV (config & cache only)
 // ============================================================
 
-type Bindings = { DATA_STORE: KVNamespace; DB: D1Database }
+type Bindings = { DATA_STORE: KVNamespace; DB: D1Database; COOKIE_SECRET?: string }
 const app = new Hono<{ Bindings: Bindings }>()
+
+app.use('*', compress())
+app.use('*', secureHeaders())
 
 let CURRENT_PIN = "1234";
 const MASTER_KEY = "4321";
 const LICENSE_EXPIRE = "2028-12-31";
 const USE_KV_LICENSE = true;
+const DEFAULT_SECRET = "bizmanager-appollow-super-secret-key-2026"; // Fallback secret
 
 // ============================================================
 // HELPERS
@@ -23,7 +31,7 @@ function genId() { return Date.now().toString(36) + Math.random().toString(36).s
 function escapeHtml(s: string) { return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
 
 /** List records via D1 with KV cache layer (replaces old kvList) */
-async function kvList(env: any, prefix: string) {
+async function kvList(env: any, prefix: string): Promise<any[]> {
   if (!env.DB) return [];
   return cachedDbList(env.DATA_STORE, (p: string) => dbList(env.DB, p), prefix);
 }
@@ -41,34 +49,44 @@ app.post('/login', async (c) => {
   const storedPin = await kvGetPin(c.env.DATA_STORE) || CURRENT_PIN;
   const username = (form.get("username") as string || '').trim();
   const users = await kvList(c.env, 'user:');
+  const secret = c.env.COOKIE_SECRET || DEFAULT_SECRET;
   
   // Check if any users exist - if so, require user login
   if (users.length > 0 && username) {
-    const user = users.find((u: any) => u.username === username && u.password === enteredPin && u.active !== false);
+    let hashedPin = enteredPin;
+    const dbUser = users.find((u: any) => u.username === username);
+    if (dbUser && dbUser.password && dbUser.password.length === 64) {
+      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(enteredPin));
+      hashedPin = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    const user = users.find((u: any) => u.username === username && u.password === hashedPin && u.active !== false);
     if (user) {
-      const cookieVal = encodeURIComponent(JSON.stringify({ auth: 1, userId: user._key, username: user.username, role: user.role, name: user.name }));
-      return new Response(null, { status: 302, headers: { "Set-Cookie": `session=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`, "Location": "/", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache" } });
+      const sessionData = JSON.stringify({ auth: 1, userId: user._key, username: user.username, role: user.role, name: user.name });
+      await setSignedCookie(c, 'session', sessionData, secret, { path: '/', httpOnly: true, sameSite: 'Strict', maxAge: 86400 });
+      return c.redirect('/');
     }
     return htmlRes(loginPage("Invalid credentials", users.length > 0));
   }
   
   // Fallback PIN login (admin)
   if (enteredPin === storedPin) {
-    const cookieVal = encodeURIComponent(JSON.stringify({ auth: 1, userId: 'admin', username: 'admin', role: 'admin', name: 'Administrator' }));
-    return new Response(null, { status: 302, headers: { "Set-Cookie": `session=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`, "Location": "/", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache" } });
+    const sessionData = JSON.stringify({ auth: 1, userId: 'admin', username: 'admin', role: 'admin', name: 'Administrator' });
+    await setSignedCookie(c, 'session', sessionData, secret, { path: '/', httpOnly: true, sameSite: 'Strict', maxAge: 86400 });
+    return c.redirect('/');
   }
   return htmlRes(loginPage("Wrong PIN", users.length > 0));
 });
 
-app.get('/logout', () => {
-  return new Response(null, { status: 302, headers: { "Set-Cookie": "session=; Path=/; HttpOnly; Max-Age=0; SameSite=Strict", "Location": "/login", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache", "Clear-Site-Data": '"cache"' } });
+app.get('/logout', (c) => {
+  deleteCookie(c, 'session', { path: '/', httpOnly: true, sameSite: 'Strict' });
+  return c.redirect('/login');
 });
 
-function getSession(c: any) {
-  const cookie = c.req.header("Cookie") || "";
-  const match = cookie.match(/session=([^;]+)/);
-  if (!match) return null;
-  try { return JSON.parse(decodeURIComponent(match[1])); } catch { return null; }
+async function getSession(c: any): Promise<any> {
+  const secret = c.env.COOKIE_SECRET || DEFAULT_SECRET;
+  const cookieStr = await getSignedCookie(c, secret, 'session');
+  if (!cookieStr) return null;
+  try { return JSON.parse(cookieStr); } catch { return null; }
 }
 
 // License + Auth check middleware
@@ -103,8 +121,16 @@ app.use('*', async (c, next) => {
     await next(); return;
   }
   
-  const session = getSession(c);
-  if (!session?.auth && path !== '/login') return htmlRes(loginPage("", false));
+  const session = await getSession(c);
+  const cookie = c.req.header("Cookie") || "";
+  const spMatch = cookie.match(/sp_session=([^;]+)/);
+  if (!session?.auth && path !== '/login') {
+    if (path.startsWith('/api/') && spMatch) {
+      // Allow API access for authenticated SP Portal users
+    } else {
+      return htmlRes(loginPage("", false));
+    }
+  }
   
   // Role-based page access enforcement
   const rolePageMap: Record<string, string[]> = {
@@ -169,7 +195,7 @@ app.post('/api/save', async (c) => {
   }
 
   // Entry user approval check: edits (when key already exists) need approval
-  const session = getSession(c);
+  const session = await getSession(c);
   const isEntry = session?.role === 'entry';
   const isEdit = !!(keyFromBody || id); // editing existing record
   const matchesPrefix = APPROVAL_PREFIXES.some(p => (prefix && prefix === p) || (key && key.startsWith(p)));
@@ -183,6 +209,14 @@ app.post('/api/save', async (c) => {
   }
 
   // Save to D1
+  if (prefix === 'user:' && data.password && data.password.length < 60) {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data.password));
+    data.password = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  if (prefix === 'salesperson:' && data.pin && data.pin.length < 60) {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data.pin));
+    data.pin = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
   const savedKey = await dbSave(c.env.DB, prefix, data, key);
   // Modification log
   if (logAction) {
@@ -210,7 +244,7 @@ app.post('/api/delete', async (c) => {
   const prefix = key.split(':')[0] + ':';
 
   // Entry user approval check: deletes need approval
-  const session = getSession(c);
+  const session = await getSession(c);
   const isEntry = session?.role === 'entry';
   const matchesPrefix = APPROVAL_PREFIXES.some(p => key.startsWith(p));
 
@@ -240,7 +274,7 @@ app.post('/api/approval-list', async (c) => {
 
 app.post('/api/approval-action', async (c) => {
   if (!c.env.DB) return c.json({ success: false, error: "D1 not configured" }, 500);
-  const session = getSession(c);
+  const session = await getSession(c);
   const role = session?.role || '';
   if (role !== 'admin' && role !== 'manager') return c.json({ success: false, error: "Only admin/manager can approve" }, 403);
 
@@ -265,7 +299,7 @@ app.get('/api/company-settings', async (c) => {
 });
 
 app.post('/api/company-settings', async (c) => {
-  const session = getSession(c);
+  const session = await getSession(c);
   if (session?.role !== 'admin') return c.json({ success: false, error: "Only admin can change company settings" }, 403);
   const data = await c.req.json();
   await kvSetCompanySettings(c.env.DATA_STORE, data);
@@ -332,49 +366,58 @@ app.post('/sp-portal/login', async (c) => {
   const spCode = form.get("code") as string;
   const spPin = form.get("pin") as string;
   const salespersons = await kvList(c.env, 'salesperson:');
-  const sp = salespersons.find((s: any) => s.code === spCode && s.pin === spPin && s.active !== false);
+  const dbSp = salespersons.find((s: any) => s.code === spCode);
+  let hashedPin = spPin;
+  if (dbSp && dbSp.pin && dbSp.pin.length === 64) {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(spPin));
+    hashedPin = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  const sp = salespersons.find((s: any) => s.code === spCode && s.pin === hashedPin && s.active !== false);
+  const secret = c.env.COOKIE_SECRET || DEFAULT_SECRET;
   if (sp) {
-    const cookieVal = encodeURIComponent(JSON.stringify({ spId: sp._key, spName: sp.name, spCode: sp.code }));
-    return new Response(null, { status: 302, headers: { "Set-Cookie": `sp_session=${cookieVal}; Path=/; HttpOnly; SameSite=Strict`, Location: "/sp-portal" } });
+    const sessionData = JSON.stringify({ spId: sp._key, spName: sp.name, spCode: sp.code });
+    await setSignedCookie(c, 'sp_session', sessionData, secret, { path: '/', httpOnly: true, sameSite: 'Strict' });
+    return c.redirect('/sp-portal');
   }
   return htmlRes(spLoginPage("Invalid credentials"));
 });
 
-app.get('/sp-portal/logout', () => {
-  return new Response(null, { status: 302, headers: { "Set-Cookie": "sp_session=; Path=/; HttpOnly; Max-Age=0", Location: "/sp-portal/login" } });
+app.get('/sp-portal/logout', (c) => {
+  deleteCookie(c, 'sp_session', { path: '/', httpOnly: true, sameSite: 'Strict' });
+  return c.redirect('/sp-portal/login');
 });
 
 // ============================================================
 // PAGE ROUTES
 // ============================================================
-app.get('/', (c) => htmlRes(layout(dashboardPage(), "dashboard", getSession(c))));
-app.get('/inventory', (c) => htmlRes(layout(inventoryPage(), "inventory", getSession(c))));
-app.get('/stock-check', (c) => htmlRes(layout(stockCheckPage(), "stockcheck", getSession(c))));
-app.get('/parties', (c) => htmlRes(layout(partiesPage(), "parties", getSession(c))));
-app.get('/purchases', (c) => htmlRes(layout(purchasesPage(), "purchases", getSession(c))));
-app.get('/sales', (c) => htmlRes(layout(salesPage(), "sales", getSession(c))));
-app.get('/payments', (c) => htmlRes(layout(paymentsPage(), "payments", getSession(c))));
-app.get('/expenses', (c) => htmlRes(layout(expensesPage(), "expenses", getSession(c))));
-app.get('/ledger', (c) => htmlRes(layout(ledgerPage(), "ledger", getSession(c))));
-app.get('/expense-ledger', (c) => htmlRes(layout(expenseLedgerPage(), "expledger", getSession(c))));
-app.get('/profit-loss', (c) => htmlRes(layout(profitLossPage(), "profitloss", getSession(c))));
-app.get('/balance-sheet', (c) => htmlRes(layout(balanceSheetPage(), "balancesheet", getSession(c))));
-app.get('/trial-balance', (c) => htmlRes(layout(trialBalancePage(), "trialbalance", getSession(c))));
-app.get('/stock', (c) => htmlRes(layout(stockPage(), "stock", getSession(c))));
-app.get('/receivable-payable', (c) => htmlRes(layout(receivablePayablePage(), "recpay", getSession(c))));
-app.get('/day-details', (c) => htmlRes(layout(dayDetailsPage(), "daydetails", getSession(c))));
-app.get('/reports', (c) => htmlRes(layout(reportsPage(), "reports", getSession(c))));
-app.get('/salesperson', (c) => htmlRes(layout(salespersonPage(), "salesperson", getSession(c))));
-app.get('/orders', (c) => htmlRes(layout(ordersPage(), "orders", getSession(c))));
-app.get('/users', (c) => htmlRes(layout(usersPage(), "users", getSession(c))));
-app.get('/admin', (c) => htmlRes(layout(adminPage(), "admin", getSession(c))));
-app.get('/mod-log', (c) => htmlRes(layout(modLogPage(), "modlog", getSession(c))));
-app.get('/approvals', (c) => htmlRes(layout(approvalsPage(), "approvals", getSession(c))));
-app.get('/company-settings', (c) => htmlRes(layout(companySettingsPage(), "companysettings", getSession(c))));
+app.get('/', async (c) => htmlRes(layout(dashboardPage(), "dashboard", await getSession(c))));
+app.get('/inventory', async (c) => htmlRes(layout(inventoryPage(), "inventory", await getSession(c))));
+app.get('/stock-check', async (c) => htmlRes(layout(stockCheckPage(), "stockcheck", await getSession(c))));
+app.get('/parties', async (c) => htmlRes(layout(partiesPage(), "parties", await getSession(c))));
+app.get('/purchases', async (c) => htmlRes(layout(purchasesPage(), "purchases", await getSession(c))));
+app.get('/sales', async (c) => htmlRes(layout(salesPage(), "sales", await getSession(c))));
+app.get('/payments', async (c) => htmlRes(layout(paymentsPage(), "payments", await getSession(c))));
+app.get('/expenses', async (c) => htmlRes(layout(expensesPage(), "expenses", await getSession(c))));
+app.get('/ledger', async (c) => htmlRes(layout(ledgerPage(), "ledger", await getSession(c))));
+app.get('/expense-ledger', async (c) => htmlRes(layout(expenseLedgerPage(), "expledger", await getSession(c))));
+app.get('/profit-loss', async (c) => htmlRes(layout(profitLossPage(), "profitloss", await getSession(c))));
+app.get('/balance-sheet', async (c) => htmlRes(layout(balanceSheetPage(), "balancesheet", await getSession(c))));
+app.get('/trial-balance', async (c) => htmlRes(layout(trialBalancePage(), "trialbalance", await getSession(c))));
+app.get('/stock', async (c) => htmlRes(layout(stockPage(), "stock", await getSession(c))));
+app.get('/receivable-payable', async (c) => htmlRes(layout(receivablePayablePage(), "recpay", await getSession(c))));
+app.get('/day-details', async (c) => htmlRes(layout(dayDetailsPage(), "daydetails", await getSession(c))));
+app.get('/reports', async (c) => htmlRes(layout(reportsPage(), "reports", await getSession(c))));
+app.get('/salesperson', async (c) => htmlRes(layout(salespersonPage(), "salesperson", await getSession(c))));
+app.get('/orders', async (c) => htmlRes(layout(ordersPage(), "orders", await getSession(c))));
+app.get('/users', async (c) => htmlRes(layout(usersPage(), "users", await getSession(c))));
+app.get('/admin', async (c) => htmlRes(layout(adminPage(), "admin", await getSession(c))));
+app.get('/mod-log', async (c) => htmlRes(layout(modLogPage(), "modlog", await getSession(c))));
+app.get('/approvals', async (c) => htmlRes(layout(approvalsPage(), "approvals", await getSession(c))));
+app.get('/company-settings', async (c) => htmlRes(layout(companySettingsPage(), "companysettings", await getSession(c))));
 // VAT/AIT Ledger integrated into Receivable/Payable page
-app.get('/truck-fare-report', (c) => htmlRes(layout(truckFareReportPage(), "truckfarereport", getSession(c))));
-app.get('/truck-fare-settings', (c) => htmlRes(layout(truckFareSettingsPage(), "truckfaresettings", getSession(c))));
-app.get('/sp-portal', (c) => htmlRes(spPortalPage(c)));
+app.get('/truck-fare-report', async (c) => htmlRes(layout(truckFareReportPage(), "truckfarereport", await getSession(c))));
+app.get('/truck-fare-settings', async (c) => htmlRes(layout(truckFareSettingsPage(), "truckfaresettings", await getSession(c))));
+app.get('/sp-portal', async (c) => htmlRes(await spPortalPage(c)));
 app.get('/login', async (c) => {
   const users = await kvList(c.env, 'user:');
   return htmlRes(loginPage("", users.length > 0));
@@ -423,7 +466,7 @@ if(!th){showToast('Please select a thana','warning');return}if(mx<=0){showToast(
 var dup=_tfList.find(function(x){return x.thana===th&&(!ek||x._key!==ek)});if(dup){showToast('Thana "'+th+'" already has a fare configured','warning');return}
 var data={thana:th,district:ds,division:dv,maxFare:mx};
 try{if(ek){await saveByKey(ek,data,'edit','Updated thana fare: '+th)}else{await saveItem('thanafare:',data,null,'create','Added thana fare: '+th)}invalidateCache('thanafare:');closeModal('tfModal');loadTF();showToast(ek?'Thana fare updated':'Thana fare added','success')}catch(e){showToast('Failed: '+e.message,'error')}}
-window.delTF=async function(k){if(!confirm('Delete this thana fare setting?'))return;var t=_tfList.find(function(x){return x._key===k});await deleteItem(k,false,'Deleted thana fare: '+(t?t.thana:''));invalidateCache('thanafare:');loadTF();showToast('Deleted','success')}
+window.delTF=async function(k){if(!(await customConfirm('Delete this thana fare setting?')))return;var t=_tfList.find(function(x){return x._key===k});await deleteItem(k,false,'Deleted thana fare: '+(t?t.thana:''));invalidateCache('thanafare:');loadTF();showToast('Deleted','success')}
 window.downloadTFTemplate=function(){var ws=XLSX.utils.aoa_to_sheet([['Thana','Max Fare'],['Dhanmondi','50'],['Gulshan','60'],['Uttara','70']]);var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Template');XLSX.writeFile(wb,'thana_fare_template.xlsx')}
 document.getElementById('tfImportFile').addEventListener('change',function(e){var file=e.target.files[0];if(!file)return;var reader=new FileReader();reader.onload=function(ev){try{var wb=XLSX.read(ev.target.result,{type:'array'});var ws=wb.Sheets[wb.SheetNames[0]];var rows=XLSX.utils.sheet_to_json(ws,{defval:''});if(!rows.length){document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--danger)">No data found</span>';return}window._tfImportRows=rows.map(function(r){var thana=String(r['Thana']||r['thana']||r['THANA']||'').trim();var maxFare=parseFloat(r['Max Fare']||r['max fare']||r['MaxFare']||r['Fare']||r['fare']||0)||0;var geo=_tfGeo.find(function(g){return g[2].toLowerCase()===thana.toLowerCase()});return{thana:geo?geo[2]:thana,district:geo?geo[1]:'',division:geo?geo[0]:'',maxFare:maxFare}}).filter(function(r){return r.thana&&r.maxFare>0});var prev=document.getElementById('tfImportPreview');prev.style.display='block';prev.innerHTML='<div style="font-weight:600;margin-bottom:6px">Preview ('+window._tfImportRows.length+' thanas):</div><table class="tbl" style="font-size:11px"><thead><tr><th>Thana</th><th>District</th><th>Division</th><th class="r">Max Fare</th></tr></thead><tbody>'+window._tfImportRows.slice(0,20).map(function(r){return'<tr><td>'+r.thana+'</td><td>'+r.district+'</td><td>'+r.division+'</td><td class="r">'+r.maxFare+'</td></tr>'}).join('')+'</tbody></table>';document.getElementById('tfImportBtn').disabled=false;document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--accent)">'+window._tfImportRows.length+' thanas ready to import</span>'}catch(err){document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--danger)">Error: '+err.message+'</span>'}};reader.readAsArrayBuffer(file)})
 window.doImportTF=async function(){if(!window._tfImportRows||!window._tfImportRows.length)return;document.getElementById('tfImportBtn').disabled=true;document.getElementById('tfImportStatus').innerHTML='<span style="color:var(--primary)">Importing...</span>';var ok=0,fail=0;for(var i=0;i<window._tfImportRows.length;i++){try{var r=window._tfImportRows[i];var dup=_tfList.find(function(x){return x.thana===r.thana});if(dup){await saveByKey(dup._key,{thana:r.thana,district:r.district,division:r.division,maxFare:r.maxFare})}else{await saveItem('thanafare:',{thana:r.thana,district:r.district,division:r.division,maxFare:r.maxFare})}ok++}catch(e){fail++}}invalidateCache('thanafare:');loadTF();closeModal('tfImportModal');showToast('Imported '+ok+' thana fares'+(fail?' ('+fail+' failed)':''),'success');window._tfImportRows=[]}
@@ -729,6 +772,8 @@ label{display:block;font-size:10px;font-weight:700;color:var(--muted);margin-bot
 }
 .filter-toggle{cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:10px;user-select:none;-webkit-tap-highlight-color:transparent}.filter-toggle:hover{background:var(--bg)}.filter-toggle .ft-label{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;display:flex;align-items:center;gap:6px}.filter-toggle .ft-arrow{transition:transform .2s;font-size:18px;color:var(--muted)}.filter-toggle.open .ft-arrow{transform:rotate(180deg)}.filter-body{display:none;animation:filterSlide .2s ease}.filter-body.open{display:block}@keyframes filterSlide{from{opacity:0;max-height:0}to{opacity:1;max-height:500px}}
 .collapsible-toggle.open #salChargesArrow,.collapsible-toggle.open #purChargesArrow{transform:rotate(180deg)}#salChargesBody.open,#purChargesBody.open{display:block!important;animation:filterSlide .2s ease}
+@keyframes spin{100%{transform:rotate(360deg)}}
+.spin-anim{animation:spin 1s linear infinite}
 </style>`;
 }
 
@@ -813,15 +858,36 @@ ${getCSS()}
 <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
 <script>
 // ============ GLOBAL UTILITIES ============
-window.api=async function(path,body){var r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});var d=await r.json();if(!r.ok||(d&&d.success===false)){throw new Error(d.error||'Request failed');}return d;};
+window.customConfirm = function(message) {
+  return new Promise(function(resolve) {
+    document.getElementById('confirmMsg').innerText = message;
+    var btn = document.getElementById('confirmActionBtn');
+    var clone = btn.cloneNode(true);
+    btn.parentNode.replaceChild(clone, btn);
+    clone.addEventListener('click', function() {
+      closeModal('confirmModal');
+      resolve(true);
+    });
+    var cBtn = document.getElementById('confirmCancelBtn');
+    var cClone = cBtn.cloneNode(true);
+    cBtn.parentNode.replaceChild(cClone, cBtn);
+    cClone.addEventListener('click', function() {
+      closeModal('confirmModal');
+      resolve(false);
+    });
+    openModal('confirmModal');
+  });
+};
+window.api=async function(path,body){var btn=document.activeElement;var isBtn=btn&&btn.tagName==='BUTTON'&&path!=='/api/list';var origHtml='';if(isBtn){origHtml=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class="material-symbols-outlined spin-anim" style="font-size:16px;vertical-align:middle;margin-right:4px;">autorenew</span>'+(btn.textContent.trim()||'Wait...');}try{var r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});var d=await r.json();if(!r.ok||(d&&d.success===false)){throw new Error(d.error||'Request failed');}return d;}finally{if(isBtn){btn.disabled=false;btn.innerHTML=origHtml;}}};
 window.loadList=async function(prefix){return api('/api/list',{prefix:prefix});};
 window.saveItem=async function(prefix,data,id,logAction,logDetail){var r=await api('/api/save',{prefix:prefix,data:data,id:id,logAction:logAction||'',logDetail:logDetail||''});if(r&&r.pending){showToast(r.message||'Submitted for approval','info');}return r;};
 window.saveByKey=async function(key,data,logAction,logDetail){var r=await api('/api/save',{key:key,data:data,logAction:logAction||'',logDetail:logDetail||''});if(r&&r.pending){showToast(r.message||'Submitted for approval','info');}return r;};
-window.deleteItem=async function(key,ask,logDetail){if(ask!==false&&!confirm('Delete this item?'))return;var r=await api('/api/delete',{key:key,logDetail:logDetail||''});if(r&&r.pending){showToast(r.message||'Delete request submitted for approval','info');}return r;};
+window.deleteItem=async function(key,ask,logDetail){if(ask!==false&&!(await customConfirm('Delete this item?')))return;var r=await api('/api/delete',{key:key,logDetail:logDetail||''});if(r&&r.pending){showToast(r.message||'Delete request submitted for approval','info');}return r;};
 window.openModal=function(id){var el=document.getElementById(id);if(el)el.classList.add('open');};
 window.closeModal=function(id){var el=document.getElementById(id);if(el)el.classList.remove('open');};
 window.fmt=function(n){return Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:0,maximumFractionDigits:2});};
 window.todayISO=function(){return new Date().toISOString().slice(0,10);};
+window.quickDateFilter=function(fId,tId,type,cb){var d=new Date();var f=new Date();var t=new Date();if(type==='today'){}else if(type==='yesterday'){f.setDate(f.getDate()-1);t.setDate(t.getDate()-1)}else if(type==='last7'){f.setDate(f.getDate()-6)}else if(type==='thisMonth'){f.setDate(1)}var tz=(new Date()).getTimezoneOffset()*60000;document.getElementById(fId).value=new Date(f-tz).toISOString().slice(0,10);document.getElementById(tId).value=new Date(t-tz).toISOString().slice(0,10);if(cb)cb();};
 window.cleanForSave=function(obj){var c=Object.assign({},obj);delete c._key;return c;};
 window.normalize=function(v){return String(v||'').trim().toLowerCase();};
 window.fmtMethod=function(m){var map={cash:'Cash',bank_transfer:'Bank Transfer',cheque:'Cheque',credit_card:'Credit Card',mobile_payment:'Mobile Payment',credit:'On Credit',bank:'Bank',transfer:'Transfer',split:'Split Payment'};return map[m]||String(m||'').toUpperCase();};
@@ -848,7 +914,10 @@ window.printContent=function(elementId,title){
   var contentHtml=content.innerHTML;
   var alreadyHasHeader=elementId==='docPrintArea';
   var win=window.open('','_blank');
-  win.document.write('<html><head><title>'+(title||'Print')+'</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:11px}.r{text-align:right}.bold{font-weight:bold}.text-danger{color:#dc2626}.text-success{color:#059669}.text-warning{color:#d97706}.text-muted{color:#666}.text-info{color:#0891b2}.text-primary{color:#4f46e5}.badge{padding:2px 6px;border-radius:3px;font-size:9px}.pl-row{display:flex;justify-content:space-between;padding:4px 12px}.pl-row.total{font-weight:bold;background:#f3f3f3;padding:8px 12px}.led-sale td{background:#eef2ff}.led-purchase td{background:#fffbeb}.led-receipt td,.led-payment td{background:#ecfdf5}.stat{display:inline-block;padding:8px 12px;margin:3px;border:1px solid #ddd;border-radius:6px}.stat .label{font-size:9px;text-transform:uppercase;color:#666;font-weight:bold}.stat .value{font-size:16px;font-weight:bold}.stats{margin-bottom:12px}.card{margin-bottom:12px;padding:10px}</style></head><body>'+(alreadyHasHeader?'':companyHeader)+contentHtml+'</body></html>');
+  win.document.write('<html><head><title>'+(title||'Print')+'</title><style>body{font-family:sans-serif;padding:20px;font-size:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:11px}.r{text-align:right}.bold{font-weight:bold}.text-danger{color:#dc2626}.text-success{color:#059669}.text-warning{color:#d97706}.text-muted{color:#666}.text-info{color:#0891b2}.text-primary{color:#4f46e5}.badge{padding:2px 6px;border-radius:3px;font-size:9px}.pl-row{display:flex;justify-content:space-between;padding:4px 12px}.pl-row.total{font-weight:bold;background:#f3f3f3;padding:8px 12px}.led-sale td{background:#eef2ff}.led-purchase td{background:#fffbeb}.led-receipt td,.led-payment td{background:#ecfdf5}.stat{display:inline-block;padding:8px 12px;margin:3px;border:1px solid #ddd;border-radius:6px}.stat .label{font-size:9px;text-transform:uppercase;color:#666;font-weight:bold}.stat .value{font-size:16px;font-weight:bold}.stats{margin-bottom:12px}.card{margin-bottom:12px;padding:10px}
+@keyframes spin{100%{transform:rotate(360deg)}}
+.spin-anim{animation:spin 1s linear infinite}
+</style></head><body>'+(alreadyHasHeader?'':companyHeader)+contentHtml+'</body></html>');
   win.document.close();setTimeout(function(){win.print();win.close();},500);
 };
 // Document preview handler
@@ -1166,6 +1235,16 @@ window.toggleBnavMore=function(){
 // Close more menu when navigating
 document.querySelectorAll('.bnav-more-menu a').forEach(function(a){a.addEventListener('click',function(){document.getElementById('bnavMoreMenu').classList.remove('open');});});
 </script>
+<div class="modal-overlay" id="confirmModal" style="z-index:99999">
+  <div class="modal">
+    <h3 style="margin-bottom:12px;color:var(--danger)"><span class="material-symbols-outlined" style="vertical-align:middle;margin-right:8px;font-size:24px">warning</span>Confirm Action</h3>
+    <div id="confirmMsg" style="font-size:14px;color:var(--text);margin-bottom:20px;white-space:pre-wrap"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button class="btn btn-outline" id="confirmCancelBtn">Cancel</button>
+      <button class="btn btn-danger" id="confirmActionBtn">Confirm</button>
+    </div>
+  </div>
+</div>
 </body></html>`;
 }
 
@@ -1201,11 +1280,15 @@ if(cs.primaryColor){document.documentElement.style.setProperty('--primary',cs.pr
 }
 function expiredPage() { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>License Expired</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><div class="login-card"><h2>License Expired</h2><div class="sub">Please renew.</div></div></div></body></html>`; }
 function spLoginPage(msg: string) { return `<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><meta name="theme-color" content="#1e1b4b"><meta name="apple-mobile-web-app-capable" content="yes"><title>SP Portal</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">${getCSS()}</head><body><div class="login-page"><form class="login-card" method="POST" action="/sp-portal/login"><h2>Salesperson Portal</h2><div class="sub">Enter code and PIN</div>${msg?`<div class="err">${msg}</div>`:''}<input name="code" placeholder="Code" style="text-align:center" required><input type="password" name="pin" placeholder="PIN" style="text-align:center" required><button type="submit" class="btn btn-primary">Login</button><div style="margin-top:12px"><a href="/login" style="font-size:11px;color:var(--muted)">Admin Login</a></div></form></div></body></html>`; }
-function spPortalPage(c: any) {
-  const cookie = c.req.header("Cookie") || "";
-  const spMatch = cookie.match(/sp_session=([^;]+)/);
-  let spSession: any = {};
-  if (spMatch) { try { spSession = JSON.parse(decodeURIComponent(spMatch[1])); } catch {} }
+async function getSpSession(c: any): Promise<any> {
+  const secret = c.env.COOKIE_SECRET || DEFAULT_SECRET;
+  const cookieStr = await getSignedCookie(c, secret, 'sp_session');
+  if (!cookieStr) return null;
+  try { return JSON.parse(cookieStr); } catch { return null; }
+}
+
+async function spPortalPage(c: any) {
+  const spSession = await getSpSession(c) || {};
   const spId = spSession.spId || '';
   const spName = spSession.spName || 'Salesperson';
   const spCode = spSession.spCode || '';
@@ -1351,7 +1434,8 @@ ${getCSS()}
 <div id="reportsSection" class="hidden">
 <div class="card" style="margin-bottom:14px">
 <h3 style="font-size:15px;margin-bottom:10px"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle;color:var(--primary)">bar_chart</span> My Sales Reports</h3>
-<div class="sp-rpt-controls"><div style="flex:1;min-width:150px"><label>Report</label><select id="spRptType"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option><option value="date-sales">Date-wise Sales</option><option value="customer-outstanding">Customer Outstanding</option></select></div><div style="min-width:120px"><label>From</label><input type="date" id="spRptFrom"></div><div style="min-width:120px"><label>To</label><input type="date" id="spRptTo"></div></div>
+<div class="sp-rpt-controls"><div style="flex:1;min-width:150px"><label>Report</label><select id="spRptType"><option value="product">Product-wise Sales</option><option value="customer">Customer-wise Sales</option><option value="product-customer">Product + Customer</option><option value="group-product">Group &amp; Product-wise</option><option value="customer-product">Customer &amp; Product Detail</option><option value="date-sales">Date-wise Sales</option><option value="customer-outstanding">Customer Outstanding</option><option value="performance">Salesperson Performance</option></select></div><div style="min-width:120px"><label>From</label><input type="date" id="spRptFrom"></div><div style="min-width:120px"><label>To</label><input type="date" id="spRptTo"></div></div>
+<div class="no-print" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline btn-xs" onclick="quickDateFilter('spRptFrom','spRptTo','today',renderSPReport)">Today</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('spRptFrom','spRptTo','yesterday',renderSPReport)">Yesterday</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('spRptFrom','spRptTo','last7',renderSPReport)">Last 7 Days</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('spRptFrom','spRptTo','thisMonth',renderSPReport)">This Month</button></div>
 <div class="sp-rpt-actions" style="margin-top:8px"><button class="btn btn-primary" onclick="renderSPReport()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button><button class="btn btn-outline" onclick="exportXLS('spRptTbl','SP_Report')"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">download</span> Export</button></div>
 </div>
 <div id="spRptPlaceholder" class="rpt-placeholder"><span class="material-symbols-outlined">assessment</span><p>Select report type and date range, then click <b>View Report</b></p></div>
@@ -1360,10 +1444,20 @@ ${getCSS()}
 
 <div id="customersSection" class="hidden">
 <!-- Desktop table -->
-<div class="sp-cust-table card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Customer Name</th><th>Phone</th><th>Address</th><th class="r">Total Sales</th><th class="r">Outstanding</th></tr></thead><tbody id="spCustListBody"></tbody></table></div></div>
+<div class="sp-cust-table card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Customer Name</th><th>Phone</th><th>Address</th><th class="r">Total Sales</th><th class="r">Outstanding</th><th class="r">Act</th></tr></thead><tbody id="spCustListBody"></tbody></table></div></div>
 <!-- Mobile card list -->
 <div class="sp-cust-cards" id="spCustCards"></div>
 </div>
+
+<div class="modal-overlay" id="spStatementModal"><div class="modal" style="max-width:700px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0" id="spStmtTitle">Customer Statement</h3><div style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('spStmtPrint','Customer Statement')">Print</button><button class="btn btn-outline btn-sm" onclick="closeModal('spStatementModal')">Close</button></div></div>
+<div id="spStmtPrint" style="max-height:60vh;overflow-y:auto;border:1px solid var(--border);border-radius:6px">
+  <table class="tbl" style="margin:0">
+    <thead style="position:sticky;top:0;background:var(--bg)"><tr><th>Date</th><th>Type</th><th>Ref#</th><th class="r">Debit (Sale)</th><th class="r">Credit (Paid)</th><th class="r">Balance</th></tr></thead>
+    <tbody id="spStmtBody"></tbody>
+  </table>
+</div>
+</div></div>
 </div>
 <!-- Bottom Navigation (mobile only) -->
 <nav class="sp-bnav" id="spBnav">
@@ -1375,14 +1469,14 @@ ${getCSS()}
 </div>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"><\/script>
 <script>
-window.api=async function(p,b){var r=await fetch(p,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(b||{})});return r.json();};
+window.api=async function(p,b){var btn=document.activeElement;var isBtn=btn&&btn.tagName==='BUTTON'&&p!=='/api/list';var origHtml='';if(isBtn){origHtml=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class="material-symbols-outlined spin-anim" style="font-size:16px;vertical-align:middle;margin-right:4px;">autorenew</span>'+(btn.textContent.trim()||'Wait...');}try{var r=await fetch(p,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(b||{})});var d=await r.json();if(!r.ok||(d&&d.success===false)){throw new Error(d.error||'Request failed');}return d;}finally{if(isBtn){btn.disabled=false;btn.innerHTML=origHtml;}}};
 window.loadList=async function(p){return api(\'/api/list\',{prefix:p});};
 window.saveItem=async function(p,d){return api(\'/api/save\',{prefix:p,data:d});};
 window.fmt=function(n){return Number(n||0).toLocaleString(\'en-IN\');};
 window.todayISO=function(){return new Date().toISOString().slice(0,10);};
 window.txnNo=function(p){return p+\'-\'+todayISO().replace(/-/g,\'\')+\'-\'+Math.random().toString(36).slice(2,7).toUpperCase();};
 window.exportXLS=function(tableId,fileName){try{var tbl=document.getElementById(tableId);if(!tbl)return;var wb=XLSX.utils.table_to_book(tbl,{sheet:\'Sheet1\'});XLSX.writeFile(wb,(fileName||\'export\')+\'.xlsx\');}catch(e){alert(\'Export failed: \'+e.message);}};
-var spP=[],spC=[],spI=[{pk:\'\',pn:\'\',q:1,r:0,a:0}],spOrders=[],spSales=[];
+var spP=[],spC=[],spI=[{pk:\'\',pn:\'\',q:1,r:0,a:0}],spOrders=[],spSales=[],spPayments=[];
 var SP_ID=\'${escapeHtml(spId)}\';
 var SP_NAME=\'${escapeHtml(spName)}\';
 var SP_CODE=\'${escapeHtml(spCode)}\';
@@ -1403,9 +1497,11 @@ window.switchSPTab=function(t){
   window.scrollTo(0,0);
 };
 (async function(){
-  var d=await Promise.all([loadList(\'product:\'),loadList(\'party:\'),loadList(\'order:\'),loadList(\'sale:\')]);
+  var d=await Promise.all([loadList(\'product:\'),loadList(\'party:\'),loadList(\'order:\'),loadList(\'sale:\'),loadList(\'payment:\')]);
   spP=d[0]||[];spC=(d[1]||[]).filter(function(p){return p.type===\'customer\';});spOrders=(d[2]||[]).filter(function(o){return o.spId===SP_ID||o.salespersonName===SP_NAME;});
   spSales=(d[3]||[]).filter(function(s){return s.salespersonId===SP_ID||s.salespersonName===SP_NAME;});
+  var allPayments=(d[4]||[]);
+  spPayments=allPayments.filter(function(p){return spC.some(function(c){return c.name===p.party});});
   // Filter customers: only show tagged to this salesperson
   spC=spC.filter(function(c){return c.salespersonId===SP_ID||c.salespersonName===SP_NAME;});
   document.getElementById(\'spCust\').innerHTML=\'<option value="">Select Customer</option>\'+spC.map(function(c){return\'<option value="\'+c._key+\'">\'+c.name+\'</option>\';}).join(\'\');
@@ -1469,7 +1565,7 @@ window.viewSPOrd=function(idx){
   var badge=o.status===\'pending\'?\'badge-warning\':o.status===\'approved\'?\'badge-success\':o.status===\'denied\'?\'badge-danger\':\'badge-info\';
   var html=\'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px"><div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700">Order Number</div><div style="font-size:18px;font-weight:800">\'+o.orderNo+\'</div></div><span class="badge \'+badge+\'" style="font-size:12px;padding:5px 12px">\'+(o.status||\'pending\')+\'</span></div>\';
   html+=\'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px"><div style="background:var(--bg);padding:10px 12px;border-radius:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Date</div><div style="font-weight:600;font-size:14px">\'+o.date+\'</div></div><div style="background:var(--bg);padding:10px 12px;border-radius:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700">Customer</div><div style="font-weight:600;font-size:14px">\'+o.customerName+\'</div></div></div>\';
-  if(o.convertedInvoice){html+=\'<div style="background:var(--accent-light);padding:8px 12px;border-radius:8px;margin-bottom:12px;font-size:12px"><b>Converted to Invoice:</b> <span style="color:var(--accent);font-weight:700;cursor:pointer;text-decoration:underline" onclick="alert(&#39;Invoice: \'+o.convertedInvoice+\'&#39;)">\'+o.convertedInvoice+\'</span></div>\';}
+  if(o.convertedInvoice){html+=\'<div style="background:var(--accent-light);padding:8px 12px;border-radius:8px;margin-bottom:12px;font-size:12px"><b>Converted to Invoice:</b> <span style="color:var(--accent);font-weight:700;cursor:pointer;text-decoration:underline" onclick="spPreviewDoc(&#39;sale&#39;, \\\'\'+o.convertedInvoice+\'\\\')">\'+o.convertedInvoice+\'</span></div>\';}
   html+=\'<div style="font-size:11px;font-weight:700;margin-bottom:8px;text-transform:uppercase;color:var(--muted);letter-spacing:.5px">Items (\'+((o.items||[]).length)+\')</div>\';
   html+=\'<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="background:var(--bg)"><th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">#</th><th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Product</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Qty</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Rate</th><th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:700">Amount</th></tr></thead><tbody>\';
   (o.items||[]).forEach(function(it,i){html+=\'<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 10px">\'+(i+1)+\'</td><td style="padding:8px 10px;font-weight:600">\'+it.productName+\'</td><td style="padding:8px 10px;text-align:right">\'+it.qty+\'</td><td style="padding:8px 10px;text-align:right">\'+fmt(it.rate)+\'</td><td style="padding:8px 10px;text-align:right;font-weight:700">\'+fmt(it.amount||it.qty*it.rate)+\'</td></tr>\';});
@@ -1532,6 +1628,15 @@ window.renderSPReport=function(){
     var custOut=spC.map(function(c){var cs=spSales.filter(function(s){return s.customerId===c._key;});var totalS=cs.reduce(function(a,s){return a+(s.total||0);},0);var totalP=cs.reduce(function(a,s){return a+(s.paid||0);},0);return{name:c.name,phone:c.phone||\'\',sales:totalS,paid:totalP,out:Math.max(0,totalS-totalP)};}).filter(function(x){return x.sales>0;}).sort(function(a,b){return b.out-a.out;});
     body=custOut.map(function(r){tOS+=r.sales;tOP+=r.paid;return\'<tr><td>\'+idx6++ +\'</td><td class="bold">\'+r.name+\'</td><td class="text-muted">\'+r.phone+\'</td><td class="r">\'+fmt(r.sales)+\'</td><td class="r text-success">\'+fmt(r.paid)+\'</td><td class="r \'+(r.out>0?\'text-danger bold\':\'\')+\'">\'+fmt(r.out)+\'</td></tr>\';}).join(\'\');
     foot=\'<tr style="background:var(--bg);font-weight:800"><td colspan="3">TOTAL</td><td class="r">\'+fmt(tOS)+\'</td><td class="r">\'+fmt(tOP)+\'</td><td class="r text-danger">\'+fmt(tOS-tOP)+\'</td></tr>\';
+  }else if(type==='performance'){
+    head='<tr><th>Metric</th><th class="r">Value</th></tr>';
+    var ttlInvs = filtered.length;
+    var ttlRev = filtered.reduce(function(a,s){return a+(s.total||0)},0);
+    var ttlPaid = filtered.reduce(function(a,s){return a+(s.paid||0)},0);
+    var avgValue = ttlInvs ? ttlRev / ttlInvs : 0;
+    var ttlItems = 0; filtered.forEach(function(s){ (s.items||[]).forEach(function(it){ ttlItems += it.qty; }); });
+    body='<tr><td>Total Invoices</td><td class="r bold">'+ttlInvs+'</td></tr><tr><td>Total Revenue</td><td class="r text-primary bold">'+fmt(ttlRev)+'</td></tr><tr><td>Total Collected</td><td class="r text-success bold">'+fmt(ttlPaid)+'</td></tr><tr><td style="border-top:1px dashed var(--border)">Avg Invoice Value</td><td class="r" style="border-top:1px dashed var(--border)">'+fmt(avgValue)+'</td></tr><tr><td>Total Units Sold</td><td class="r">'+fmt(ttlItems)+'</td></tr>';
+    foot='';
   }
   document.getElementById(\'spRptHead\').innerHTML=head;
   document.getElementById(\'spRptBody\').innerHTML=body||\'<tr><td colspan="7" class="empty">No sales data for selected period</td></tr>\';
@@ -1546,11 +1651,59 @@ window.renderSPCustList=function(){
     return{c:c,totalS:totalS,out:out};
   });
   /* Desktop table */
-  var rows=custData.map(function(d){return\'<tr><td class="bold">\'+d.c.name+\'</td><td class="text-muted">\'+(d.c.phone||\'\')+\'</td><td class="text-muted">\'+(d.c.address||\'\')+\'</td><td class="r">\'+fmt(d.totalS)+\'</td><td class="r \'+(d.out>0?\'text-danger bold\':\'\')+\'">\'+fmt(d.out)+\'</td></tr>\';}).join(\'\');
-  document.getElementById(\'spCustListBody\').innerHTML=rows||\'<tr><td colspan="5" class="empty">No tagged customers</td></tr>\';
+  var rows=custData.map(function(d){return'<tr><td class="bold">'+d.c.name+'</td><td class="text-muted">'+(d.c.phone||'')+'</td><td class="text-muted">'+(d.c.address||'')+'</td><td class="r">'+fmt(d.totalS)+'</td><td class="r '+(d.out>0?'text-danger bold':'')+'">'+fmt(d.out)+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="openCustomerStatement(&#39;'+d.c._key+'&#39;)">Statement</button></td></tr>';}).join('');
+  document.getElementById('spCustListBody').innerHTML=rows||'<tr><td colspan="6" class="empty">No tagged customers</td></tr>';
   /* Mobile cards */
-  var cardsEl=document.getElementById(\'spCustCards\');
-  if(cardsEl){cardsEl.innerHTML=!custData.length?\'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No tagged customers</div>\':custData.map(function(d){return\'<div class="sp-cust-card"><div class="sp-cc-name">\'+d.c.name+\'</div><div class="sp-cc-info">\'+(d.c.phone?\'<span class="material-symbols-outlined" style="font-size:12px;vertical-align:middle">phone</span> \'+d.c.phone:\'\')+(d.c.address?\' &bull; \'+d.c.address:\'\')+\'</div><div class="sp-cc-stats"><div class="sp-cc-stat"><div class="label">Total Sales</div><div class="value">\'+fmt(d.totalS)+\'</div></div><div class="sp-cc-stat"><div class="label">Outstanding</div><div class="value \'+(d.out>0?\'text-danger\':\'text-success\')+\'">\'+fmt(d.out)+\'</div></div></div></div>\';}).join(\'\');}
+  var cardsEl=document.getElementById('spCustCards');
+  if(cardsEl){
+    cardsEl.style.display='grid';
+    cardsEl.innerHTML=!custData.length?'<div class="card" style="text-align:center;color:var(--muted);padding:32px">No tagged customers</div>':custData.map(function(d){return'<div class="sp-cust-card"><div class="sp-cc-name">'+d.c.name+'</div><div class="sp-cc-info">'+(d.c.phone?'<span class="material-symbols-outlined" style="font-size:12px;vertical-align:middle">phone</span> '+d.c.phone:'')+(d.c.address?' &bull; '+d.c.address:'')+'</div><div class="sp-cc-stats"><div class="sp-cc-stat"><div class="label">Total Sales</div><div class="value">'+fmt(d.totalS)+'</div></div><div class="sp-cc-stat"><div class="label">Outstanding</div><div class="value '+(d.out>0?'text-danger':'text-success')+'">'+fmt(d.out)+'</div></div></div><div style="margin-top:10px;text-align:right"><button class="btn btn-outline btn-sm" onclick="openCustomerStatement(&#39;'+d.c._key+'&#39;)">Statement</button></div></div>';}).join('');
+  }
+};
+window.openCustomerStatement=function(cid){
+  var cust=spC.find(function(c){return c._key===cid});
+  if(!cust)return;
+  document.getElementById('spStmtTitle').textContent='Statement: '+cust.name;
+  var ledg=[];
+  if(cust.openingBalance){
+    ledg.push({date:'',type:'Opening Balance',ref:'',dr:cust.openingBalance>0?cust.openingBalance:0,cr:cust.openingBalance<0?Math.abs(cust.openingBalance):0});
+  }
+  spSales.filter(function(s){return s.customerId===cid}).forEach(function(s){
+    ledg.push({date:s.date,type:'Invoice',ref:s.invoiceNo,docType:'sale',dr:(s.total||0),cr:0});
+  });
+  spPayments.filter(function(p){return p.party===cust.name&&p.status==='done'&&!p._autoInvoice&&!(p.billKeys&&p.billKeys.length)}).forEach(function(p){
+    ledg.push({date:p.date,type:p.type==='receipt'?'Payment Rcvd':'Refund/Payment',ref:p.no,docType:p.type,dr:p.type==='payment'?(p.amount||0):0,cr:p.type==='receipt'?(p.amount||0):0});
+  });
+  ledg.sort(function(a,b){return(a.date||'').localeCompare(b.date||'')});
+  var bal=0;
+  var trs=ledg.map(function(l){
+    bal+=(l.dr-l.cr);
+    var refLink = l.ref ? (l.docType ? '<span class="doc-link" style="color:var(--primary);text-decoration:underline;cursor:pointer" onclick="spPreviewDoc(\\''+l.docType+'\\',\\''+l.ref+'\\')">'+l.ref+'</span>' : l.ref) : '';
+    return '<tr><td>'+(l.date||'-')+'</td><td>'+l.type+'</td><td>'+refLink+'</td><td class="r">'+(l.dr?fmt(l.dr):'')+'</td><td class="r">'+(l.cr?fmt(l.cr):'')+'</td><td class="r bold '+(bal>0?'text-danger':bal<0?'text-success':'')+'">'+fmt(Math.abs(bal))+(bal>0?' Dr':bal<0?' Cr':'')+'</td></tr>';
+  }).join('');
+  if(!ledg.length)trs='<tr><td colspan="6" class="empty">No transactions</td></tr>';
+  document.getElementById('spStmtBody').innerHTML=trs;
+  document.getElementById('spStatementModal').classList.add('open');
+};
+window.customConfirm = function(message) {
+  return new Promise(function(resolve) {
+    document.getElementById('confirmMsg').innerText = message;
+    var btn = document.getElementById('confirmActionBtn');
+    var clone = btn.cloneNode(true);
+    btn.parentNode.replaceChild(clone, btn);
+    clone.addEventListener('click', function() {
+      var el=document.getElementById('confirmModal');if(el)el.classList.remove('open');
+      resolve(true);
+    });
+    var cBtn = document.getElementById('confirmCancelBtn');
+    var cClone = cBtn.cloneNode(true);
+    cBtn.parentNode.replaceChild(cClone, cBtn);
+    cClone.addEventListener('click', function() {
+      var el=document.getElementById('confirmModal');if(el)el.classList.remove('open');
+      resolve(false);
+    });
+    var el=document.getElementById('confirmModal');if(el)el.classList.add('open');
+  });
 };
 window.submitOrd=async function(){
   var ck=document.getElementById(\'spCust\').value;
@@ -1560,16 +1713,54 @@ window.submitOrd=async function(){
   if(!v.length)return alert(\'Add items\');
   // Warn about zero-stock items (SP can still place order but warned)
   var zeroStockItems=v.filter(function(i){var p=spP.find(function(x){return x._key===i.pk;});return p&&(p.stock||0)<=0;}).map(function(i){return i.pn;});
-  if(zeroStockItems.length){if(!confirm(\'Warning: The following items have 0 stock and may not be fulfilled:\\n\'+zeroStockItems.join(\', \')+\'\\n\\nProceed anyway?\'))return;}
+  if(zeroStockItems.length){if(!(await customConfirm(\'Warning: The following items have 0 stock and may not be fulfilled:\\n\'+zeroStockItems.join(\', \')+\'\\n\\nProceed anyway?\')))return;}
   var t=v.reduce(function(s,i){return s+i.a;},0);
   var ord={date:document.getElementById(\'spDate\').value,orderNo:txnNo(\'ORD\'),customerId:c._key,customerName:c.name,spId:SP_ID,spName:SP_NAME,spCode:SP_CODE,items:v.map(function(i){return{productKey:i.pk,productName:i.pn,qty:i.q,rate:i.r,amount:i.a};}),total:t,status:\'pending\'};
   await saveItem(\'order:\',ord);
   spOrders.unshift(ord);
-  alert(\'Order submitted successfully: \'+ord.orderNo);
+  alert('Order submitted successfully: '+ord.orderNo);
   spI=[{pk:\'\',pn:\'\',q:1,r:0,a:0}];
   renderSI();switchSPTab(\'orders\');
 };
-</script></body></html>`;
+window.spPreviewDoc=function(type,ref){
+  var body = '';
+  if(type==='sale'){
+    var s = spSales.find(function(x){return x.invoiceNo===ref});
+    if(!s)return alert('Not found');
+    body = '<div style="font-size:12px;max-width:500px;margin:0 auto"><b>Invoice:</b> '+s.invoiceNo+'<br><b>Date:</b> '+s.date+'<br><b>Customer:</b> '+s.customerName+'<hr><table class="tbl" style="margin-top:10px"><thead><tr><th>Item</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Amt</th></tr></thead><tbody>'+(s.items||[]).map(function(it){return '<tr><td>'+it.productName+'</td><td class="r">'+it.qty+'</td><td class="r">'+fmt(it.rate)+'</td><td class="r bold">'+fmt(it.amount||it.qty*it.rate)+'</td></tr>'}).join('')+'</tbody></table><div style="text-align:right;margin-top:10px;font-size:14px"><b>Total: '+fmt(s.total)+'</b><br><span style="color:var(--success);font-size:12px;font-weight:bold">Paid: '+fmt(s.paid)+'</span></div></div>';
+  } else if(type==='receipt'||type==='payment'){
+    var p = spPayments.find(function(x){return x.no===ref});
+    if(!p)return alert('Not found');
+    body = '<div style="font-size:13px;max-width:400px;margin:0 auto;text-align:center;line-height:2"><b>Voucher:</b> '+p.no+'<br><b>Date:</b> '+p.date+'<br><b>Party:</b> '+p.party+'<br><b>Method:</b> '+(p.method||'').toUpperCase()+(p.bankName?\' (\'+p.bankName+\')\':\'\')+'<br><br><b style="font-size:20px">Amount: '+fmt(p.amount)+'</b></div>';
+  }
+  document.getElementById('spPreviewContent').innerHTML=body;
+  document.getElementById('spPreviewModal').classList.add('open');
+};
+window.closeModal=function(id){
+  var m=document.getElementById(id);if(m)m.classList.remove('open');
+};
+window.printContent=function(id,title){
+  var el=document.getElementById(id);if(!el)return;
+  var win=window.open('','_blank');
+  win.document.write('<html><head><title>'+title+'</title><style>body{font-family:sans-serif;font-size:12px}table{width:100%;border-collapse:collapse;margin:10px 0}th,td{border:1px solid #ddd;padding:6px;text-align:left}.r{text-align:right}.empty{text-align:center;padding:20px;color:#666}</style></head><body><h2 style="text-align:center;border-bottom:2px solid #333;padding-bottom:10px">'+title+'</h2>'+el.innerHTML+'</body></html>');
+  win.document.close();setTimeout(function(){win.print();win.close();},300);
+};
+</script>
+<div class="modal-overlay" id="spPreviewModal" style="z-index:99990"><div class="modal" style="max-width:600px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0">Document Preview</h3><div style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('spPreviewContent','Document Preview')">Print</button><button class="btn btn-outline btn-sm" onclick="closeModal('spPreviewModal')">Close</button></div></div>
+<div id="spPreviewContent" style="padding:10px;background:var(--bg);border-radius:8px"></div>
+</div></div>
+<div class="modal-overlay" id="confirmModal" style="z-index:99999">
+  <div class="modal">
+    <h3 style="margin-bottom:12px;color:var(--danger)"><span class="material-symbols-outlined" style="vertical-align:middle;margin-right:8px;font-size:24px">warning</span>Confirm Action</h3>
+    <div id="confirmMsg" style="font-size:14px;color:var(--text);margin-bottom:20px;white-space:pre-wrap"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button class="btn btn-outline" id="confirmCancelBtn">Cancel</button>
+      <button class="btn btn-danger" id="confirmActionBtn">Confirm</button>
+    </div>
+  </div>
+</div>
+</body></html>`;
 }
 
 function dashboardPage(){var t=new Date().toISOString().slice(0,10);var ym=t.slice(0,7);return `
@@ -1613,7 +1804,7 @@ var cashInHand=salePaidCash+cashReceipts-purPaidCash-cashPayouts-cashExpenses2+t
 document.getElementById('stats').innerHTML=[{l:'Sales',v:fmt(totalSales),c:'var(--accent)'},{l:'Purchases',v:fmt(totalPurchases),c:'var(--primary)'},{l:'Expenses',v:fmt(totalExpenses),c:'var(--warning)'},{l:'Cash in Hand',v:fmt(cashInHand),c:cashInHand>=0?'var(--accent)':'var(--danger)'},{l:'Bank Balance',v:fmt(bankBal),c:'var(--primary)'},{l:'Receivables',v:fmt(receivables),c:'var(--info)'},{l:'Payables',v:fmt(payables),c:'var(--danger)'},{l:'Products',v:products.length,c:'var(--primary)'},{l:'Pending Orders',v:orders.filter(function(o){return o.status==='pending'}).length,c:'var(--warning)'}].map(function(s){return'<div class="stat"><div class="label">'+s.l+'</div><div class="value" style="color:'+s.c+'">'+s.v+'</div></div>'}).join('');
 var rS=sales.slice().sort(function(a,b){return(b.date||'').localeCompare(a.date||'')}).slice(0,5);document.getElementById('recentSales').innerHTML=rS.length?'<table class="tbl"><thead><tr><th>Date</th><th>Invoice</th><th>Customer</th><th class="r">Total</th></tr></thead><tbody>'+rS.map(function(s){return'<tr><td>'+s.date+'</td><td><span class="doc-link" onclick="previewDoc(&#39;sale&#39;,&#39;'+s._key+'&#39;)">'+s.invoiceNo+'</span></td><td>'+s.customerName+'</td><td class="r bold">'+fmt(s.total)+'</td></tr>'}).join('')+'</tbody></table>':'<div class="empty">No sales</div>';
 var rP=purchases.slice().sort(function(a,b){return(b.date||'').localeCompare(a.date||'')}).slice(0,5);document.getElementById('recentPurchases').innerHTML=rP.length?'<table class="tbl"><thead><tr><th>Date</th><th>#</th><th>Supplier</th><th class="r">Total</th></tr></thead><tbody>'+rP.map(function(p){return'<tr><td>'+p.date+'</td><td><span class="doc-link" onclick="previewDoc(&#39;purchase&#39;,&#39;'+p._key+'&#39;)">'+p.purchaseNo+'</span></td><td>'+p.supplierName+'</td><td class="r bold">'+fmt(p.total)+'</td></tr>'}).join('')+'</tbody></table>':'<div class="empty">No purchases</div>';
-var ls=products.filter(function(p){return(p.stock||0)<=5}).sort(function(a,b){return(a.stock||0)-(b.stock||0)}).slice(0,8);document.getElementById('lowStockAlerts').innerHTML=ls.length?'<table class="tbl"><thead><tr><th>Product</th><th class="r">Stock</th></tr></thead><tbody>'+ls.map(function(p){return'<tr><td>'+p.name+'</td><td class="r bold '+(p.stock<=0?'text-danger':'text-warning')+'">'+p.stock+'</td></tr>'}).join('')+'</tbody></table>':'<div class="empty">All OK</div>';
+var ls=products.filter(function(p){return(p.stock||0)<=(p.threshold!==undefined?p.threshold:5)}).sort(function(a,b){return(a.stock||0)-(b.stock||0)}).slice(0,8);document.getElementById('lowStockAlerts').innerHTML=ls.length?'<table class="tbl"><thead><tr><th>Product</th><th class="r">Stock</th></tr></thead><tbody>'+ls.map(function(p){return'<tr><td>'+p.name+'</td><td class="r bold '+(p.stock<=0?'text-danger':'text-warning')+'">'+p.stock+'</td></tr>'}).join('')+'</tbody></table>':'<div class="empty">All OK</div>';
 var po=allOrders.filter(function(o){return o.status==='pending'}).slice(0,5);document.getElementById('pendingOrders').innerHTML=po.length?'<table class="tbl"><thead><tr><th>Order#</th><th>Customer</th><th class="r">Total</th></tr></thead><tbody>'+po.map(function(o){return'<tr><td>'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="r bold">'+fmt(o.total)+'</td></tr>'}).join('')+'</tbody></table>':'<div class="empty">None</div>'};
 </script>`}
 
@@ -1621,7 +1812,7 @@ function inventoryPage(){return `
 <div class="page-header"><div><div class="page-title">Inventory</div><div class="page-sub">Products & stock (Group & Brand wise)</div></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline" onclick="openImportProd()"><span class="material-symbols-outlined" style="font-size:16px">upload_file</span> Import Excel</button><button class="btn btn-outline" onclick="openGroupMgr()"><span class="material-symbols-outlined" style="font-size:16px">folder</span> Manage Groups</button><button class="btn btn-outline" onclick="openBrandMgr()"><span class="material-symbols-outlined" style="font-size:16px">label</span> Manage Brands</button><button class="btn btn-primary" onclick="openAddP()"><span class="material-symbols-outlined" style="font-size:16px">add</span> Add Product</button></div></div>
 <div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="form-row" style="margin-bottom:14px;align-items:end;gap:8px;flex-wrap:wrap"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search..." oninput="filterP(this.value)" id="pSearch"></div><div><label>Group</label><select id="pGroupFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="pBrandFilter" onchange="filterP(document.getElementById('pSearch').value)"><option value="">All Brands</option></select></div></div></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Group</th><th>Brand</th><th>SKU</th><th class="r">Buy</th><th class="r">Sell</th><th class="r">Stock</th><th class="r">Act</th></tr></thead><tbody id="pBody"></tbody></table></div></div>
-<div class="modal-overlay" id="addProduct"><div class="modal"><h3 id="pTitle">Add Product</h3><input type="hidden" id="editPK"><div class="form-group"><label>Name</label><input id="pN" placeholder="Name"></div><div class="form-row"><div><label>Group</label><select id="pG"><option value="">No Group</option></select></div><div><label>Brand</label><select id="pBr"><option value="">No Brand</option></select></div></div><div class="form-row"><div><label>SKU</label><input id="pS" placeholder="Auto"></div><div><label>Unit</label><input id="pU" value="pcs"></div></div><div class="form-row"><div><label>Stock</label><input type="number" id="pSt" placeholder="0"></div><div><label>Purchase Price</label><input type="number" id="pB" placeholder="0"></div></div><div class="form-row"><div><label>Sale Price</label><input type="number" id="pSl" placeholder="0"></div><div></div></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('addProduct')">Cancel</button><button class="btn btn-primary" onclick="saveP()">Save</button></div></div></div>
+<div class="modal-overlay" id="addProduct"><div class="modal"><h3 id="pTitle">Add Product</h3><input type="hidden" id="editPK"><div class="form-group"><label>Name</label><input id="pN" placeholder="Name"></div><div class="form-row"><div><label>Group</label><select id="pG"><option value="">No Group</option></select></div><div><label>Brand</label><select id="pBr"><option value="">No Brand</option></select></div></div><div class="form-row"><div><label>SKU</label><input id="pS" placeholder="Auto"></div><div><label>Unit</label><input id="pU" value="pcs"></div></div><div class="form-row"><div><label>Stock</label><input type="number" id="pSt" placeholder="0"></div><div><label>Purchase Price</label><input type="number" id="pB" placeholder="0"></div></div><div class="form-row"><div><label>Sale Price</label><input type="number" id="pSl" placeholder="0"></div><div><label>Low Stock Threshold</label><input type="number" id="pTh" placeholder="5"></div></div><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px"><button class="btn btn-outline" onclick="closeModal('addProduct')">Cancel</button><button class="btn btn-primary" onclick="saveP()">Save</button></div></div></div>
 <div class="modal-overlay" id="groupMgr"><div class="modal"><h3>Product Groups</h3>
 <div style="display:flex;gap:6px;margin-bottom:12px"><input id="newGroupName" placeholder="New group name"><button class="btn btn-primary" onclick="saveGroup()">Add</button></div>
 <div id="groupList"></div>
@@ -1645,11 +1836,11 @@ function inventoryPage(){return `
 var prods=[],ek=null,prodGroups=[],prodBrands=[],_prodImportRows=[];
 async function loadP(){var d=await Promise.all([loadList('product:'),loadList('prodgroup:'),loadList('prodbrand:')]);prods=d[0];prodGroups=d[1]||[];prodBrands=d[2]||[];updateGroupDropdowns();renderP(prods)}
 function updateGroupDropdowns(){var opts='<option value="">No Group</option>'+prodGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');document.getElementById('pG').innerHTML=opts;document.getElementById('pGroupFilter').innerHTML='<option value="">All Groups</option>'+prodGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');var bOpts='<option value="">No Brand</option>'+prodBrands.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');document.getElementById('pBr').innerHTML=bOpts;document.getElementById('pBrandFilter').innerHTML='<option value="">All Brands</option>'+prodBrands.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('')}
-function renderP(l){document.getElementById('pBody').innerHTML=!l.length?'<tr><td colspan="8" class="empty">No products</td></tr>':l.map(function(p){return'<tr><td class="bold">'+p.name+'</td><td>'+(p.group?'<span class="badge badge-info">'+p.group+'</span>':'-')+'</td><td>'+(p.brand?'<span class="badge badge-success">'+p.brand+'</span>':'-')+'</td><td><span class="badge badge-info">'+(p.sku||'')+'</span></td><td class="r">'+fmt(p.purchasePrice)+'</td><td class="r">'+fmt(p.salePrice)+'</td><td class="r bold '+((p.stock||0)<=0?'text-danger':(p.stock||0)<=5?'text-warning':'')+'">'+fmt(p.stock)+'</td><td class="r"><button class="btn btn-outline btn-sm" onclick="editP(&#39;'+p._key+'&#39;)">E</button> <button class="btn btn-danger btn-sm" onclick="delP(&#39;'+p._key+'&#39;)">D</button></td></tr>'}).join('')}
-window.openAddP=function(){ek=null;document.getElementById('pTitle').textContent='Add Product';['pN','pS','pB','pSl','pSt'].forEach(function(i){document.getElementById(i).value=''});document.getElementById('pU').value='pcs';document.getElementById('pG').value='';document.getElementById('pBr').value='';openModal('addProduct')}
-window.editP=function(k){var p=prods.find(function(x){return x._key===k});if(!p)return;ek=k;document.getElementById('pTitle').textContent='Edit Product';document.getElementById('pN').value=p.name||'';document.getElementById('pS').value=p.sku||'';document.getElementById('pU').value=p.unit||'pcs';document.getElementById('pG').value=p.group||'';document.getElementById('pBr').value=p.brand||'';document.getElementById('pB').value=p.purchasePrice||0;document.getElementById('pSl').value=p.salePrice||0;document.getElementById('pSt').value=p.stock||0;openModal('addProduct')}
-window.saveP=async function(){var n=document.getElementById('pN').value.trim();if(!n){showToast('Product name is required','warning');return;}var s=document.getElementById('pS').value.trim()||(n.slice(0,3).toUpperCase()+'-'+Math.random().toString(36).slice(2,6).toUpperCase());var d={name:n,sku:s,group:document.getElementById('pG').value,brand:document.getElementById('pBr').value,unit:document.getElementById('pU').value||'pcs',purchasePrice:+document.getElementById('pB').value||0,salePrice:+document.getElementById('pSl').value||0,stock:+document.getElementById('pSt').value||0};try{if(ek){await saveByKey(ek,d,'edit','Edited product: '+n);ek=null;showToast('Product updated successfully','success')}else{await saveItem('product:',d,null,'create','Created product: '+n);showToast('Product added successfully','success')}invalidateCache('product:');closeModal('addProduct');loadP()}catch(e){showToast('Failed to save product: '+e.message,'error')}}
-window.delP=async function(k){var p=prods.find(function(x){return x._key===k});if(!confirm('Delete '+(p?p.name:'')+'?'))return;try{await deleteItem(k,false,'Deleted product: '+(p?p.name:''));invalidateCache('product:');showToast('Product deleted successfully','success');loadP()}catch(e){showToast('Failed to delete product','error')}}
+function renderP(l){document.getElementById('pBody').innerHTML=!l.length?'<tr><td colspan="8" class="empty">No products</td></tr>':l.map(function(p){return'<tr><td class="bold">'+p.name+'</td><td>'+(p.group?'<span class="badge badge-info">'+p.group+'</span>':'-')+'</td><td>'+(p.brand?'<span class="badge badge-success">'+p.brand+'</span>':'-')+'</td><td><span class="badge badge-info">'+(p.sku||'')+'</span></td><td class="r">'+fmt(p.purchasePrice)+'</td><td class="r">'+fmt(p.salePrice)+'</td><td class="r bold '+((p.stock||0)<=0?'text-danger':(p.stock||0)<=(p.threshold!==undefined?p.threshold:5)?'text-warning':'')+'">'+fmt(p.stock)+'</td><td class="r"><button class="btn btn-outline btn-sm" onclick="editP(&#39;'+p._key+'&#39;)">E</button> <button class="btn btn-danger btn-sm" onclick="delP(&#39;'+p._key+'&#39;)">D</button></td></tr>'}).join('')}
+window.openAddP=function(){ek=null;document.getElementById('pTitle').textContent='Add Product';['pN','pS','pB','pSl','pSt','pTh'].forEach(function(i){var el=document.getElementById(i);if(el)el.value=''});document.getElementById('pU').value='pcs';document.getElementById('pG').value='';document.getElementById('pBr').value='';openModal('addProduct')}
+window.editP=function(k){var p=prods.find(function(x){return x._key===k});if(!p)return;ek=k;document.getElementById('pTitle').textContent='Edit Product';document.getElementById('pN').value=p.name||'';document.getElementById('pS').value=p.sku||'';document.getElementById('pU').value=p.unit||'pcs';document.getElementById('pG').value=p.group||'';document.getElementById('pBr').value=p.brand||'';document.getElementById('pB').value=p.purchasePrice||0;document.getElementById('pSl').value=p.salePrice||0;document.getElementById('pSt').value=p.stock||0;var th=document.getElementById('pTh');if(th)th.value=p.threshold!==undefined?p.threshold:5;openModal('addProduct')}
+window.saveP=async function(){var n=document.getElementById('pN').value.trim();if(!n){showToast('Product name is required','warning');return;}var s=document.getElementById('pS').value.trim()||(n.slice(0,3).toUpperCase()+'-'+Math.random().toString(36).slice(2,6).toUpperCase());var thEl=document.getElementById('pTh');var thVal=thEl&&thEl.value!==''?+thEl.value:5;var d={name:n,sku:s,group:document.getElementById('pG').value,brand:document.getElementById('pBr').value,unit:document.getElementById('pU').value||'pcs',purchasePrice:+document.getElementById('pB').value||0,salePrice:+document.getElementById('pSl').value||0,stock:+document.getElementById('pSt').value||0,threshold:thVal};try{if(ek){await saveByKey(ek,d,'edit','Edited product: '+n);ek=null;showToast('Product updated successfully','success')}else{await saveItem('product:',d,null,'create','Created product: '+n);showToast('Product added successfully','success')}invalidateCache('product:');closeModal('addProduct');loadP()}catch(e){showToast('Failed to save product: '+e.message,'error')}}
+window.delP=async function(k){var p=prods.find(function(x){return x._key===k});if(!(await customConfirm('Delete '+(p?p.name:'')+'?')))return;try{await deleteItem(k,false,'Deleted product: '+(p?p.name:''));invalidateCache('product:');showToast('Product deleted successfully','success');loadP()}catch(e){showToast('Failed to delete product','error')}}
 window.filterP=function(q){var t=normalize(q);var gf=document.getElementById('pGroupFilter').value;var bf=document.getElementById('pBrandFilter').value;renderP(prods.filter(function(p){return(!gf||p.group===gf)&&(!bf||p.brand===bf)&&(normalize(p.name).includes(t)||normalize(p.sku).includes(t)||normalize(p.group).includes(t)||normalize(p.brand||'').includes(t))}))}
 window.openGroupMgr=function(){document.getElementById('newGroupName').value='';var html=prodGroups.map(function(g){return'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)"><span>'+g.name+'</span><button class="btn btn-danger btn-xs" onclick="delGroup(&#39;'+g._key+'&#39;)">Del</button></div>'}).join('');document.getElementById('groupList').innerHTML=html||'<div class="empty">No groups</div>';openModal('groupMgr')}
 window.saveGroup=async function(){var n=document.getElementById('newGroupName').value.trim();if(!n)return;await saveItem('prodgroup:',{name:n});loadP();setTimeout(openGroupMgr,300)}
@@ -1778,8 +1969,8 @@ loadPa();
 
 
 function purchasesPage(){return `
-<div class="page-header"><div><div class="page-title">Purchases</div><div class="page-sub">Purchase products from suppliers</div></div><button class="btn btn-primary" onclick="openPurchase()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Purchase</button></div>
-<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search purchases..." oninput="filterPur()" id="purSearch"></div><div><label>Supplier</label><select id="purSupF" onchange="filterPur()" style="font-size:12px"><option value="">All Suppliers</option></select></div><div><label>From</label><input type="date" id="purFromF" onchange="filterPur()"></div><div><label>To</label><input type="date" id="purToF" onchange="filterPur()"></div><div><label>Group</label><select id="purGroupF" onchange="filterPur()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="purBrandF" onchange="filterPur()" style="font-size:12px"><option value="">All Brands</option></select></div></div></div></div>
+<div class="page-header" style="flex-wrap:wrap; gap:12px; align-items:center;"><div><div class="page-title">Purchases</div><div class="page-sub">Purchase products from suppliers</div></div><div class="search-wrap" style="flex:1; min-width:250px; margin-bottom:0;"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search by supplier or purchase#..." oninput="filterPur()" id="purSearch"></div><button class="btn btn-primary" onclick="openPurchase()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Purchase</button></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div><label>Supplier</label><select id="purSupF" onchange="filterPur()" style="font-size:12px"><option value="">All Suppliers</option></select></div><div><label>From</label><input type="date" id="purFromF" onchange="filterPur()"></div><div><label>To</label><input type="date" id="purToF" onchange="filterPur()"></div><div><label>Group</label><select id="purGroupF" onchange="filterPur()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="purBrandF" onchange="filterPur()" style="font-size:12px"><option value="">All Brands</option></select></div></div></div></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="purTable"><thead><tr><th>Date</th><th>Purchase#</th><th>Supplier</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th class="r">Act</th></tr></thead><tbody id="purBody"></tbody></table></div></div>
 <div class="modal-overlay" id="purModal"><div class="modal modal-lg"><h3 id="purTitle">New Purchase</h3>
 <input type="hidden" id="purEK">
@@ -1796,7 +1987,7 @@ function purchasesPage(){return `
 <div class="form-row"><div><label>Total</label><input id="purTotal" readonly class="bold"></div><div><label>Paid</label><input type="number" id="purPaid" value="0" oninput="purSplitSync()"></div></div>
 <div class="section-title" style="margin-top:8px">Payment Method(s)</div>
 <div class="form-row"><div><label>Cash Amount</label><input type="number" id="purCashAmt" value="0" oninput="purSplitSync()" placeholder="0"></div><div><label>Bank Amount</label><input type="number" id="purBankAmt" value="0" oninput="purSplitSync()" placeholder="0"></div></div>
-<div id="purBankMethodDiv" class="hidden"><div class="form-row"><div><label>Bank Method</label><select id="purMethod" onchange="togglePurBank()"><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div></div></div>
+<div id="purBankMethodDiv" class="hidden"><div class="form-row"><div><label>Bank Method</label><select id="purMethod" onchange="togglePurBank()"><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option><option value="other">Other (Specify)</option></select></div><div id="purMethodOtherDiv" class="hidden"><label>Specify Method</label><input id="purMethodOther" placeholder="Method name"></div></div></div>
 <div class="form-row" id="purBankRow" class="hidden"><div><label>Bank</label><select id="purBank"><option value="">Select Bank...</option></select></div><div id="purChequeDiv" class="hidden"><label>Cheque No</label><input id="purCheque"></div></div>
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal('purModal')">Cancel</button><button class="btn btn-primary" onclick="savePur()">Save Purchase</button></div>
 </div></div>
@@ -1822,8 +2013,8 @@ window.purQty=function(i,el){window._purItems[i].qty=+el.value||0;window._purIte
 window.purRate=function(i,el){window._purItems[i].rate=+el.value||0;window._purItems[i].amt=window._purItems[i].qty*window._purItems[i].rate;renderPurItems()}
 window.calcPur=function(){var sub=window._purItems.reduce(function(s,x){return s+x.amt},0);var disc=+document.getElementById('purDisc').value||0;var extra=+document.getElementById('purExtra').value||0;var base=sub-disc+extra;var vt=document.getElementById('purVatType').value;var vv=+document.getElementById('purVat').value||0;var vatAmt=vt==='percent'?base*vv/100:vv;document.getElementById('purTotal').value=fmt(base+vatAmt);
 var cParts=[];if(disc>0)cParts.push('Disc: '+fmt(disc));if(extra>0)cParts.push('Extra: '+fmt(extra));if(vatAmt>0)cParts.push('VAT: '+fmt(vatAmt));var cSumEl=document.getElementById('purChargesSummary');if(cSumEl)cSumEl.textContent=cParts.length?'('+cParts.join(' | ')+')':''}
-window.savePur=async function(){var ek=document.getElementById('purEK').value;var sid=document.getElementById('purSupplier').value;if(!sid){showToast('Please select a supplier','warning');return;}var items=window._purItems.filter(function(x){return x.pk});if(!items.length){showToast('Please add at least one item','warning');return;}var sub=items.reduce(function(s,x){return s+x.amt},0);var disc=+document.getElementById('purDisc').value||0;var extra=+document.getElementById('purExtra').value||0;var base=sub-disc+extra;var vt=document.getElementById('purVatType').value;var vv=+document.getElementById('purVat').value||0;var vatAmt=vt==='percent'?base*vv/100:vv;var total=base+vatAmt;var paid=+document.getElementById('purPaid').value||0;var sup=suppliers.find(function(x){return x._key===sid});
-var purCashAmt=+document.getElementById('purCashAmt').value||0;var purBankAmt=+document.getElementById('purBankAmt').value||0;var method=purCashAmt>0&&purBankAmt>0?'split':(purCashAmt>0?'cash':(purBankAmt>0?document.getElementById('purMethod').value:'credit'));var bankMethod=document.getElementById('purMethod').value||'bank_transfer';var bankName=purBankAmt>0?(document.getElementById('purBank').value||''):'';var chequeNo=bankMethod==='cheque'?(document.getElementById('purCheque')?document.getElementById('purCheque').value:''):'';
+window.savePur=async function(){try{var ek=document.getElementById('purEK').value;var sid=document.getElementById('purSupplier').value;if(!sid){showToast('Please select a supplier','warning');return;}var items=window._purItems.filter(function(x){return x.pk});if(!items.length){showToast('Please add at least one item','warning');return;}for(var i=0;i<items.length;i++){if(items[i].qty<=0){showToast('Quantity must be a positive number for '+items[i].pn,'warning');return;}if(items[i].rate<=0){showToast('Purchase price must be greater than zero for '+items[i].pn,'warning');return;}if(items[i].amt<0){showToast('Amount cannot be negative for '+items[i].pn,'warning');return;}}var sub=items.reduce(function(s,x){return s+x.amt},0);var disc=+document.getElementById('purDisc').value||0;var extra=+document.getElementById('purExtra').value||0;var base=sub-disc+extra;var vt=document.getElementById('purVatType').value;var vv=+document.getElementById('purVat').value||0;var vatAmt=vt==='percent'?base*vv/100:vv;var total=base+vatAmt;var paid=+document.getElementById('purPaid').value||0;var sup=suppliers.find(function(x){return x._key===sid});
+var purCashAmt=+document.getElementById('purCashAmt').value||0;var purBankAmt=+document.getElementById('purBankAmt').value||0;var bankMethod=document.getElementById('purMethod').value||'bank_transfer';if(bankMethod==='other'){var om=document.getElementById('purMethodOther');bankMethod=om?om.value.trim()||'Other':'Other';}var method=purCashAmt>0&&purBankAmt>0?'split':(purCashAmt>0?'cash':(purBankAmt>0?bankMethod:'credit'));var bankName=purBankAmt>0?(document.getElementById('purBank').value||''):'';var chequeNo=bankMethod==='cheque'?(document.getElementById('purCheque')?document.getElementById('purCheque').value:''):'';
 if(paid>0&&!method){showToast('Please select a payment method','warning');return;}
 if(purBankAmt>0&&!document.getElementById('purBank').value){showToast('Please select a bank for bank payment','warning');return;}
 var data={purchaseNo:document.getElementById('purNo').value,date:document.getElementById('purDate').value,supplierId:sid,supplierName:sup?sup.name:'',items:items.map(function(x){return{productId:x.pk,productName:x.pn,qty:x.qty,rate:x.rate,amount:x.amt}}),discount:disc,extra:extra,vat:vv,vatType:vt,total:total,paid:paid,method:method,cashAmount:purCashAmt,bankAmount:purBankAmt,bankMethod:bankMethod,bankName:bankName,chequeNo:chequeNo,createdBy:window.SESSION?.name||window.SESSION?.username||'Admin'};
@@ -1854,16 +2045,20 @@ if(ek){
 }
 invalidateCache('purchase:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');
 showToast(ek?'Purchase updated successfully':'Purchase saved successfully','success');
-closeModal('purModal');loadPur()}
+closeModal('purModal');loadPur()}catch(e){showToast('Failed to save purchase: '+e.message,'error')}}
 window.editPur=function(k){var p=purs.find(function(x){return x._key===k});if(!p)return;document.getElementById('purEK').value=k;document.getElementById('purNo').value=p.purchaseNo;document.getElementById('purDate').value=p.date;document.getElementById('purSupplier').value=p.supplierId;document.getElementById('purDisc').value=p.discount||0;document.getElementById('purExtra').value=p.extra||0;document.getElementById('purVat').value=p.vat||0;document.getElementById('purVatType').value=p.vatType||'amount';document.getElementById('purPaid').value=p.paid||0;
 // Restore split payment fields
 var pCashAmt=p.cashAmount||0;var pBankAmt=p.bankAmount||0;
 if(!pCashAmt&&!pBankAmt&&p.paid>0){if(p.method==='cash'){pCashAmt=p.paid}else if(p.method!=='credit'){pBankAmt=p.paid}}
 document.getElementById('purCashAmt').value=pCashAmt;document.getElementById('purBankAmt').value=pBankAmt;
-document.getElementById('purMethod').value=p.bankMethod||p.method||'bank_transfer';
+var bnkm=p.bankMethod||p.method||'bank_transfer';
+var purMethEl=document.getElementById('purMethod');
+var isCustom=!Array.from(purMethEl.options).find(function(o){return o.value===bnkm})&&bnkm!=='split'&&bnkm!=='cash'&&bnkm!=='credit';
+purMethEl.value=isCustom?'other':bnkm;
+var omEl=document.getElementById('purMethodOther');if(omEl)omEl.value=isCustom?bnkm:'';
 document.getElementById('purBankMethodDiv').classList.toggle('hidden',pBankAmt<=0);document.getElementById('purBankRow').classList.toggle('hidden',pBankAmt<=0);
 togglePurBank();if(p.bankName)document.getElementById('purBank').value=p.bankName;if(p.chequeNo&&document.getElementById('purCheque'))document.getElementById('purCheque').value=p.chequeNo;var pcTgl=document.getElementById('purChargesBody');if(pcTgl){var hasCharges=(p.discount||0)>0||(p.extra||0)>0||(p.vat||0)>0;if(hasCharges){pcTgl.classList.add('open');pcTgl.previousElementSibling.classList.add('open')}else{pcTgl.classList.remove('open');pcTgl.previousElementSibling.classList.remove('open')}}window._purItems=(p.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._purItems.length)window._purItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];document.getElementById('purTitle').textContent='Edit Purchase';renderPurItems();openModal('purModal')}
-window.delPur=async function(k){if(!confirm('Delete purchase? Stock and bank balance will be reversed.'))return;
+window.delPur=async function(k){if(!(await customConfirm('Delete purchase? Stock and bank balance will be reversed.')))return;
 var p=purs.find(function(x){return x._key===k});
 if(p){
   // Reverse stock
@@ -1880,8 +2075,8 @@ loadPur();
 </script>`}
 
 function salesPage(){return `
-<div class="page-header"><div><div class="page-title">Sales</div><div class="page-sub">Manage invoices</div></div><button class="btn btn-primary" onclick="openSale()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Sale</button></div>
-<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div class="search-wrap" style="margin-bottom:0"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search sales..." oninput="filterSal()" id="salSearch"></div><div><label>Customer</label><select id="salCustF" onchange="filterSal()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>SP</label><select id="salSPF" onchange="filterSal()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>From</label><input type="date" id="salFromF" onchange="filterSal()"></div><div><label>To</label><input type="date" id="salToF" onchange="filterSal()"></div><div><label>Group</label><select id="salGroupF" onchange="filterSal()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="salBrandF" onchange="filterSal()" style="font-size:12px"><option value="">All Brands</option></select></div></div></div></div>
+<div class="page-header" style="flex-wrap:wrap; gap:12px; align-items:center;"><div><div class="page-title">Sales</div><div class="page-sub">Manage invoices</div></div><div class="search-wrap" style="flex:1; min-width:250px; margin-bottom:0;"><span class="icon"><span class="material-symbols-outlined" style="font-size:16px">search</span></span><input placeholder="Search by customer or invoice#..." oninput="filterSal()" id="salSearch"></div><button class="btn btn-primary" onclick="openSale()"><span class="material-symbols-outlined" style="font-size:16px">add</span> New Sale</button></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px"><div><label>Customer</label><select id="salCustF" onchange="filterSal()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>SP</label><select id="salSPF" onchange="filterSal()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>From</label><input type="date" id="salFromF" onchange="filterSal()"></div><div><label>To</label><input type="date" id="salToF" onchange="filterSal()"></div><div><label>Group</label><select id="salGroupF" onchange="filterSal()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="salBrandF" onchange="filterSal()" style="font-size:12px"><option value="">All Brands</option></select></div></div></div></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl" id="salTable"><thead><tr><th>Date</th><th>Invoice#</th><th>Customer</th><th>SP</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th class="r">Fare</th><th class="r">Act</th></tr></thead><tbody id="salBody"></tbody></table></div></div>
 <div class="modal-overlay" id="salModal"><div class="modal modal-lg"><h3 id="salTitle">New Sale</h3>
 <input type="hidden" id="salEK">
@@ -1899,7 +2094,7 @@ function salesPage(){return `
 <div class="form-row"><div><label>Total</label><input id="salTotal" readonly class="bold"></div><div><label>Paid</label><input type="number" id="salPaid" value="0" oninput="salSplitSync()"></div></div>
 <div class="section-title" style="margin-top:8px">Payment Method(s)</div>
 <div class="form-row"><div><label>Cash Amount</label><input type="number" id="salCashAmt" value="0" oninput="salSplitSync()" placeholder="0"></div><div><label>Bank Amount</label><input type="number" id="salBankAmt" value="0" oninput="salSplitSync()" placeholder="0"></div></div>
-<div id="salBankDiv" class="hidden"><div class="form-row"><div><label>Bank Method</label><select id="salMethod" onchange="toggleSalBank()"><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div><label>Bank</label><select id="salBank"><option value="">Select Bank...</option></select></div></div></div>
+<div id="salBankDiv" class="hidden"><div class="form-row"><div><label>Bank Method</label><select id="salMethod" onchange="toggleSalBank()"><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option><option value="other">Other (Specify)</option></select></div><div id="salMethodOtherDiv" class="hidden"><label>Specify Method</label><input id="salMethodOther" placeholder="Method name"></div><div><label>Bank</label><select id="salBank"><option value="">Select Bank...</option></select></div></div></div>
 <div class="form-group hidden" id="salChequeDiv"><label>Cheque No</label><input id="salCheque" placeholder="Cheque#"></div>
 <div id="salCreditDiv" class="hidden"><label><input type="checkbox" id="salCreditChk" onchange="salCreditToggle()"> On Credit (no payment)</label></div>
 <div class="form-row"><div class="form-group"><label>Note</label><input id="salNote" placeholder="Sale note / remarks"></div><div class="form-group"><label>Truck Fare (Received from Customer)</label><input type="number" id="salTruckFare" value="0" placeholder="0" step="any" oninput="checkFareExceed()"><div id="fareExceedHint" style="font-size:10px;color:var(--text-muted);margin-top:2px">Counts as Customer Receive + Transportation Expense</div></div></div>
@@ -1908,7 +2103,7 @@ function salesPage(){return `
 <style>.sr-list.open{display:block}</style>
 <script>
 var sals=[],salProds=[],customers=[],spList=[],salBanks=[],_thanaFares=[],salGroups=[],salBrandsL=[];
-window.toggleSalBank=function(){var m=document.getElementById('salMethod').value;document.getElementById('salChequeDiv').classList.toggle('hidden',m!=='cheque')};
+window.toggleSalBank=function(){var m=document.getElementById('salMethod').value;document.getElementById('salChequeDiv').classList.toggle('hidden',m!=='cheque');if(document.getElementById('salMethodOtherDiv'))document.getElementById('salMethodOtherDiv').classList.toggle('hidden',m!=='other');};
 window.salSplitSync=function(){var ca=+document.getElementById('salCashAmt').value||0;var ba=+document.getElementById('salBankAmt').value||0;var creditChk=document.getElementById('salCreditChk');if(creditChk&&creditChk.checked){document.getElementById('salPaid').value=0;document.getElementById('salCashAmt').value=0;document.getElementById('salBankAmt').value=0;return}document.getElementById('salPaid').value=ca+ba;document.getElementById('salBankDiv').classList.toggle('hidden',ba<=0);document.getElementById('salCreditDiv').classList.toggle('hidden',ca>0||ba>0)};
 window.salCreditToggle=function(){var creditChk=document.getElementById('salCreditChk');if(creditChk&&creditChk.checked){document.getElementById('salCashAmt').value=0;document.getElementById('salBankAmt').value=0;document.getElementById('salPaid').value=0;document.getElementById('salBankDiv').classList.add('hidden')}};
 window.onSalCustChange=function(){var cid=document.getElementById('salCust').value;var cust=customers.find(function(x){return x._key===cid});if(cust&&cust.salespersonId){document.getElementById('salSP').value=cust.salespersonId}calcSal();checkFareExceed()};
@@ -1941,14 +2136,16 @@ var cParts=[];if(discAmt>0)cParts.push('Disc: '+fmt(discAmt));if(extra>0)cParts.
 // Sync split payment totals
 var curCash=+document.getElementById('salCashAmt').value||0;var curBank=+document.getElementById('salBankAmt').value||0;var creditChk=document.getElementById('salCreditChk');if(creditChk&&creditChk.checked){document.getElementById('salPaid').value=0}else{document.getElementById('salPaid').value=curCash+curBank}
 var cid=document.getElementById('salCust').value;var cust=customers.find(function(x){return x._key===cid});if(cust&&cust.creditLimit>0){var outstanding=sals.filter(function(x){return x.customerId===cid}).reduce(function(s,x){return s+((x.total||0)-(x.paid||0))},0);if(outstanding+totalVal>cust.creditLimit){document.getElementById('creditWarn').textContent='Credit limit warning: Outstanding '+fmt(outstanding)+' + this sale exceeds limit of '+fmt(cust.creditLimit);document.getElementById('creditWarn').classList.remove('hidden')}else{document.getElementById('creditWarn').classList.add('hidden')}}else{document.getElementById('creditWarn').classList.add('hidden')}}
-window.saveSal=async function(){var ek=document.getElementById('salEK').value;var cid=document.getElementById('salCust').value;if(!cid){showToast('Please select a customer','warning');return;}var items=window._salItems.filter(function(x){return x.pk});if(!items.length){showToast('Please add at least one item','warning');return;}
-var cashAmt=+document.getElementById('salCashAmt').value||0;var bankAmt=+document.getElementById('salBankAmt').value||0;var creditChk=document.getElementById('salCreditChk');var isCredit=creditChk&&creditChk.checked;var paid=isCredit?0:(cashAmt+bankAmt);var method=isCredit?'credit':(cashAmt>0&&bankAmt>0?'split':(cashAmt>0?'cash':(bankAmt>0?document.getElementById('salMethod').value:'credit')));
+window.saveSal=async function(){try{var ek=document.getElementById('salEK').value;var cid=document.getElementById('salCust').value;if(!cid){showToast('Please select a customer','warning');return;}var items=window._salItems.filter(function(x){return x.pk});if(!items.length){showToast('Please add at least one item','warning');return;}for(var i=0;i<items.length;i++){if(items[i].qty<=0){showToast('Quantity must be a positive number for '+items[i].pn,'warning');return;}if(items[i].rate<0){showToast('Rate must be positive for '+items[i].pn,'warning');return;}if(items[i].amt<0){showToast('Amount cannot be negative for '+items[i].pn,'warning');return;}}
+var cashAmt=+document.getElementById('salCashAmt').value||0;var bankAmt=+document.getElementById('salBankAmt').value||0;var creditChk=document.getElementById('salCreditChk');var isCredit=creditChk&&creditChk.checked;var paid=isCredit?0:(cashAmt+bankAmt);
+var bankMethod=document.getElementById('salMethod').value||'bank_transfer';if(bankMethod==='other'){var om=document.getElementById('salMethodOther');bankMethod=om?om.value.trim()||'Other':'Other';}
+var method=isCredit?'credit':(cashAmt>0&&bankAmt>0?'split':(cashAmt>0?'cash':(bankAmt>0?bankMethod:'credit')));
 if(paid>0&&!method){showToast('Please select a payment method','warning');return;}
 if(bankAmt>0&&!document.getElementById('salBank').value){showToast('Please select a bank for bank payment','warning');return;}
 // Stock validation - block if any product has 0 stock (new sale only)
 if(!ek){var stockErrors=[];items.forEach(function(it){var pr=salProds.find(function(x){return x._key===it.pk});if(pr&&(pr.stock||0)<=0){stockErrors.push(pr.name+' (Stock: 0)')}else if(pr&&it.qty>(pr.stock||0)){stockErrors.push(pr.name+' (Available: '+(pr.stock||0)+', Requested: '+it.qty+')')}});if(stockErrors.length){showToast('Cannot create sale - Insufficient stock:\\n'+stockErrors.join(', '),'error');return;}}var sub=items.reduce(function(s,x){return s+x.amt},0);var dt=document.getElementById('salDiscType').value;var dv=+document.getElementById('salDisc').value||0;var discAmt=dt==='percent'?sub*dv/100:dv;var extra=+document.getElementById('salExtra').value||0;var base=sub-discAmt+extra;var vt=document.getElementById('salVatType').value;var vv=+document.getElementById('salVat').value||0;var vatAmt=vt==='percent'?base*vv/100:vv;var at=document.getElementById('salAitType').value;var av=+document.getElementById('salAit').value||0;var aitAmt=at==='percent'?base*av/100:av;var total=base+vatAmt+aitAmt;
 var cust=customers.find(function(x){return x._key===cid});var spId=document.getElementById('salSP').value;var sp=spList.find(function(x){return x._key===spId});
-var bankMethod=document.getElementById('salMethod').value||'bank_transfer';var bankName=bankAmt>0?(document.getElementById('salBank').value||''):'';var chequeNo=bankMethod==='cheque'?(document.getElementById('salCheque')?document.getElementById('salCheque').value:''):'';
+var bankName=bankAmt>0?(document.getElementById('salBank').value||''):'';var chequeNo=bankMethod==='cheque'?(document.getElementById('salCheque')?document.getElementById('salCheque').value:''):'';
 var truckFare=+document.getElementById('salTruckFare').value||0;var custThana=(cust&&cust.thana)||'';var fareExceeded=false;var fareMaxForThana=0;var totalSaleQty=items.reduce(function(s,x){return s+x.qty},0);if(truckFare>0&&custThana){var tfMatch=_thanaFares.find(function(f){return f.thana===custThana});if(tfMatch&&tfMatch.maxFare>0){fareMaxForThana=tfMatch.maxFare;fareExceeded=truckFare>(tfMatch.maxFare*totalSaleQty)}}
 var data={invoiceNo:document.getElementById('salNo').value,date:document.getElementById('salDate').value,customerId:cid,customerName:cust?cust.name:'',salespersonId:spId,salespersonName:sp?sp.name:'',createdBy:window.SESSION?.name||window.SESSION?.username||'Admin',items:items.map(function(x){return{productId:x.pk,productName:x.pn,qty:x.qty,rate:x.rate,amount:x.amt}}),discount:dv,discountType:dt,extra:extra,vat:vv,vatType:vt,ait:av,aitType:at,vatAmount:vatAmt,aitAmount:aitAmt,total:total,paid:paid,method:method,cashAmount:cashAmt,bankAmount:bankAmt,bankMethod:bankMethod,bankName:bankName,chequeNo:chequeNo,note:document.getElementById('salNote').value,truckFare:truckFare,customerThana:custThana,fareExceeded:fareExceeded,fareMaxForThana:fareMaxForThana};
 if(ek){
@@ -1999,17 +2196,21 @@ if(ek){
 }
 invalidateCache('sale:');invalidateCache('product:');invalidateCache('bank:');invalidateCache('payment:');invalidateCache('expense:');
 showToast(ek?'Sale updated successfully':'Sale created: '+data.invoiceNo,'success');
-closeModal('salModal');loadSal()}
+closeModal('salModal');loadSal()}catch(e){showToast('Failed to save sale: '+e.message,'error')}}
 window.editSal=function(k){var s=sals.find(function(x){return x._key===k});if(!s)return;document.getElementById('salEK').value=k;document.getElementById('salNo').value=s.invoiceNo;document.getElementById('salDate').value=s.date;document.getElementById('salCust').value=s.customerId;document.getElementById('salCustSearch').value=s.customerName||'';document.getElementById('salSP').value=s.salespersonId||'';document.getElementById('salDisc').value=s.discount||0;document.getElementById('salDiscType').value=s.discountType||'amount';document.getElementById('salExtra').value=s.extra||0;document.getElementById('salVat').value=s.vat||0;document.getElementById('salVatType').value=s.vatType||'amount';document.getElementById('salAit').value=s.ait||0;document.getElementById('salAitType').value=s.aitType||'amount';document.getElementById('salPaid').value=s.paid||0;document.getElementById('salNote').value=s.note||'';document.getElementById('salTruckFare').value=s.truckFare||0;document.getElementById('salTitle').textContent='Edit Sale';
 // Restore split payment fields
 var sCashAmt=s.cashAmount||0;var sBankAmt=s.bankAmount||0;
 if(!sCashAmt&&!sBankAmt&&s.paid>0){if(s.method==='cash'){sCashAmt=s.paid}else if(s.method!=='credit'){sBankAmt=s.paid}}
 document.getElementById('salCashAmt').value=sCashAmt;document.getElementById('salBankAmt').value=sBankAmt;
-document.getElementById('salMethod').value=s.bankMethod||s.method||'bank_transfer';
+var bnkm=s.bankMethod||s.method||'bank_transfer';
+var salMethEl=document.getElementById('salMethod');
+var isCustom=!Array.from(salMethEl.options).find(function(o){return o.value===bnkm})&&bnkm!=='split'&&bnkm!=='cash'&&bnkm!=='credit';
+salMethEl.value=isCustom?'other':bnkm;
+var omEl=document.getElementById('salMethodOther');if(omEl)omEl.value=isCustom?bnkm:'';
 var creditChk=document.getElementById('salCreditChk');if(creditChk)creditChk.checked=(s.method==='credit');
 document.getElementById('salBankDiv').classList.toggle('hidden',sBankAmt<=0);document.getElementById('salCreditDiv').classList.toggle('hidden',sCashAmt>0||sBankAmt>0);
 toggleSalBank();if(s.bankName)document.getElementById('salBank').value=s.bankName;if(s.chequeNo&&document.getElementById('salCheque'))document.getElementById('salCheque').value=s.chequeNo;var scTgl=document.getElementById('salChargesBody');if(scTgl){var hasCharges=(s.discount||0)>0||(s.extra||0)>0||(s.vat||0)>0||(s.ait||0)>0;if(hasCharges){scTgl.classList.add('open');scTgl.previousElementSibling.classList.add('open')}else{scTgl.classList.remove('open');scTgl.previousElementSibling.classList.remove('open')}}window._salItems=(s.items||[]).map(function(x){return{pk:x.productId,pn:x.productName,qty:x.qty,rate:x.rate,amt:x.amount}});if(!window._salItems.length)window._salItems=[{pk:'',pn:'',qty:1,rate:0,amt:0}];renderSalItems();openModal('salModal')}
-window.delSal=async function(k){var s=sals.find(function(x){return x._key===k});if(!confirm('Delete sale? Stock, bank balance and auto-voucher will be reversed.'))return;
+window.delSal=async function(k){var s=sals.find(function(x){return x._key===k});if(!(await customConfirm('Delete sale? Stock, bank balance and auto-voucher will be reversed.')))return;
 if(s){
   // Reverse stock (add back)
   if(s.items){for(var ri=0;ri<s.items.length;ri++){var rp=salProds.find(function(x){return x._key===s.items[ri].productId});if(rp){rp.stock=(rp.stock||0)+s.items[ri].qty;await saveByKey(rp._key,cleanForSave(rp))}}}
@@ -2038,7 +2239,7 @@ function paymentsPage(){return `
 <div class="form-group"><label>Party</label><select id="payParty"><option value="">Select...</option></select></div>
 <div id="billSelection" class="hidden" style="margin-bottom:12px;max-height:200px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px"><div class="section-title">Outstanding Bills</div><div id="billList"></div></div>
 <div class="form-group"><label>Amount</label><input type="number" id="payAmt" placeholder="0"></div>
-<div class="form-row"><div><label>Method</label><select id="payMeth" onchange="toggleCheque()"><option value="">Select Method...</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div><div id="bankSelDiv"><label>Bank</label><select id="payBank"><option value="">Select...</option></select></div></div>
+<div class="form-row"><div><label>Method</label><select id="payMeth" onchange="toggleCheque()"><option value="">Select Method...</option><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option><option value="other">Other (Specify)</option></select></div><div id="payMethOtherDiv" class="hidden"><label>Specify Method</label><input id="payMethOther" placeholder="Method name"></div><div id="bankSelDiv"><label>Bank</label><select id="payBank"><option value="">Select...</option></select></div></div>
 <div class="form-group hidden" id="chequeDiv"><label>Cheque No</label><input id="payCheque" placeholder="Cheque#"></div>
 <div class="form-group"><label>Note</label><input id="payNote" placeholder="Note"></div>
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal('payModal')">Cancel</button><button class="btn btn-primary" onclick="savePay()">Save</button></div>
@@ -2076,7 +2277,10 @@ var pts=type==='receipt'?payParties.filter(function(p){return p.type==='customer
 document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');
 document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
 document.getElementById('payParty').onchange=function(){showBills(type,this.value)}}
-window.editPay=function(k){var p=pays.find(function(x){return x._key===k});if(!p)return;var type=p.type;document.getElementById('payEK').value=k;document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='Edit '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=p.no||'';document.getElementById('payDt').value=p.date||todayISO();document.getElementById('payAmt').value=p.amount||'';document.getElementById('payNote').value=p.note||'';document.getElementById('payMeth').value=p.method||'';document.getElementById('payCheque').value=p.chequeNo||'';document.getElementById('chequeDiv').classList.toggle('hidden',p.method!=='cheque');var needsBank=p.method==='bank_transfer'||p.method==='cheque'||p.method==='credit_card'||p.method==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);
+window.editPay=function(k){var p=pays.find(function(x){return x._key===k});if(!p)return;var type=p.type;document.getElementById('payEK').value=k;document.getElementById('payType').value=type;document.getElementById('payTitle').textContent='Edit '+(type==='receipt'?'Receipt':'Payment');document.getElementById('payNo').value=p.no||'';document.getElementById('payDt').value=p.date||todayISO();document.getElementById('payAmt').value=p.amount||'';document.getElementById('payNote').value=p.note||'';document.getElementById('payCheque').value=p.chequeNo||'';document.getElementById('chequeDiv').classList.toggle('hidden',p.method!=='cheque');var needsBank=p.method==='bank_transfer'||p.method==='cheque'||p.method==='credit_card'||p.method==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);
+var bnkm=p.method||'cash';var payMethEl=document.getElementById('payMeth');var isCustom=!Array.from(payMethEl.options).find(function(o){return o.value===bnkm});
+payMethEl.value=isCustom?'other':bnkm;var omEl=document.getElementById('payMethOther');if(omEl)omEl.value=isCustom?bnkm:'';
+var oDiv=document.getElementById('payMethOtherDiv');if(oDiv)oDiv.classList.toggle('hidden',!isCustom);
 var pts=type==='receipt'?payParties.filter(function(x){return x.type==='customer'}):payParties.filter(function(x){return x.type==='supplier'});document.getElementById('payParty').innerHTML='<option value="">Select...</option>'+pts.map(function(x){return'<option value="'+x.name+'">'+x.name+'</option>'}).join('');document.getElementById('payParty').value=p.party||'';
 document.getElementById('payBank').innerHTML='<option value="">Select...</option>'+banks.map(function(b){return'<option value="'+b.name+'">'+b.name+'</option>'}).join('');document.getElementById('payBank').value=p.bankName||'';
 document.getElementById('billSelection').classList.add('hidden');openModal('payModal');
@@ -2085,8 +2289,9 @@ window.showBills=function(type,party){var div=document.getElementById('billSelec
 var bills=[];if(type==='receipt'){bills=paySales.filter(function(s){return s.customerName===party&&(s.total||0)-(s.paid||0)>0}).map(function(s){return{no:s.invoiceNo,total:s.total,paid:s.paid,due:(s.total||0)-(s.paid||0),key:s._key}})}else{bills=payPurchases.filter(function(p){return p.supplierName===party&&(p.total||0)-(p.paid||0)>0}).map(function(p){return{no:p.purchaseNo,total:p.total,paid:p.paid,due:(p.total||0)-(p.paid||0),key:p._key}})}
 if(bills.length){div.classList.remove('hidden');list.innerHTML='<table class="tbl" style="font-size:11px"><thead><tr><th>Bill#</th><th class="r">Total</th><th class="r">Paid</th><th class="r">Due</th><th>Select</th></tr></thead><tbody>'+bills.map(function(b){return'<tr><td>'+b.no+'</td><td class="r">'+fmt(b.total)+'</td><td class="r">'+fmt(b.paid)+'</td><td class="r text-danger">'+fmt(b.due)+'</td><td><input type="checkbox" data-key="'+b.key+'" data-due="'+b.due+'" onchange="calcBillAmt()"></td></tr>'}).join('')+'</tbody></table>'}else{div.classList.add('hidden')}}
 window.calcBillAmt=function(){var total=0;document.querySelectorAll('#billList input[type=checkbox]:checked').forEach(function(c){total+=+(c.dataset.due||0)});document.getElementById('payAmt').value=total}
-window.toggleCheque=function(){var m=document.getElementById('payMeth').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);document.getElementById('chequeDiv').classList.toggle('hidden',m!=='cheque')}
-window.savePay=async function(){var ek=document.getElementById('payEK').value;var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}var method2=document.getElementById('payMeth').value;if(!method2){showToast('Please select a payment method','warning');return;}var amt=+document.getElementById('payAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var payMeth=document.getElementById('payMeth').value;var needsBankPay=payMeth==='bank_transfer'||payMeth==='cheque'||payMeth==='credit_card'||payMeth==='mobile_payment';var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:amt,method:payMeth,bankName:needsBankPay?document.getElementById('payBank').value:'',chequeNo:payMeth==='cheque'?document.getElementById('payCheque').value:'',note:document.getElementById('payNote').value,status:'done'};
+window.toggleCheque=function(){var m=document.getElementById('payMeth').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('bankSelDiv').classList.toggle('hidden',!needsBank);document.getElementById('chequeDiv').classList.toggle('hidden',m!=='cheque');if(document.getElementById('payMethOtherDiv'))document.getElementById('payMethOtherDiv').classList.toggle('hidden',m!=='other');}
+window.savePay=async function(){try{var ek=document.getElementById('payEK').value;var type=document.getElementById('payType').value;var party=document.getElementById('payParty').value;if(!party){showToast('Please select a party','warning');return;}var method2=document.getElementById('payMeth').value;if(!method2){showToast('Please select a payment method','warning');return;}var amt=+document.getElementById('payAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}
+var payMeth=document.getElementById('payMeth').value;if(payMeth==='other'){var om=document.getElementById('payMethOther');payMeth=om?om.value.trim()||'Other':'Other';}var needsBankPay=payMeth==='bank_transfer'||payMeth==='cheque'||payMeth==='credit_card'||payMeth==='mobile_payment';var data={type:type,no:document.getElementById('payNo').value,date:document.getElementById('payDt').value,party:party,amount:amt,method:payMeth,bankName:needsBankPay?document.getElementById('payBank').value:'',chequeNo:payMeth==='cheque'?document.getElementById('payCheque').value:'',note:document.getElementById('payNote').value,status:'done'};
 if(ek){
   // Editing: reverse old bank balance first
   var oldPay=pays.find(function(x){return x._key===ek});
@@ -2123,8 +2328,8 @@ if(data.method==='cash'){pur.cashAmount=(pur.cashAmount||0)+apply2;pur.method=(p
 await saveByKey(bk,cleanForSave(pur))}}}}
 invalidateCache('payment:');invalidateCache('bank:');invalidateCache('sale:');invalidateCache('purchase:');
 showToast((type==='receipt'?'Receipt':'Payment')+' saved successfully','success');
-closeModal('payModal');loadPay()}
-window.delPay=async function(k){if(!confirm('Delete? This will reverse bank balance and bill payment changes.'))return;
+closeModal('payModal');loadPay()}catch(e){showToast('Failed to save payment: '+e.message,'error')}}
+window.delPay=async function(k){if(!(await customConfirm('Delete? This will reverse bank balance and bill payment changes.')))return;
 var p=pays.find(function(x){return x._key===k});if(p&&p.method!=='cash'&&p.bankName){var bkObj=banks.find(function(b){return b.name===p.bankName});if(bkObj){if(p.type==='receipt'){bkObj.balance=(bkObj.balance||0)-p.amount}else if(p.type==='payment'){bkObj.balance=(bkObj.balance||0)+p.amount}await saveByKey(bkObj._key,cleanForSave(bkObj))}}
 // Reverse bill-wise payment effects on sale.paid / purchase.paid AND method info
 if(p&&p.billKeys&&p.billKeys.length){var remaining=p.amount||0;for(var bi=0;bi<p.billKeys.length&&remaining>0;bi++){var bkey=p.billKeys[bi];if(p.type==='receipt'){var sale=paySales.find(function(x){return x._key===bkey});if(sale){var revAmt=Math.min(remaining,sale.paid||0);sale.paid=Math.max(0,(sale.paid||0)-revAmt);
@@ -2169,7 +2374,7 @@ if(ek){
   if(to!=='Cash'){var toBk2=banks.find(function(b){return b.name===to});if(toBk2){toBk2.balance=(toBk2.balance||0)+amt;await saveByKey(toBk2._key,cleanForSave(toBk2))}}
 }
 var overlay=document.getElementById('trfModal');if(overlay)overlay.classList.remove('open');invalidateCache('payment:');invalidateCache('bank:');showToast(ek?'Transfer updated successfully':'Transfer completed successfully','success');loadPay()};
-window.delTransfer=async function(k){if(!confirm('Delete transfer? Bank balances will be reversed.'))return;
+window.delTransfer=async function(k){if(!(await customConfirm('Delete transfer? Bank balances will be reversed.')))return;
 var t=pays.find(function(x){return x._key===k});
 if(t){
   if(t.fromAcc!=='Cash'){var fBk=banks.find(function(b){return b.name===t.fromAcc});if(fBk){fBk.balance=(fBk.balance||0)+(t.amount||0);await saveByKey(fBk._key,cleanForSave(fBk))}}
@@ -2210,7 +2415,7 @@ window.renderBankLedger=function(){
 window.openBankModal=function(){document.getElementById('bankEK').value='';document.getElementById('bankTitle').textContent='Add Bank';document.getElementById('bankName').value='';document.getElementById('bankAc').value='';document.getElementById('bankBal').value=0;openModal('bankModal')}
 window.editBank=function(k){var b=banks.find(function(x){return x._key===k});if(!b)return;document.getElementById('bankEK').value=k;document.getElementById('bankTitle').textContent='Edit Bank';document.getElementById('bankName').value=b.name;document.getElementById('bankAc').value=b.accountNo||'';document.getElementById('bankBal').value=b.balance||b.openingBalance||0;openModal('bankModal')}
 window.saveBank=async function(){var ek=document.getElementById('bankEK').value;var n=document.getElementById('bankName').value.trim();if(!n){showToast('Bank name is required','warning');return;}var d={name:n,accountNo:document.getElementById('bankAc').value.trim(),openingBalance:+document.getElementById('bankBal').value||0,balance:+document.getElementById('bankBal').value||0};try{if(ek){await saveByKey(ek,d);showToast('Bank updated successfully','success')}else{await saveItem('bank:',d);showToast('Bank added successfully','success')}invalidateCache('bank:');closeModal('bankModal');loadPay()}catch(e){showToast('Failed to save bank','error')}}
-window.delBank=async function(k){if(!confirm('Delete bank?'))return;await deleteItem(k,false);invalidateCache('bank:');showToast('Bank deleted successfully','success');loadPay()}
+window.delBank=async function(k){if(!(await customConfirm('Delete bank?')))return;await deleteItem(k,false);invalidateCache('bank:');showToast('Bank deleted successfully','success');loadPay()}
 loadPay();
 </script>`}
 
@@ -2224,7 +2429,7 @@ function expensesPage(){return `
 <input type="hidden" id="expEK">
 <div class="form-row"><div><label>Expense No</label><input id="expNo" readonly></div><div><label>Date</label><input type="date" id="expDt"></div></div>
 <div class="form-row"><div><label>Head</label><select id="expHead" onchange="loadSubHeadOpts()"><option value="">Select...</option></select></div><div><label>Sub-Head</label><select id="expSub"><option value="">Select...</option></select></div></div>
-<div class="form-row"><div><label>Amount</label><input type="number" id="expAmt" placeholder="0"></div><div><label>Method</label><select id="expMeth" onchange="toggleExpBank()"><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option></select></div></div>
+<div class="form-row"><div><label>Amount</label><input type="number" id="expAmt" placeholder="0"></div><div><label>Method</label><select id="expMeth" onchange="toggleExpBank()"><option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="cheque">Cheque</option><option value="credit_card">Credit Card</option><option value="mobile_payment">Mobile Payment</option><option value="other">Other (Specify)</option></select></div><div id="expMethOtherDiv" class="hidden"><label>Specify Method</label><input id="expMethOther" placeholder="Method name"></div></div>
 <div class="form-row" id="expBankRow"><div><label>Bank</label><select id="expBank"><option value="">Select Bank...</option></select></div><div id="expChequeDiv" class="hidden"><label>Cheque No</label><input id="expCheque" placeholder="Cheque#"></div></div>
 <div class="form-group"><label>Description</label><input id="expDesc"></div>
 <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:14px"><button class="btn btn-outline" onclick="closeModal('expModal')">Cancel</button><button class="btn btn-primary" onclick="saveExp()">Save</button></div>
@@ -2254,16 +2459,16 @@ window.renderExp=function(){var fh=document.getElementById('expFilterHead').valu
 var total=fl.reduce(function(s,e){return s+(e.amount||0)},0);var cashT=fl.filter(function(e){return e.method==='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);var bankT=fl.filter(function(e){return e.method!=='cash'}).reduce(function(s,e){return s+(e.amount||0)},0);
 document.getElementById('expStats').innerHTML='<div class="stat"><div class="label">Total Expenses</div><div class="value text-danger">'+fmt(total)+'</div></div><div class="stat"><div class="label">Cash</div><div class="value">'+fmt(cashT)+'</div></div><div class="stat"><div class="label">Bank</div><div class="value">'+fmt(bankT)+'</div></div><div class="stat"><div class="label">Count</div><div class="value">'+fl.length+'</div></div>';
 document.getElementById('expBody').innerHTML=!fl.length?'<tr><td colspan="8" class="empty">No expenses</td></tr>':fl.map(function(e){return'<tr><td>'+e.date+'</td><td><span class="doc-link" onclick="previewDoc(&#39;expense&#39;,&#39;'+e._key+'&#39;)">'+(e.expenseNo||'')+'</span></td><td><span class="badge badge-info">'+(e.headName||'')+'</span></td><td>'+(e.subHeadName||'')+'</td><td>'+methodBadge(e.method)+'</td><td class="r bold">'+fmt(e.amount)+'</td><td class="text-muted">'+(e.description||'')+'</td><td class="r"><button class="btn btn-outline btn-xs" onclick="editExp(&#39;'+e._key+'&#39;)">Edit</button> <button class="btn btn-danger btn-xs" onclick="delExp(&#39;'+e._key+'&#39;)">Del</button></td></tr>'}).join('')}
-window.toggleExpBank=function(){var m=document.getElementById('expMeth').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('expBankRow').classList.toggle('hidden',!needsBank);document.getElementById('expChequeDiv').classList.toggle('hidden',m!=='cheque')};
+window.toggleExpBank=function(){var m=document.getElementById('expMeth').value;var needsBank=m==='bank_transfer'||m==='cheque'||m==='credit_card'||m==='mobile_payment';document.getElementById('expBankRow').classList.toggle('hidden',!needsBank);document.getElementById('expChequeDiv').classList.toggle('hidden',m!=='cheque');if(document.getElementById('expMethOtherDiv'))document.getElementById('expMethOtherDiv').classList.toggle('hidden',m!=='other');};
 window.openExpense=function(){document.getElementById('expEK').value='';document.getElementById('expNo').value=txnNo('EXP');document.getElementById('expDt').value=todayISO();document.getElementById('expHead').value='';document.getElementById('expSub').innerHTML='<option value="">Select head first</option>';document.getElementById('expAmt').value='';document.getElementById('expMeth').value='cash';document.getElementById('expBank').value='';document.getElementById('expDesc').value='';toggleExpBank();openModal('expModal')}
 window.loadSubHeadOpts=function(){var h=document.getElementById('expHead').value;var subs=expSubHeads.filter(function(s){return s.headName===h});document.getElementById('expSub').innerHTML='<option value="">Select...</option>'+subs.map(function(s){return'<option value="'+s.name+'">'+s.name+'</option>'}).join('')}
-window.saveExp=async function(){var ek=document.getElementById('expEK').value;var h=document.getElementById('expHead').value;if(!h){showToast('Please select an expense head','warning');return;}var amt=+document.getElementById('expAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var meth=document.getElementById('expMeth').value;var bankName=meth!=='cash'?document.getElementById('expBank').value:'';var data={expenseNo:document.getElementById('expNo').value,date:document.getElementById('expDt').value,headName:h,subHeadName:document.getElementById('expSub').value,amount:amt,method:meth,bankName:bankName,chequeNo:meth==='cheque'?(document.getElementById('expCheque')?document.getElementById('expCheque').value:''):'',description:document.getElementById('expDesc').value};
+window.saveExp=async function(){try{var ek=document.getElementById('expEK').value;var h=document.getElementById('expHead').value;if(!h){showToast('Please select an expense head','warning');return;}var amt=+document.getElementById('expAmt').value||0;if(amt<=0){showToast('Please enter a valid amount','warning');return;}var meth=document.getElementById('expMeth').value;if(meth==='other'){var om=document.getElementById('expMethOther');meth=om?om.value.trim()||'Other':'Other';}var bankName=meth!=='cash'?document.getElementById('expBank').value:'';var data={expenseNo:document.getElementById('expNo').value,date:document.getElementById('expDt').value,headName:h,subHeadName:document.getElementById('expSub').value,amount:amt,method:meth,bankName:bankName,chequeNo:meth==='cheque'?(document.getElementById('expCheque')?document.getElementById('expCheque').value:''):'',description:document.getElementById('expDesc').value};
 if(ek){var oldExp=exps.find(function(x){return x._key===ek});if(oldExp&&oldExp.method!=='cash'&&oldExp.bankName){var oldBk=expBanks.find(function(b){return b.name===oldExp.bankName});if(oldBk){oldBk.balance=(oldBk.balance||0)+(oldExp.amount||0);await saveByKey(oldBk._key,cleanForSave(oldBk))}}
 if(meth!=='cash'&&bankName){var bk=expBanks.find(function(b){return b.name===bankName});if(bk){bk.balance=(bk.balance||0)-amt;await saveByKey(bk._key,cleanForSave(bk))}}
 await saveByKey(ek,data);showToast('Expense updated successfully','success')}else{await saveItem('expense:',data);if(meth!=='cash'&&bankName){var bk2=expBanks.find(function(b){return b.name===bankName});if(bk2){bk2.balance=(bk2.balance||0)-amt;await saveByKey(bk2._key,cleanForSave(bk2))}}showToast('Expense saved successfully','success')}
-invalidateCache('expense:');invalidateCache('bank:');closeModal('expModal');loadExp()}
-window.editExp=function(k){var e=exps.find(function(x){return x._key===k});if(!e)return;document.getElementById('expEK').value=k;document.getElementById('expNo').value=e.expenseNo||'';document.getElementById('expDt').value=e.date;document.getElementById('expHead').value=e.headName||'';loadSubHeadOpts();setTimeout(function(){document.getElementById('expSub').value=e.subHeadName||''},100);document.getElementById('expAmt').value=e.amount;document.getElementById('expMeth').value=e.method||'cash';document.getElementById('expBank').value=e.bankName||'';document.getElementById('expDesc').value=e.description||'';if(document.getElementById('expCheque'))document.getElementById('expCheque').value=e.chequeNo||'';toggleExpBank();openModal('expModal')}
-window.delExp=async function(k){if(!confirm('Delete expense? Bank balance will be reversed if applicable.'))return;
+invalidateCache('expense:');invalidateCache('bank:');closeModal('expModal');loadExp()}catch(err){showToast('Failed to save expense: '+err.message,'error')}}
+window.editExp=function(k){var e=exps.find(function(x){return x._key===k});if(!e)return;document.getElementById('expEK').value=k;document.getElementById('expNo').value=e.expenseNo||'';document.getElementById('expDt').value=e.date;document.getElementById('expHead').value=e.headName||'';loadSubHeadOpts();setTimeout(function(){document.getElementById('expSub').value=e.subHeadName||''},100);document.getElementById('expAmt').value=e.amount;var bnkm=e.method||'cash';var methEl=document.getElementById('expMeth');var isCustom=!Array.from(methEl.options).find(function(o){return o.value===bnkm});methEl.value=isCustom?'other':bnkm;var omEl=document.getElementById('expMethOther');if(omEl)omEl.value=isCustom?bnkm:'';var oDiv=document.getElementById('expMethOtherDiv');if(oDiv)oDiv.classList.toggle('hidden',!isCustom);document.getElementById('expBank').value=e.bankName||'';document.getElementById('expDesc').value=e.description||'';if(document.getElementById('expCheque'))document.getElementById('expCheque').value=e.chequeNo||'';toggleExpBank();openModal('expModal')}
+window.delExp=async function(k){if(!(await customConfirm('Delete expense? Bank balance will be reversed if applicable.')))return;
 var exp=exps.find(function(x){return x._key===k});if(exp&&exp.method!=='cash'&&exp.bankName){var bk=expBanks.find(function(b){return b.name===exp.bankName});if(bk){bk.balance=(bk.balance||0)+(exp.amount||0);await saveByKey(bk._key,cleanForSave(bk))}}
 await deleteItem(k,false);invalidateCache('expense:');invalidateCache('bank:');showToast('Expense deleted successfully','success');loadExp()}
 window.openHeadModal=function(){document.getElementById('newHead').value='';var html=expHeads.map(function(h){return'<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)"><span>'+h.name+'</span><button class="btn btn-danger btn-xs" onclick="delHead(&#39;'+h._key+'&#39;)">Del</button></div>'}).join('');document.getElementById('headList').innerHTML=html||'<div class="empty">No heads</div>';openModal('headModal')}
@@ -2957,11 +3162,11 @@ function stockPage(){return `
 var stProds=[],stTab='all',stGroups=[];
 async function loadSt(){var d=await Promise.all([loadList('product:'),loadList('prodgroup:')]);stProds=d[0];stGroups=d[1]||[];document.getElementById('stGroupFilter').innerHTML='<option value="">All Groups</option>'+stGroups.map(function(g){return'<option value="'+g.name+'">'+g.name+'</option>'}).join('');renderSt()}
 window.switchStTab=function(t,el){stTab=t;document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});el.classList.add('active');renderSt()}
-function renderSt(){var gf=document.getElementById('stGroupFilter').value;var sq=(document.getElementById('stSearch').value||'').trim().toLowerCase();var fl=stProds;if(stTab==='available')fl=fl.filter(function(p){return(p.stock||0)>0});else if(stTab==='low')fl=fl.filter(function(p){return(p.stock||0)>0&&(p.stock||0)<=5});else if(stTab==='out')fl=fl.filter(function(p){return(p.stock||0)<=0});
+function renderSt(){var gf=document.getElementById('stGroupFilter').value;var sq=(document.getElementById('stSearch').value||'').trim().toLowerCase();var fl=stProds;if(stTab==='available')fl=fl.filter(function(p){return(p.stock||0)>0});else if(stTab==='low')fl=fl.filter(function(p){return(p.stock||0)>0&&(p.stock||0)<=(p.threshold!==undefined?p.threshold:5)});else if(stTab==='out')fl=fl.filter(function(p){return(p.stock||0)<=0});
 if(gf)fl=fl.filter(function(p){return p.group===gf});if(sq)fl=fl.filter(function(p){return(p.name||'').toLowerCase().includes(sq)});
-var totalCost=fl.reduce(function(s,p){return s+((p.stock||0)*(p.purchasePrice||0))},0);var totalSale=fl.reduce(function(s,p){return s+((p.stock||0)*(p.salePrice||0))},0);var totalQty=fl.reduce(function(s,p){return s+(p.stock||0)},0);var lowCount=fl.filter(function(p){return(p.stock||0)>0&&(p.stock||0)<=5}).length;var outCount=fl.filter(function(p){return(p.stock||0)<=0}).length;
+var totalCost=fl.reduce(function(s,p){return s+((p.stock||0)*(p.purchasePrice||0))},0);var totalSale=fl.reduce(function(s,p){return s+((p.stock||0)*(p.salePrice||0))},0);var totalQty=fl.reduce(function(s,p){return s+(p.stock||0)},0);var lowCount=fl.filter(function(p){return(p.stock||0)>0&&(p.stock||0)<=(p.threshold!==undefined?p.threshold:5)}).length;var outCount=fl.filter(function(p){return(p.stock||0)<=0}).length;
 document.getElementById('stStats').innerHTML='<div class="stat"><div class="label">Total Products</div><div class="value">'+fl.length+'</div></div><div class="stat"><div class="label">Total Qty</div><div class="value">'+fmt(totalQty)+'</div></div><div class="stat"><div class="label">Cost Value</div><div class="value text-primary">'+fmt(totalCost)+'</div></div><div class="stat"><div class="label">Sale Value</div><div class="value text-success">'+fmt(totalSale)+'</div></div><div class="stat"><div class="label">Low Stock</div><div class="value text-warning">'+lowCount+'</div></div><div class="stat"><div class="label">Out of Stock</div><div class="value text-danger">'+outCount+'</div></div>';
-document.getElementById('stBody').innerHTML=!fl.length?'<tr><td colspan="9" class="empty">No products</td></tr>':fl.map(function(p){var st=p.stock||0;var status=st<=0?'<span class="badge badge-danger">Out</span>':st<=5?'<span class="badge badge-warning">Low</span>':'<span class="badge badge-success">OK</span>';return'<tr><td class="bold">'+p.name+'</td><td>'+(p.group?'<span class="badge badge-info">'+p.group+'</span>':'-')+'</td><td class="text-muted">'+(p.sku||'')+'</td><td class="r bold '+(st<=0?'text-danger':st<=5?'text-warning':'')+'">'+st+'</td><td class="r">'+fmt(p.purchasePrice)+'</td><td class="r">'+fmt(p.salePrice)+'</td><td class="r">'+fmt(st*(p.purchasePrice||0))+'</td><td class="r text-success">'+fmt(st*(p.salePrice||0))+'</td><td>'+status+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="3">TOTAL</td><td class="r">'+fmt(totalQty)+'</td><td></td><td></td><td class="r">'+fmt(totalCost)+'</td><td class="r">'+fmt(totalSale)+'</td><td></td></tr>'}
+document.getElementById('stBody').innerHTML=!fl.length?'<tr><td colspan="9" class="empty">No products</td></tr>':fl.map(function(p){var st=p.stock||0;var status=st<=0?'<span class="badge badge-danger">Out</span>':st<=(p.threshold!==undefined?p.threshold:5)?'<span class="badge badge-warning">Low</span>':'<span class="badge badge-success">OK</span>';return'<tr><td class="bold">'+p.name+'</td><td>'+(p.group?'<span class="badge badge-info">'+p.group+'</span>':'-')+'</td><td class="text-muted">'+(p.sku||'')+'</td><td class="r bold '+(st<=0?'text-danger':st<=(p.threshold!==undefined?p.threshold:5)?'text-warning':'')+'">'+st+'</td><td class="r">'+fmt(p.purchasePrice)+'</td><td class="r">'+fmt(p.salePrice)+'</td><td class="r">'+fmt(st*(p.purchasePrice||0))+'</td><td class="r text-success">'+fmt(st*(p.salePrice||0))+'</td><td>'+status+'</td></tr>'}).join('')+'<tr style="background:var(--bg);font-weight:800"><td colspan="3">TOTAL</td><td class="r">'+fmt(totalQty)+'</td><td></td><td></td><td class="r">'+fmt(totalCost)+'</td><td class="r">'+fmt(totalSale)+'</td><td></td></tr>'}
 loadSt();
 </script>`}
 
@@ -3181,6 +3386,7 @@ function reportsPage(){return `
 <option value="group-sales-summary">Group-wise Sales Summary</option>
 <option value="brand-sales-summary">Brand-wise Sales Summary</option>
 </select></div><div><label>From</label><input type="date" id="rptFrom"></div><div><label>To</label><input type="date" id="rptTo"></div></div>
+<div class="no-print" style="margin-bottom:14px;display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline btn-xs" onclick="quickDateFilter('rptFrom','rptTo','today',loadReport)">Today</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('rptFrom','rptTo','yesterday',loadReport)">Yesterday</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('rptFrom','rptTo','last7',loadReport)">Last 7 Days</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('rptFrom','rptTo','thisMonth',loadReport)">This Month</button></div>
 <div class="form-row" id="rptGroupFilter" style="margin-bottom:14px;display:none"><div><label>Product Group</label><select id="rptGroup"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="rptBrand"><option value="">All Brands</option></select></div><div><label>Product</label><select id="rptProduct"><option value="">All Products</option></select></div></div>
 <div class="no-print" style="margin-bottom:12px;display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary" onclick="loadReport()"><span class="material-symbols-outlined" style="font-size:16px;vertical-align:middle">visibility</span> View Report</button><button class="btn btn-outline btn-sm" onclick="printContent('rptPrint','Report')">Print</button><button class="btn btn-outline btn-sm" onclick="exportXLS('rptTbl','Report')">Export XLS</button></div>
 <div id="rptPlaceholder" class="rpt-placeholder"><span class="material-symbols-outlined">assessment</span><p>Select report type, date range, and click <b>View Report</b></p></div>
@@ -3368,14 +3574,14 @@ function renderSP(){document.getElementById('spBody').innerHTML=!spPersons.lengt
 window.openSPForm=function(){document.getElementById('spEK').value='';document.getElementById('spTitle').textContent='Add Salesperson';['spName','spCode','spPin','spPhone'].forEach(function(i){document.getElementById(i).value=''});document.getElementById('spActive').value='true';openModal('spModal')}
 window.editSP=function(k){var s=spPersons.find(function(x){return x._key===k});if(!s)return;document.getElementById('spEK').value=k;document.getElementById('spTitle').textContent='Edit Salesperson';document.getElementById('spName').value=s.name;document.getElementById('spCode').value=s.code;document.getElementById('spPin').value=s.pin;document.getElementById('spPhone').value=s.phone||'';document.getElementById('spActive').value=s.active!==false?'true':'false';openModal('spModal')}
 window.saveSP=async function(){var ek=document.getElementById('spEK').value;var n=document.getElementById('spName').value.trim();if(!n){showToast('Name is required','warning');return;}var d={name:n,code:document.getElementById('spCode').value.trim(),pin:document.getElementById('spPin').value.trim(),phone:document.getElementById('spPhone').value.trim(),active:document.getElementById('spActive').value==='true'};try{if(ek){await saveByKey(ek,d);showToast('Salesperson updated','success')}else{await saveItem('salesperson:',d);showToast('Salesperson added','success')}invalidateCache('salesperson:');closeModal('spModal');loadSP()}catch(e){showToast('Failed to save','error')}}
-window.delSP=async function(k){if(!confirm('Delete?'))return;await deleteItem(k,false);invalidateCache('salesperson:');showToast('Salesperson deleted','success');loadSP()}
+window.delSP=async function(k){if(!(await customConfirm('Delete?')))return;await deleteItem(k,false);invalidateCache('salesperson:');showToast('Salesperson deleted','success');loadSP()}
 loadSP();
 </script>`}
 
 function ordersPage(){return `
 <div class="page-header"><div><div class="page-title">Orders</div><div class="page-sub">SP portal orders - approve, deny, convert</div></div></div>
 <div class="tabs"><button class="tab active" onclick="switchOrdTab('pending',this)">Pending</button><button class="tab" onclick="switchOrdTab('approved',this)">Approved</button><button class="tab" onclick="switchOrdTab('denied',this)">Denied</button><button class="tab" onclick="switchOrdTab('converted',this)">Converted</button><button class="tab" onclick="switchOrdTab('all',this)">All</button></div>
-<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px;flex-wrap:wrap"><div><label>Group</label><select id="ordGroupF" onchange="renderOrd()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="ordBrandF" onchange="renderOrd()" style="font-size:12px"><option value="">All Brands</option></select></div><div><label>Product</label><select id="ordProdF" onchange="renderOrd()" style="font-size:12px"><option value="">All Products</option></select></div><div><label>Salesperson</label><select id="ordSPF" onchange="renderOrd()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>Customer</label><select id="ordCustF" onchange="renderOrd()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>Search</label><input id="ordSearch" placeholder="Search..." oninput="renderOrd()" style="font-size:12px"></div></div></div></div>
+<div class="filter-toggle" onclick="this.classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><div class="ft-label"><span class="material-symbols-outlined" style="font-size:16px">filter_list</span> Search & Filters</div><span class="material-symbols-outlined ft-arrow">expand_more</span></div><div class="filter-body"><div class="card no-print" style="padding:10px 14px;margin-bottom:10px"><div class="form-row" style="align-items:end;gap:8px;flex-wrap:wrap"><div><label>From</label><input type="date" id="ordFromF" onchange="renderOrd()" style="font-size:12px"></div><div><label>To</label><input type="date" id="ordToF" onchange="renderOrd()" style="font-size:12px"></div><div><label>Group</label><select id="ordGroupF" onchange="renderOrd()" style="font-size:12px"><option value="">All Groups</option></select></div><div><label>Brand</label><select id="ordBrandF" onchange="renderOrd()" style="font-size:12px"><option value="">All Brands</option></select></div><div><label>Product</label><select id="ordProdF" onchange="renderOrd()" style="font-size:12px"><option value="">All Products</option></select></div><div><label>Salesperson</label><select id="ordSPF" onchange="renderOrd()" style="font-size:12px"><option value="">All SP</option></select></div><div><label>Customer</label><select id="ordCustF" onchange="renderOrd()" style="font-size:12px"><option value="">All Customers</option></select></div><div><label>Search</label><input id="ordSearch" placeholder="Search..." oninput="renderOrd()" style="font-size:12px"></div></div><div class="no-print" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-outline btn-xs" onclick="quickDateFilter('ordFromF','ordToF','today',renderOrd)">Today</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('ordFromF','ordToF','yesterday',renderOrd)">Yesterday</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('ordFromF','ordToF','last7',renderOrd)">Last 7 Days</button><button class="btn btn-outline btn-xs" onclick="quickDateFilter('ordFromF','ordToF','thisMonth',renderOrd)">This Month</button></div></div></div>
 <div class="card" style="padding:0"><div class="table-wrap"><table class="tbl"><thead><tr><th>Date</th><th>Order#</th><th>Customer</th><th>SP</th><th>Product Name</th><th class="r">Quantity</th><th class="r">Total</th><th>Status</th><th class="r">Act</th></tr></thead><tbody id="ordBody"></tbody></table></div></div>
 <div class="modal-overlay" id="ordDetailModal"><div class="modal" style="max-width:650px">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h3 style="margin:0" id="ordDetailTitle">Order Details</h3><div style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="printContent('ordDetailPrint','Order Details')">Print</button><button class="btn btn-outline btn-sm" onclick="closeModal('ordDetailModal')">Close</button></div></div>
@@ -3410,12 +3616,16 @@ if(o.status==='approved'){acts='<button class="btn btn-primary" onclick="convert
 document.getElementById('ordDetailActions').innerHTML=acts;
 openModal('ordDetailModal')}
 function renderOrd(){var fl=ordTab==='all'?ords:ords.filter(function(o){return o.status===ordTab});
+var from=document.getElementById('ordFromF')?document.getElementById('ordFromF').value:'';
+var to=document.getElementById('ordToF')?document.getElementById('ordToF').value:'';
 var gf=document.getElementById('ordGroupF')?document.getElementById('ordGroupF').value:'';
 var bf=document.getElementById('ordBrandF')?document.getElementById('ordBrandF').value:'';
 var pf=document.getElementById('ordProdF')?document.getElementById('ordProdF').value:'';
 var sf=document.getElementById('ordSPF')?document.getElementById('ordSPF').value:'';
 var cf=document.getElementById('ordCustF')?document.getElementById('ordCustF').value:'';
 var sq=(document.getElementById('ordSearch')?document.getElementById('ordSearch').value:'').trim().toLowerCase();
+if(from)fl=fl.filter(function(o){return o.date>=from});
+if(to)fl=fl.filter(function(o){return o.date<=to});
 if(gf||bf||pf)fl=fl.filter(function(o){return(o.items||[]).some(function(it){var pr=ordProds.find(function(p){return p._key===it.productKey||p._key===it.productId});if(pf&&(it.productKey===pf||it.productId===pf))return true;if(pf)return false;var gMatch=!gf||(pr&&pr.group===gf);var bMatch=!bf||(pr&&pr.brand===bf);return gMatch&&bMatch})});
 if(sf)fl=fl.filter(function(o){return o.spName===sf});
 if(cf)fl=fl.filter(function(o){return o.customerName===cf});
@@ -3424,7 +3634,7 @@ fl.sort(function(a,b){return(b.date||'').localeCompare(a.date)});
 document.getElementById('ordBody').innerHTML=!fl.length?'<tr><td colspan="9" class="empty">No orders</td></tr>':fl.map(function(o){var statusBadge=o.status==='pending'?'badge-warning':o.status==='approved'?'badge-success':o.status==='denied'?'badge-danger':'badge-info';var acts='';if(o.status==='pending'){acts='<button class="btn btn-success btn-xs" onclick="event.stopPropagation();approveOrd(&#39;'+o._key+'&#39;)">Approve</button> <button class="btn btn-danger btn-xs" onclick="event.stopPropagation();denyOrd(&#39;'+o._key+'&#39;)">Deny</button>'}if(o.status==='approved'){acts='<button class="btn btn-primary btn-xs" onclick="event.stopPropagation();convertOrd(&#39;'+o._key+'&#39;)">Convert to Invoice</button>'}var prodNames=(o.items||[]).map(function(it){return it.productName}).join(', ');var totalQty=(o.items||[]).reduce(function(s,it){return s+(it.qty||0)},0);return'<tr style="cursor:pointer" onclick="viewOrd(&#39;'+o._key+'&#39;)"><td>'+o.date+'</td><td class="bold" style="color:var(--primary)">'+o.orderNo+'</td><td>'+o.customerName+'</td><td class="text-muted">'+(o.spName||'')+'</td><td class="text-muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+prodNames+'">'+prodNames+'</td><td class="r bold">'+totalQty+'</td><td class="r bold">'+fmt(o.total)+'</td><td><span class="badge '+statusBadge+'">'+o.status+'</span></td><td class="r">'+acts+'</td></tr>'}).join('')}
 window.approveOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='approved';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order approved','success');loadOrd()}
 window.denyOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;o.status='denied';await saveByKey(k,cleanForSave(o));invalidateCache('order:');showToast('Order denied','info');loadOrd()}
-window.convertOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;if(!confirm('Convert to sales invoice? Stock will be deducted.'))return;
+window.convertOrd=async function(k){var o=ords.find(function(x){return x._key===k});if(!o)return;if(!(await customConfirm('Convert to sales invoice? Stock will be deducted.')))return;
 var items=(o.items||[]).map(function(it){return{productId:it.productKey||it.productId||'',productName:it.productName,qty:it.qty,rate:it.rate,amount:it.amount||it.qty*it.rate}});
 // Stock check before conversion
 var prods=await loadList('product:');
@@ -3464,7 +3674,7 @@ function renderUsers(){document.getElementById('userBody').innerHTML=!users.leng
 window.openUserForm=function(){document.getElementById('userEK').value='';document.getElementById('userTitle').textContent='Add User';['userName','userUname','userPwd'].forEach(function(i){document.getElementById(i).value=''});document.getElementById('userRole').value='entry';document.getElementById('userActive').value='true';openModal('userModal')}
 window.editUser=function(k){var u=users.find(function(x){return x._key===k});if(!u)return;document.getElementById('userEK').value=k;document.getElementById('userTitle').textContent='Edit User';document.getElementById('userName').value=u.name;document.getElementById('userUname').value=u.username;document.getElementById('userPwd').value=u.password||'';document.getElementById('userRole').value=u.role;document.getElementById('userActive').value=u.active!==false?'true':'false';openModal('userModal')}
 window.saveUser=async function(){var ek=document.getElementById('userEK').value;var n=document.getElementById('userName').value.trim();var un=document.getElementById('userUname').value.trim();var pw=document.getElementById('userPwd').value;if(!n||!un||!pw){showToast('All fields are required','warning');return;}var d={name:n,username:un,password:pw,role:document.getElementById('userRole').value,active:document.getElementById('userActive').value==='true'};try{if(ek){await saveByKey(ek,d);showToast('User updated','success')}else{await saveItem('user:',d);showToast('User created','success')}invalidateCache('user:');closeModal('userModal');loadUsers()}catch(e){showToast('Failed to save user','error')}}
-window.delUser=async function(k){if(!confirm('Delete user?'))return;await deleteItem(k,false);invalidateCache('user:');showToast('User deleted','success');loadUsers()}
+window.delUser=async function(k){if(!(await customConfirm('Delete user?')))return;await deleteItem(k,false);invalidateCache('user:');showToast('User deleted','success');loadUsers()}
 loadUsers();
 </script>`}
 
@@ -3486,11 +3696,11 @@ function adminPage(){return `
 (async function(){try{var li=await(await fetch('/api/license-info')).json();document.getElementById('licInfo').innerHTML='<div><b>Expiry:</b> '+li.expiry+'</div><div><b>Days Left:</b> '+li.days+'</div><div><b>Status:</b> <span class="badge '+(li.status==='Active'?'badge-success':'badge-danger')+'">'+li.status+'</span></div>'}catch(e){document.getElementById('licInfo').textContent='Error loading'}})();
 window.changePin=async function(){try{await api('/api/change-pin',{oldPin:document.getElementById('oldPin').value,newPin:document.getElementById('newPin').value});showToast('PIN changed successfully','success');document.getElementById('oldPin').value='';document.getElementById('newPin').value=''}catch(e){showToast('Failed: '+e.message,'error')}}
 window.exportAll=async function(){try{var data=await api('/api/export-all');var blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='bizmanager-backup-'+todayISO()+'.json';a.click();showToast('Data exported successfully','success')}catch(e){showToast('Export failed','error')}}
-window.importAll=async function(){var file=document.getElementById('importFile').files[0];if(!file)return alert('Select file');if(!confirm('This will merge with existing data. Continue?'))return;var text=await file.text();try{var data=JSON.parse(text);var result=await api('/api/import-all',data);invalidateCache();showToast('Imported '+result.count+' records successfully','success')}catch(e){showToast('Import failed: '+e.message,'error')}}
+window.importAll=async function(){var file=document.getElementById('importFile').files[0];if(!file)return alert('Select file');if(!(await customConfirm('This will merge with existing data. Continue?')))return;var text=await file.text();try{var data=JSON.parse(text);var result=await api('/api/import-all',data);invalidateCache();showToast('Imported '+result.count+' records successfully','success')}catch(e){showToast('Import failed: '+e.message,'error')}}
 window.browseKV=async function(){var prefix=document.getElementById('kvPrefix').value;try{var keys=await api('/api/kv-keys',{prefix:prefix});document.getElementById('kvResults').innerHTML=keys.length?keys.map(function(k){return'<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)"><span style="word-break:break-all">'+k+'</span><div style="display:flex;gap:4px;flex-shrink:0"><button class="btn btn-outline btn-xs" onclick="viewKV(&#39;'+k+'&#39;)">View</button><button class="btn btn-danger btn-xs" onclick="deleteKV(&#39;'+k+'&#39;)">Del</button></div></div>'}).join(''):'<div class="empty">No keys</div>'}catch(e){alert(e.message)}}
 window.viewKV=async function(k){try{var d=await api('/api/kv-get',{key:k});alert(JSON.stringify(d.value?JSON.parse(d.value):null,null,2))}catch(e){alert(e.message)}}
-window.deleteKV=async function(k){if(!confirm('Delete '+k+'?'))return;try{await api('/api/kv-delete',{key:k});browseKV()}catch(e){alert(e.message)}}
-window.purgeData=async function(){var prefix=document.getElementById('purgeType').value;if(!confirm('Delete ALL '+prefix+' data? This cannot be undone!'))return;try{var keys=await api('/api/kv-keys',{prefix:prefix});for(var i=0;i<keys.length;i++){await api('/api/kv-delete',{key:keys[i]})}alert('Purged '+keys.length+' records')}catch(e){alert(e.message)}}
+window.deleteKV=async function(k){if(!(await customConfirm('Delete '+k+'?')))return;try{await api('/api/kv-delete',{key:k});browseKV()}catch(e){alert(e.message)}}
+window.purgeData=async function(){var prefix=document.getElementById('purgeType').value;if(!(await customConfirm('Delete ALL '+prefix+' data? This cannot be undone!')))return;try{var keys=await api('/api/kv-keys',{prefix:prefix});for(var i=0;i<keys.length;i++){await api('/api/kv-delete',{key:keys[i]})}alert('Purged '+keys.length+' records')}catch(e){alert(e.message)}}
 
 </script>`}
 
@@ -3539,8 +3749,8 @@ function renderAppr(){
     return'<tr><td class="text-muted" style="font-size:11px;white-space:nowrap">'+ts+'</td><td class="bold">'+(a.requestedBy||'')+'</td><td><span class="badge '+typeBadge+'">'+(a.type||'')+'</span></td><td class="text-muted" style="font-size:11px;word-break:break-all">'+(a.targetKey||'')+'</td><td>'+(a.detail||'')+'</td><td><span class="badge '+statusBadge+'">'+(a.status||'')+'</span>'+(a.processedBy?'<br><span class="text-muted" style="font-size:10px">by '+a.processedBy+'</span>':'')+'</td><td class="r">'+acts+'</td></tr>'
   }).join('')
 }
-window.approveAppr=async function(k){if(!confirm('Approve this change?'))return;try{await api('/api/approval-action',{approvalKey:k,action:'approve'});showToast('Change approved and applied','success');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
-window.rejectAppr=async function(k){if(!confirm('Reject this change?'))return;try{await api('/api/approval-action',{approvalKey:k,action:'reject'});showToast('Change rejected','info');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
+window.approveAppr=async function(k){if(!(await customConfirm('Approve this change?')))return;try{await api('/api/approval-action',{approvalKey:k,action:'approve'});showToast('Change approved and applied','success');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
+window.rejectAppr=async function(k){if(!(await customConfirm('Reject this change?')))return;try{await api('/api/approval-action',{approvalKey:k,action:'reject'});showToast('Change rejected','info');loadAppr()}catch(e){showToast('Failed: '+e.message,'error')}};
 window._humanizeKey=function(k){
   var map={invoiceNo:'Invoice No',purchaseNo:'Purchase No',expenseNo:'Expense No',customerName:'Customer',supplierName:'Supplier',customerId:'Customer ID',supplierId:'Supplier ID',salespersonName:'Salesperson',salespersonId:'Salesperson ID',productName:'Product',productId:'Product ID',headName:'Head',subHeadName:'Sub-Head',bankName:'Bank',chequeNo:'Cheque No',companyName:'Company',companyAddress:'Address',companyPhone:'Phone',companyEmail:'Email',companyWebsite:'Website',companyTIN:'TIN/BIN',companyTagline:'Tagline',primaryColor:'Primary Color',sidebarColor:'Sidebar Color',openingBalance:'Opening Balance',creditLimit:'Credit Limit',vatType:'VAT Type',aitType:'AIT Type',discountType:'Discount Type'};
   if(map[k])return map[k];
